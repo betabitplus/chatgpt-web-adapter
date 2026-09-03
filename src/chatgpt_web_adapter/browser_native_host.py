@@ -383,7 +383,7 @@ class BrowserNativeBroker:
             }[operation]
             timeout = max(
                 1.0,
-                min(float(timeout_ms or default_timeout_ms) / 1000.0, 300.0),
+                float(timeout_ms or default_timeout_ms) / 1000.0,
             )
             waiter: queue.Queue[dict[str, Any]] = queue.Queue()
             with self.pending_lock:

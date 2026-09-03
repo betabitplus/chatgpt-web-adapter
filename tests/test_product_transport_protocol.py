@@ -169,6 +169,28 @@ def test_runtime_canonical_methods_do_not_route_through_write_transport() -> Non
     assert transport.send_calls == []
 
 
+def test_runtime_canonical_methods_use_transport_canonical_client_when_available() -> None:
+    source_canonical = _Canonical()
+    transport_canonical = _Canonical()
+    transport = _FakeTransport()
+    transport.canonical_client = transport_canonical
+    runtime = ChatGPTProductRuntime(source_canonical, write_transport=transport)
+
+    runtime.get_status("c1")
+    runtime.get_messages("c1", limit=3)
+    attached = runtime.attach_conversation("c1")
+
+    assert source_canonical.status_calls == []
+    assert source_canonical.message_calls == []
+    assert source_canonical.attach_calls == []
+    assert transport_canonical.status_calls == ["c1"]
+    assert transport_canonical.message_calls == [("c1", {"limit": 3})]
+    assert transport_canonical.attach_calls == ["c1"]
+    assert attached.conversation_id == "c1"
+    assert transport.health_calls == []
+    assert transport.send_calls == []
+
+
 def test_injected_transport_identity_must_match_selected_production_transport() -> None:
     transport = _FakeTransport()
     transport.transport_id = "future-native"

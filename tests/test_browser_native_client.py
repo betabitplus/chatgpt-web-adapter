@@ -55,6 +55,28 @@ class RecoveryFakeProvider(FakeProvider):
         )
 
 
+class LeaseAwareProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lease_id = "lease-new"
+        self.write_leases: list[str | None] = []
+        self.write_started = False
+
+    def _current_browser_authority_lease_id(self):
+        return self.lease_id
+
+    def clear_browser_authority_lease(self) -> None:
+        self.lease_id = None
+
+    def set_browser_authority_lease(self, lease_id: str) -> None:
+        self.lease_id = lease_id
+
+    def send_text(self, text, *, conversation=None, timeout=None):
+        self.write_started = True
+        self.write_leases.append(self.lease_id)
+        return super().send_text(text, conversation=conversation, timeout=timeout)
+
+
 def _client(provider, *, status_value="completed"):
     old = SimpleNamespace(
         message_id="old-assistant",
@@ -181,6 +203,43 @@ def test_completion_evidence_must_still_be_completed_on_immediate_recheck() -> N
 
     assert provider.normal_calls == [("hello", "existing-conversation", 2)]
     assert provider.recovery_calls == []
+
+
+def test_continuation_preflight_temporarily_suspends_new_write_lease() -> None:
+    provider = LeaseAwareProvider()
+    client = _client(provider, status_value="completed")
+    observed_reads: list[tuple[str, str | None]] = []
+    original_get_messages = client.get_messages
+    original_get_status = client.get_status
+
+    def get_messages(conversation, **kwargs):
+        phase = "postwrite" if provider.write_started else "prewrite"
+        observed_reads.append((phase, provider._current_browser_authority_lease_id()))
+        return original_get_messages(conversation, **kwargs)
+
+    def get_status(conversation):
+        phase = "postwrite" if provider.write_started else "prewrite"
+        observed_reads.append((phase, provider._current_browser_authority_lease_id()))
+        return original_get_status(conversation)
+
+    client.get_messages = get_messages
+    client.get_status = get_status
+
+    response = send_browser_native(
+        client,
+        "hello",
+        conversation="existing-conversation",
+        timeout=2,
+        poll_interval=0.01,
+    )
+
+    assert response.text == "CANONICAL_READBACK"
+    prewrite = [lease for phase, lease in observed_reads if phase == "prewrite"]
+    postwrite = [lease for phase, lease in observed_reads if phase == "postwrite"]
+    assert prewrite and all(lease is None for lease in prewrite)
+    assert provider.write_leases == ["lease-new"]
+    assert postwrite and all(lease == "lease-new" for lease in postwrite)
+    assert provider._current_browser_authority_lease_id() == "lease-new"
 
 
 def test_new_chat_never_authorizes_stale_ui_recovery() -> None:

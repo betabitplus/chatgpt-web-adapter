@@ -120,3 +120,145 @@ def test_finish_reason_remains_fast_path_without_status_message_id() -> None:
         timeout=0.01,
         interval=0.001,
     ) is message
+
+
+def _canonical_node(
+    *,
+    message_id: str,
+    parent: str | None,
+    role: str,
+    text: str,
+    turn_exchange_id: str | None,
+    recipient: str = "all",
+    finish_reason: str | None = None,
+):
+    metadata = {"model_slug": "gpt-test"}
+    if turn_exchange_id is not None:
+        metadata["turn_exchange_id"] = turn_exchange_id
+        metadata["working_turn_id"] = turn_exchange_id
+    if finish_reason is not None:
+        metadata["finish_details"] = {"type": finish_reason}
+    return {
+        "id": message_id,
+        "parent": parent,
+        "children": [],
+        "message": {
+            "id": message_id,
+            "author": {"role": role},
+            "content": {"content_type": "text", "parts": [text]},
+            "recipient": recipient,
+            "metadata": metadata,
+        },
+    }
+
+
+class _CanonicalPayloadClient:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def _get_conversation_payload(self, conversation):
+        return self.payload
+
+
+def test_exact_turn_exchange_id_ignores_stale_and_tool_directed_assistants() -> None:
+    old = _canonical_node(
+        message_id="assistant-old",
+        parent=None,
+        role="assistant",
+        text="GPTTY_OK",
+        turn_exchange_id="turn-old",
+        finish_reason="stop",
+    )
+    user = _canonical_node(
+        message_id="user-new",
+        parent="assistant-old",
+        role="user",
+        text="use the tool",
+        turn_exchange_id="turn-new",
+    )
+    tool_directed = _canonical_node(
+        message_id="assistant-tool-call",
+        parent="user-new",
+        role="assistant",
+        text='{"tool":"open_workspace"}',
+        turn_exchange_id="turn-new",
+        recipient="api_tool.call_tool",
+        finish_reason="stop",
+    )
+    tool = _canonical_node(
+        message_id="tool-result",
+        parent="assistant-tool-call",
+        role="tool",
+        text='{"ok":true}',
+        turn_exchange_id="turn-new",
+    )
+    final = _canonical_node(
+        message_id="assistant-final",
+        parent="tool-result",
+        role="assistant",
+        text="CODEXPRO_OK",
+        turn_exchange_id="turn-new",
+        finish_reason="stop",
+    )
+    payload = {
+        "current_node": "assistant-final",
+        "mapping": {
+            "assistant-old": old,
+            "user-new": user,
+            "assistant-tool-call": tool_directed,
+            "tool-result": tool,
+            "assistant-final": final,
+        },
+    }
+    client = _CanonicalPayloadClient(payload)
+
+    message, returned_payload, read_count = _wait_for_new_final_assistant(
+        client,
+        "conversation-1",
+        baseline_assistant_ids=set(),
+        timeout=0.01,
+        interval=0.001,
+        include_readback=True,
+        turn_exchange_id="turn-new",
+    )
+
+    assert message.message_id == "assistant-final"
+    assert message.text == "CODEXPRO_OK"
+    assert returned_payload is payload
+    assert read_count == 1
+
+
+def test_turn_filter_falls_back_to_baseline_when_payload_has_no_turn_metadata() -> None:
+    old = _canonical_node(
+        message_id="assistant-old",
+        parent=None,
+        role="assistant",
+        text="OLD",
+        turn_exchange_id=None,
+        finish_reason="stop",
+    )
+    final = _canonical_node(
+        message_id="assistant-new",
+        parent="assistant-old",
+        role="assistant",
+        text="NEW",
+        turn_exchange_id=None,
+        finish_reason="stop",
+    )
+    payload = {
+        "current_node": "assistant-new",
+        "mapping": {"assistant-old": old, "assistant-new": final},
+    }
+    client = _CanonicalPayloadClient(payload)
+
+    message = _wait_for_new_final_assistant(
+        client,
+        "conversation-1",
+        baseline_assistant_ids={"assistant-old"},
+        timeout=0.01,
+        interval=0.001,
+        turn_exchange_id="turn-new",
+    )
+
+    assert message.message_id == "assistant-new"
+    assert message.text == "NEW"

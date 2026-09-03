@@ -404,6 +404,9 @@ class ChatGPTProductRuntime:
                 )
 
         self.write_transport = write_transport
+        transport_canonical = getattr(write_transport, "canonical_client", None)
+        if transport_canonical is not None:
+            self.canonical = require_canonical_conversation_client(transport_canonical)
         self._transport = write_transport
         self._writer = getattr(write_transport, "_runtime", write_transport)
 

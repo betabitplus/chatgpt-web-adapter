@@ -49,11 +49,37 @@ async function _cwaCanonicalFetch(tabId, conversationId, timeoutMs) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ${JSON.stringify(timeoutMs)});
     try {
-      const response = await fetch(${JSON.stringify(endpoint)}, {
+      const sessionResponse = await fetch("/api/auth/session", {
         method: "GET",
         credentials: "include",
         cache: "no-store",
         headers: { accept: "application/json" },
+        signal: controller.signal
+      });
+      let sessionPayload = null;
+      try {
+        sessionPayload = await sessionResponse.json();
+      } catch {}
+      const accessToken = typeof sessionPayload?.accessToken === "string"
+        ? sessionPayload.accessToken.trim()
+        : "";
+      if (!sessionResponse.ok || !accessToken) {
+        return {
+          ok: false,
+          status: sessionResponse.status,
+          contentType: (sessionResponse.headers.get("content-type") || "").slice(0, 128),
+          reasonCode: "CANONICAL_READ_AUTHENTICATION_REQUIRED",
+          retryable: false
+        };
+      }
+      const response = await fetch(${JSON.stringify(endpoint)}, {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+        headers: {
+          accept: "application/json",
+          authorization: "Bearer " + accessToken
+        },
         signal: controller.signal
       });
       const contentType = (response.headers.get("content-type") || "").slice(0, 128);

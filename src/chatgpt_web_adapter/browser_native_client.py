@@ -80,15 +80,48 @@ def _status_finalizes_message(status: Any, message_id: str) -> bool:
     )
 
 
+def _node_turn_exchange_id(node: dict[str, Any]) -> str | None:
+    message = node.get("message")
+    if not isinstance(message, dict):
+        return None
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("turn_exchange_id", "working_turn_id"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _assistant_candidates_from_payload(
     payload: dict[str, Any],
     *,
     baseline_assistant_ids: set[str] | frozenset[str],
+    turn_exchange_id: str | None = None,
 ) -> list[Any]:
+    branch = _current_branch_nodes(payload)
+    normalized_turn_exchange_id = (
+        turn_exchange_id.strip()
+        if isinstance(turn_exchange_id, str) and turn_exchange_id.strip()
+        else None
+    )
+    turn_metadata_present = normalized_turn_exchange_id is not None and any(
+        _node_turn_exchange_id(node) is not None for _, node in branch
+    )
+
     candidates: list[Any] = []
-    for node_id, node in _current_branch_nodes(payload):
+    for node_id, node in branch:
         message = _chat_message_from_node(node_id, node)
         if message is None or getattr(message, "role", None) != "assistant":
+            continue
+        recipient = getattr(message, "recipient", None)
+        if isinstance(recipient, str) and recipient.strip() not in {"", "all"}:
+            continue
+        if (
+            turn_metadata_present
+            and _node_turn_exchange_id(node) != normalized_turn_exchange_id
+        ):
             continue
         message_id = getattr(message, "message_id", None)
         if not isinstance(message_id, str) or message_id in baseline_assistant_ids:
@@ -107,6 +140,7 @@ def _wait_for_new_final_assistant(
     timeout: float,
     interval: float,
     include_readback: bool = False,
+    turn_exchange_id: str | None = None,
 ) -> Any | tuple[Any, dict[str, Any] | None, int | None]:
     """Wait for canonical finality, optionally returning the reused payload.
 
@@ -143,6 +177,7 @@ def _wait_for_new_final_assistant(
                 candidates = _assistant_candidates_from_payload(
                     payload,
                     baseline_assistant_ids=baseline_assistant_ids,
+                    turn_exchange_id=turn_exchange_id,
                 )
                 for candidate in reversed(candidates):
                     finish_reason = getattr(candidate, "finish_reason", None)
@@ -170,6 +205,10 @@ def _wait_for_new_final_assistant(
                 for message in messages
                 if isinstance(getattr(message, "message_id", None), str)
                 and message.message_id not in baseline_assistant_ids
+                and (
+                    not isinstance(getattr(message, "recipient", None), str)
+                    or getattr(message, "recipient", None).strip() in {"", "all"}
+                )
                 and bool(getattr(message, "text", "").strip())
             ]
             for candidate in reversed(candidates):
@@ -281,24 +320,48 @@ def submit_browser_native(
     baseline_assistant_ids: set[str] = set()
     is_continuation = conversation is not None
     canonical_status_before_turn = None
-    if conversation is not None:
-        baseline_assistant_ids = _assistant_message_ids(self, conversation)
-        canonical_status_before_turn = _canonical_status_value(self, conversation)
 
-    recovery_send = getattr(provider, "send_text_with_stale_ui_recovery", None)
-    recovery_stream_send = getattr(
-        provider, "send_text_with_stale_ui_recovery_streaming", None
+    # BrowserAuthorityLease fences the browser write and its terminal readback.
+    # Continuation preflight reads happen before any write is submitted, so they
+    # must not inherit the newly-issued write lease. A persistent runtime tab
+    # may still carry the previous completed turn's lease in extension storage;
+    # presenting the new lease during these reads would fail closed before the
+    # new turn has a chance to replace it.
+    current_lease = getattr(provider, "_current_browser_authority_lease_id", None)
+    clear_lease = getattr(provider, "clear_browser_authority_lease", None)
+    set_lease = getattr(provider, "set_browser_authority_lease", None)
+    suspended_lease_id = current_lease() if callable(current_lease) else None
+    suspend_prewrite_lease = (
+        conversation is not None
+        and isinstance(suspended_lease_id, str)
+        and bool(suspended_lease_id)
+        and callable(clear_lease)
+        and callable(set_lease)
     )
-    stream_send = getattr(provider, "send_text_streaming", None)
-    canonical_status_recovery_confirm = None
-    recovery_authorized = False
-    if (
-        is_continuation
-        and canonical_status_before_turn == "completed"
-        and callable(recovery_send)
-    ):
-        canonical_status_recovery_confirm = _canonical_status_value(self, conversation)
-        recovery_authorized = canonical_status_recovery_confirm == "completed"
+    if suspend_prewrite_lease:
+        clear_lease()
+    try:
+        if conversation is not None:
+            baseline_assistant_ids = _assistant_message_ids(self, conversation)
+            canonical_status_before_turn = _canonical_status_value(self, conversation)
+
+        recovery_send = getattr(provider, "send_text_with_stale_ui_recovery", None)
+        recovery_stream_send = getattr(
+            provider, "send_text_with_stale_ui_recovery_streaming", None
+        )
+        stream_send = getattr(provider, "send_text_streaming", None)
+        canonical_status_recovery_confirm = None
+        recovery_authorized = False
+        if (
+            is_continuation
+            and canonical_status_before_turn == "completed"
+            and callable(recovery_send)
+        ):
+            canonical_status_recovery_confirm = _canonical_status_value(self, conversation)
+            recovery_authorized = canonical_status_recovery_confirm == "completed"
+    finally:
+        if suspend_prewrite_lease:
+            set_lease(suspended_lease_id)
 
     self._emit_event(
         on_event,
@@ -466,6 +529,7 @@ def await_browser_native_final(
         timeout=remaining,
         interval=submission.poll_interval,
         include_readback=True,
+        turn_exchange_id=getattr(turn, "turn_exchange_id", None),
     )
 
     if canonical_payload is not None:

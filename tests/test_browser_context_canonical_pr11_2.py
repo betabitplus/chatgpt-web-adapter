@@ -207,6 +207,8 @@ def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -
     assert 'importScripts("service_worker_temporary_chat_route_reopen_probe.js")' not in source
 
     assert 'credentials: "include"' in source
+    assert 'fetch("/api/auth/session"' in source
+    assert 'authorization: "Bearer " + accessToken' in source
     assert "response.arrayBuffer()" in source
     assert 'crypto.subtle.digest("SHA-256", bytes)' in source
     assert "CWA_CANONICAL_CHUNK_BASE64_CHARS = 600_000" in source

@@ -543,7 +543,7 @@ async function executeNativeTurn(message) {
     ? message.conversationId.trim()
     : null;
   const timeoutMs = Number.isFinite(message.timeoutMs)
-    ? Math.max(10_000, Math.min(Number(message.timeoutMs), 300_000))
+    ? Math.max(10_000, Number(message.timeoutMs))
     : DEFAULT_TIMEOUT_MS;
 
   const tab = await ensureRuntimeTab(conversationId);

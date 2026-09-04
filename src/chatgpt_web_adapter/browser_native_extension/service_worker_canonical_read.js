@@ -22,6 +22,22 @@ function _cwaCanonicalStableReason(error) {
     : "CANONICAL_READ_BROWSER_ERROR";
 }
 
+async function _cwaCanonicalPruneOrphanedChatGPTTabs(canonicalTabId) {
+  const runtimeTabId = await storedRuntimeTabId();
+  const keep = new Set(
+    [runtimeTabId, canonicalTabId].filter((tabId) => Number.isInteger(tabId))
+  );
+  const tabs = await chrome.tabs.query({ url: `${CHATGPT_ORIGIN}/*` });
+  const orphanIds = tabs
+    .map((tab) => tab?.id)
+    .filter((tabId) => Number.isInteger(tabId) && !keep.has(tabId));
+  if (orphanIds.length > 0) {
+    try {
+      await chrome.tabs.remove(orphanIds);
+    } catch {}
+  }
+}
+
 async function _cwaCanonicalRuntimeTab() {
   const stored = await chrome.storage.local.get(CWA_CANONICAL_READ_TAB_KEY);
   const storedId = stored?.[CWA_CANONICAL_READ_TAB_KEY];
@@ -29,7 +45,9 @@ async function _cwaCanonicalRuntimeTab() {
     try {
       const tab = await chrome.tabs.get(storedId);
       if (isChatGPTUrl(tab?.url || "")) {
-        return tab.status === "complete" ? tab : waitForTabComplete(storedId);
+        const ready = tab.status === "complete" ? tab : await waitForTabComplete(storedId);
+        await _cwaCanonicalPruneOrphanedChatGPTTabs(storedId);
+        return ready;
       }
     } catch {
       await chrome.storage.local.remove(CWA_CANONICAL_READ_TAB_KEY);
@@ -41,7 +59,9 @@ async function _cwaCanonicalRuntimeTab() {
     throw new Error("CANONICAL_READ_RUNTIME_TAB_CREATE_FAILED");
   }
   await chrome.storage.local.set({ [CWA_CANONICAL_READ_TAB_KEY]: tab.id });
-  return waitForTabComplete(tab.id);
+  const ready = await waitForTabComplete(tab.id);
+  await _cwaCanonicalPruneOrphanedChatGPTTabs(tab.id);
+  return ready;
 }
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {

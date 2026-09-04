@@ -71,3 +71,16 @@ def test_canonical_reads_use_separate_persistent_tab() -> None:
     assert "storeRuntimeTabId" not in block
     assert "chrome.tabs.create" in block
     assert "active: false" in block
+
+
+def test_canonical_read_prunes_orphaned_chatgpt_tabs() -> None:
+    source = _read(CANONICAL)
+    start = source.index("async function _cwaCanonicalPruneOrphanedChatGPTTabs")
+    end = source.index("\nasync function _cwaCanonicalRuntimeTab", start)
+    block = source[start:end]
+
+    assert "storedRuntimeTabId()" in block
+    assert "chrome.tabs.query({ url: `${CHATGPT_ORIGIN}/*` })" in block
+    assert "!keep.has(tabId)" in block
+    assert "chrome.tabs.remove(orphanIds)" in block
+    assert source.count("await _cwaCanonicalPruneOrphanedChatGPTTabs(") == 2

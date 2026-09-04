@@ -31,6 +31,10 @@ submit proof -> debugger detach -> passive existing Web response stream -> termi
 
 Normal live observation must not poll ChatGPT. Polling is only a bounded fallback if the passive stream cannot be observed. Avoid DOM scraping as the primary path and never move browser transport work into `gptty`.
 
+The dedicated CWA browser profile is CWA-owned. Its steady state is exactly two ChatGPT tabs: the runtime tab and the canonical-read tab. Canonical reconcile prunes orphaned `chatgpt.com` tabs left by browser session restore or previous runs.
+
+After reinstalling changed extension assets, explicitly reload the unpacked extension before live verification. A Chrome process restart alone can retain stale MV3 imported-worker code.
+
 ## Adding features
 
 Create a short-lived branch from `main`. Put ChatGPT/browser/protocol/session/finality behavior in this repository. Put only terminal UX/rendering/commands in `gptty`. Merge to downstream `main` only after tests and the relevant live smoke pass.

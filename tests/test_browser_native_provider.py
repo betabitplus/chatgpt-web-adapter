@@ -4,7 +4,10 @@ import json
 import socket
 import threading
 
-from chatgpt_web_adapter.browser_native_protocol import recv_local_message, send_local_message
+from chatgpt_web_adapter.browser_native_protocol import (
+    recv_local_message,
+    send_local_message,
+)
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeTurnProvider
 
 

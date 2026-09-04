@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from chatgpt_web_adapter.browser_native_client import (
     _canonical_intermediate_events,
-    _sanitize_intermediate_text,
     _wait_for_new_final_assistant,
     send_browser_native,
 )

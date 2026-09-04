@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import threading
 import time
+from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from .browser_authority_lease import (
@@ -16,8 +16,12 @@ from .browser_authority_lease import (
 )
 from .browser_context_canonical import BROWSER_CONTEXT_CANONICAL_READ_PLANE
 from .browser_native_client import send_browser_native, set_browser_native_turn_provider
-from .browser_native_provider import BrowserNativeBridgeStatus, BrowserNativeTurnProvider
+from .browser_native_provider import (
+    BrowserNativeBridgeStatus,
+    BrowserNativeTurnProvider,
+)
 from .exceptions import ConversationTimeoutError, RequestError, WebChatAdapterError
+from .status import _status_from_payload
 from .types import ChatConversation, ChatResponse, ConversationRef
 
 READY = "READY_FOR_BROWSER_OWNED_WRITE"
@@ -231,6 +235,26 @@ def _canonical_status_value(client: Any, conversation: Any) -> str | None:
     status = client.get_status(conversation)
     value = getattr(status, "status", None)
     return value if isinstance(value, str) else None
+
+
+def _canonical_commit_snapshot(
+    client: Any,
+    conversation: Any,
+) -> tuple[str | None, dict[str, Any] | None, int]:
+    reader = getattr(client, "_get_conversation_payload", None)
+    if callable(reader):
+        conversation_id = ConversationRef.from_any(conversation).conversation_id
+        payload = reader(conversation_id)
+        if isinstance(payload, dict):
+            status = _status_from_payload(payload)
+            value = getattr(status, "status", None)
+            return (
+                value if isinstance(value, str) else None,
+                payload,
+                int(time.time() * 1000),
+            )
+    status = _canonical_status_value(client, conversation)
+    return status, None, int(time.time() * 1000)
 
 
 class BrowserOwnedProductWriteRuntime:
@@ -727,7 +751,11 @@ class BrowserOwnedProductWriteRuntime:
                 request_stage="browser_authority_policy",
             )
 
-        preflight = self.health(conversation)
+        # Bridge/extension availability is the only generic preflight needed here.
+        # Continuations perform one later canonical commit snapshot immediately
+        # before Browser Authority is issued; an earlier canonical health read
+        # would be stale by definition and only duplicate traffic.
+        preflight = self.health()
         if not preflight.ready:
             raise BrowserOwnedWriteRuntimeError(
                 f"browser-owned write preflight failed: {preflight.reason}",
@@ -739,9 +767,14 @@ class BrowserOwnedProductWriteRuntime:
                 request_stage="browser_owned_write_preflight",
             )
 
+        commit_payload: dict[str, Any] | None = None
+        commit_checked_at_ms: int | None = None
         if conversation is not None:
             try:
-                commit_status = _canonical_status_value(self.client, conversation)
+                commit_status, commit_payload, commit_checked_at_ms = _canonical_commit_snapshot(
+                    self.client,
+                    conversation,
+                )
             except Exception as error:
                 raise BrowserOwnedWriteRuntimeError(
                     "browser-owned write commit check failed: canonical read unavailable",
@@ -850,6 +883,8 @@ class BrowserOwnedProductWriteRuntime:
                 poll_interval=poll_interval,
                 on_token=on_token,
                 on_event=runtime_event,
+                _prewrite_canonical_payload=commit_payload,
+                _prewrite_canonical_completed_at_ms=commit_checked_at_ms,
             )
             turn_ref = self._finalize_turn(turn_ref)
             if lease_ref.state is BrowserAuthorityLeaseState.ACTIVE:

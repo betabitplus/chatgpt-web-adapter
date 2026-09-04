@@ -40,7 +40,12 @@ def test_passive_tap_has_no_network_dom_or_debugger_side_channel() -> None:
     assert "response.clone()" in source
     assert "response.body.getReader()" in source
     assert "isConversationWrite" in source
-    assert "originalFetch(input, init)" in source
+    assert "window.fetch = new Proxy(originalFetch" in source
+    assert "Reflect.apply(target, thisArg, args)" in source
+    assert "const originalWebSocket = window.WebSocket" in source
+    assert "window.WebSocket = WebSocketProxy" in source
+    assert "Reflect.construct(target, args, constructor)" in source
+    assert "new WebSocket(" not in source
     for forbidden in (
         "/api/auth/session",
         "backend-api/conversation/",
@@ -176,6 +181,7 @@ onMessage({{
         "passive_thinking_block",
         "passive_tool_call",
         "passive_turn_terminal",
+        "passive_stream_ended",
     ]
     assert payload["events"][1]["text"] == "Первый нюанс уже появился: читаю workspace последовательно."
     assert payload["events"][2]["tool_name"] == "api_tool.call_tool"
@@ -186,7 +192,113 @@ onMessage({{
 def test_passive_worker_requires_real_stream_start_before_long_observation() -> None:
     worker = WORKER.read_text(encoding="utf-8")
     assert "CWA_PASSIVE_STREAM_START_GRACE_MS = 2_000" in worker
+    assert "CWA_PASSIVE_STREAM_END_GRACE_MS = 2_000" in worker
+    assert "CWA_PASSIVE_HANDOFF_START_GRACE_MS = 5_000" in worker
+    assert 'message.event?.type === "passive_stream_handoff"' in worker
     assert 'message.event?.type === "passive_stream_started"' in worker
+    assert 'message.event?.type === "passive_stream_ended"' in worker
+    assert "session.handoffPending = true" in worker
     assert "session.streamObserved = true" in worker
+    assert "session.activeStreamCount += 1" in worker
+    assert "session.activeStreamCount = Math.max(0, session.activeStreamCount - 1)" in worker
     assert 'error: "PASSIVE_OBSERVER_STREAM_NOT_OBSERVED"' in worker
+    assert 'error: "PASSIVE_OBSERVER_STREAM_ENDED_WITHOUT_TERMINAL"' in worker
     assert "session.startupTimer = setTimeout" in worker
+    assert "_cwaPassiveScheduleEndedFallback(session)" in worker
+
+
+def test_passive_tap_follows_existing_page_websocket_handoff_without_new_network() -> None:
+    harness = f"""
+const fs = require('fs');
+const vm = require('vm');
+const source = fs.readFileSync({json.dumps(str(MAIN))}, 'utf8');
+const listeners = new Map();
+const posted = [];
+let fetchCount = 0;
+class FakeWebSocket {{
+  constructor(url) {{ this.url = url; this.listeners = new Map(); FakeWebSocket.last = this; }}
+  addEventListener(type, fn) {{
+    const current = this.listeners.get(type) || [];
+    current.push(fn);
+    this.listeners.set(type, current);
+  }}
+  emit(type, data) {{
+    for (const fn of this.listeners.get(type) || []) fn({{data}});
+  }}
+}}
+const fakeWindow = {{
+  fetch: async (_input, _init) => {{
+    fetchCount += 1;
+    const handoff = {{
+      type: 'stream_handoff',
+      conversation_id: 'conversation-1',
+      turn_exchange_id: 'turn-ws-1',
+      options: [{{type:'subscribe_ws_topic', topic_id:'topic-1'}}]
+    }};
+    const body = `data: ${{JSON.stringify(handoff)}}\\n\\ndata: [DONE]\\n\\n`;
+    return new Response(body, {{status: 200, headers: {{'content-type':'text/event-stream'}}}});
+  }},
+  WebSocket: FakeWebSocket,
+  postMessage: (value, _origin) => posted.push(value),
+  addEventListener: (type, fn) => listeners.set(type, fn),
+}};
+global.window = fakeWindow;
+global.location = {{origin:'https://chatgpt.com', href:'https://chatgpt.com/c/conversation-1', pathname:'/c/conversation-1'}};
+global.Request = Request;
+vm.runInThisContext(source, {{filename:'passive_stream_tap_main.js'}});
+const onMessage = listeners.get('message');
+onMessage({{
+  source: fakeWindow,
+  origin: 'https://chatgpt.com',
+  data: {{channel:'cwa-passive-stream-v1', direction:'control', action:'arm', observerId:'observer-ws'}}
+}});
+(async () => {{
+  const socket = new fakeWindow.WebSocket('wss://example.invalid/celsius');
+  await fakeWindow.fetch('https://chatgpt.com/backend-api/f/conversation', {{method:'POST'}});
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const finalPayload = {{
+    message: {{
+      id: 'final-ws-1',
+      author: {{role:'assistant'}},
+      recipient: 'all',
+      content: {{content_type:'text', parts:['WS_FINAL']}},
+      metadata: {{finish_details: {{type:'stop'}}, turn_exchange_id:'turn-ws-1'}},
+      end_turn: true
+    }}
+  }};
+  const encoded = `data: ${{JSON.stringify(finalPayload)}}\\n\\n`;
+  socket.emit('message', JSON.stringify([{{
+    type:'message',
+    topic_id:'topic-1',
+    payload: {{type:'conversation-turn-stream', payload: {{type:'stream-item', encoded_item: encoded}}}}
+  }}]));
+  socket.emit('message', JSON.stringify([{{
+    type:'message',
+    topic_id:'topic-1',
+    payload: {{type:'conversation-turn-stream', payload: {{type:'done'}}}}
+  }}]));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const events = posted.filter((value) => value?.direction === 'event').map((value) => value.event);
+  console.log(JSON.stringify({{fetchCount, events, proxied: fakeWindow.WebSocket !== FakeWebSocket}}));
+}})();
+"""
+    completed = subprocess.run(
+        ["node", "-e", harness],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    payload = json.loads(completed.stdout.strip())
+    assert payload["fetchCount"] == 1
+    assert payload["proxied"] is True
+    assert [event["type"] for event in payload["events"]] == [
+        "passive_stream_started",
+        "passive_stream_handoff",
+        "passive_stream_ended",
+        "passive_stream_started",
+        "passive_turn_terminal",
+        "passive_stream_ended",
+    ]
+    assert payload["events"][4]["message_id"] == "final-ws-1"
+    assert payload["events"][4]["turn_exchange_id"] == "turn-ws-1"

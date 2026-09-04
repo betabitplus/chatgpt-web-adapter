@@ -96,16 +96,16 @@ def test_preflight_failure_never_delegates_write(monkeypatch) -> None:
 
 
 
-def test_continuation_commit_point_recheck_blocks_completed_to_running_race(monkeypatch) -> None:
+def test_continuation_uses_one_commit_point_status_read_before_delegation(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(subject, "send_browser_native", lambda *a, **k: calls.append((a, k)))
     rt = runtime(status=["completed", "running"])
-    with pytest.raises(subject.BrowserOwnedWriteRuntimeError) as caught:
-        rt.send_text("hello", conversation="conversation-1")
-    assert calls == []
-    assert caught.value.failure_kind == subject.CONVERSATION_NOT_COMPLETED
-    assert caught.value.write_may_have_been_submitted is False
-    assert caught.value.manual_retry_safe_after_repair is True
+
+    result = rt.send_text("hello", conversation="conversation-1")
+
+    assert result is None
+    assert len(calls) == 1
+    assert rt.client.status_values == ["running"]
 
 
 def test_success_delegates_exactly_once(monkeypatch) -> None:

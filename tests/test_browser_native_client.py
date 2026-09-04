@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from chatgpt_web_adapter.browser_native_client import (
     _canonical_intermediate_events,
     _wait_for_new_final_assistant,
     send_browser_native,
+    submit_browser_native,
 )
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeTurnResult
 from chatgpt_web_adapter.exceptions import RequestError
@@ -181,6 +183,70 @@ def test_completed_continuation_authorizes_bounded_stale_ui_recovery() -> None:
     assert write_events[0]["runtime_reload_ms"] == 321
 
 
+def test_continuation_prewrite_reuses_one_canonical_payload_for_baseline_and_status() -> None:
+    provider = RecoveryFakeProvider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def _get_conversation_payload(self, conversation_id):
+            assert conversation_id == "existing-conversation"
+            self.reads += 1
+            return _completed_canonical_payload()
+
+        def get_status(self, conversation):
+            assert conversation == "existing-conversation"
+            self.reads += 1
+            return SimpleNamespace(status="completed")
+
+        def _emit_event(self, callback, event_type, **payload):
+            return None
+
+    client = Client()
+    submission = submit_browser_native(
+        client,
+        "hello",
+        conversation="existing-conversation",
+        timeout=2,
+        poll_interval=0.01,
+    )
+
+    assert submission.baseline_message_ids == frozenset({"assistant-1"})
+    assert submission.baseline_assistant_ids == frozenset({"assistant-1"})
+    assert client.reads == 2
+    assert len(provider.recovery_calls) == 1
+
+
+def test_supplied_commit_payload_avoids_duplicate_baseline_read() -> None:
+    provider = FakeProvider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def _get_conversation_payload(self, _conversation_id):
+            raise AssertionError("commit payload should be reused instead of reread")
+
+        def _emit_event(self, callback, event_type, **payload):
+            return None
+
+    client = Client()
+    submission = submit_browser_native(
+        client,
+        "hello",
+        conversation="existing-conversation",
+        timeout=2,
+        poll_interval=0.01,
+        _prewrite_canonical_payload=_completed_canonical_payload(),
+    )
+
+    assert submission.baseline_message_ids == frozenset({"assistant-1"})
+    assert submission.baseline_assistant_ids == frozenset({"assistant-1"})
+    assert provider.normal_calls == [("hello", "existing-conversation", 2)]
+
+
 def test_running_continuation_never_authorizes_stale_ui_recovery() -> None:
     provider = RecoveryFakeProvider()
     client = _client(provider, status_value="running")
@@ -289,6 +355,37 @@ def _completed_canonical_payload() -> dict:
             }
         },
     }
+
+
+def test_fresh_internal_commit_evidence_skips_duplicate_recovery_status_read() -> None:
+    provider = RecoveryFakeProvider()
+    checked_at_ms = int(time.time() * 1000)
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def _get_conversation_payload(self, _conversation_id):
+            raise AssertionError("fresh supplied commit payload must be reused")
+
+        def get_status(self, _conversation):
+            raise AssertionError("fresh internal commit evidence must skip status recheck")
+
+        def _emit_event(self, callback, event_type, **payload):
+            return None
+
+    submission = submit_browser_native(
+        Client(),
+        "hello",
+        conversation="existing-conversation",
+        timeout=2,
+        poll_interval=0.01,
+        _prewrite_canonical_payload=_completed_canonical_payload(),
+        _prewrite_canonical_completed_at_ms=checked_at_ms,
+    )
+
+    assert submission.baseline_message_ids == frozenset({"assistant-1"})
+    assert len(provider.recovery_calls) == 1
+    assert provider.recovery_calls[0][3] == checked_at_ms
 
 
 def test_progress_message_cannot_finalize_long_turn(monkeypatch) -> None:
@@ -741,7 +838,7 @@ def test_passive_observer_waits_without_canonical_polling_then_reconciles_once()
             self.normal_calls.append((text, conversation, timeout))
             return BrowserNativeTurnResult(
                 conversation_id="conversation-1",
-                turn_exchange_id="turn-1",
+                turn_exchange_id=None,
                 response_status=200,
                 response_mime_type="text/event-stream",
                 final_url="https://chatgpt.com/c/conversation-1",
@@ -776,7 +873,7 @@ def test_passive_observer_waits_without_canonical_polling_then_reconciles_once()
             return {
                 "ok": True,
                 "conversationId": conversation_id,
-                "turnExchangeId": turn_exchange_id,
+                "turnExchangeId": "turn-passive",
                 "messageId": "assistant-1",
                 "finishReason": "stop",
             }
@@ -811,7 +908,9 @@ def test_passive_observer_waits_without_canonical_polling_then_reconciles_once()
     )
 
     assert response.text == "done"
+    assert response.request.turn_exchange_id == "turn-passive"
     assert len(provider.observe_calls) == 1
+    assert provider.observe_calls[0][1] is None
     assert client.reads == 1
     assert any(
         event.get("type") == "canonical_intermediate_message"

@@ -14,7 +14,9 @@ from chatgpt_web_adapter.browser_context_canonical import (
     _CanonicalReadChunkCollector,
 )
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeTurnProvider
-from chatgpt_web_adapter.browser_owned_product_transport import BrowserOwnedProductTransport
+from chatgpt_web_adapter.browser_owned_product_transport import (
+    BrowserOwnedProductTransport,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSION = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
@@ -211,7 +213,11 @@ def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -
 
     assert 'credentials: "include"' in source
     assert 'fetch("/api/auth/session"' in source
-    assert 'authorization: "Bearer " + accessToken' in source
+    assert 'authorization: "Bearer " + token' in source
+    assert 'const cacheKey = "__cwaCanonicalAccessTokenV1"' in source
+    assert "const cacheTtlMs = 60_000" in source
+    assert "globalThis[cacheKey] = { token, cachedAtMs: Date.now() }" in source
+    assert "delete globalThis[cacheKey]" in source
     assert "response.arrayBuffer()" in source
     assert 'crypto.subtle.digest("SHA-256", bytes)' in source
     assert "CWA_CANONICAL_CHUNK_BASE64_CHARS = 600_000" in source

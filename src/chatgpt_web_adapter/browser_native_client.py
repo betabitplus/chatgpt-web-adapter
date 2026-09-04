@@ -49,6 +49,8 @@ class BrowserNativeSubmission:
 _CANONICAL_LIVE_POLL_INTERVAL_SECONDS = 15.0
 _CANONICAL_RATE_LIMIT_BACKOFF_SECONDS = 15.0
 _PASSIVE_FINAL_RECONCILE_RETRY_SECONDS = 5.0
+_PASSIVE_FINAL_RECONCILE_SETTLE_SECONDS = 4.0
+_PREWRITE_CANONICAL_COMPLETION_MAX_AGE_MS = 5_000
 _CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS = 6_000
 _SENSITIVE_KEY_RE = re.compile(
     r"(?:authorization|cookie|set[-_]?cookie|access[-_]?token|refresh[-_]?token|"
@@ -90,6 +92,63 @@ def _canonical_status_value(self: Any, conversation: Any) -> str | None:
         return None
     value = getattr(status, "status", None)
     return value if isinstance(value, str) else None
+
+
+def _canonical_prewrite_snapshot(
+    self: Any,
+    conversation: Any,
+    *,
+    canonical_payload: dict[str, Any] | None = None,
+) -> tuple[set[str], set[str], str | None]:
+    """Resolve continuation baseline IDs/status, reusing a caller-owned commit snapshot."""
+
+    payload = canonical_payload
+    if payload is None:
+        canonical_reader = getattr(self, "_get_conversation_payload", None)
+        if callable(canonical_reader):
+            ref = ConversationRef.from_any(conversation)
+            candidate = canonical_reader(ref.conversation_id)
+            if isinstance(candidate, dict):
+                payload = candidate
+    if isinstance(payload, dict):
+        message_ids: set[str] = set()
+        assistant_ids: set[str] = set()
+        for node_id, node in _current_branch_nodes(payload):
+            message = _chat_message_from_node(node_id, node)
+            if message is None:
+                continue
+            message_id = getattr(message, "message_id", None)
+            if not isinstance(message_id, str):
+                continue
+            message_ids.add(message_id)
+            if getattr(message, "role", None) == "assistant":
+                assistant_ids.add(message_id)
+        status = _status_from_payload(payload)
+        status_value = getattr(status, "status", None)
+        return (
+            message_ids,
+            assistant_ids,
+            status_value if isinstance(status_value, str) else None,
+        )
+
+    messages = self.get_messages(
+        conversation,
+        limit=None,
+        roles=None,
+        include_empty=True,
+    )
+    message_ids = {
+        message.message_id
+        for message in messages
+        if isinstance(getattr(message, "message_id", None), str)
+    }
+    assistant_ids = {
+        message.message_id
+        for message in messages
+        if getattr(message, "role", None) == "assistant"
+        and isinstance(getattr(message, "message_id", None), str)
+    }
+    return message_ids, assistant_ids, _canonical_status_value(self, conversation)
 
 
 def _status_finalizes_message(status: Any, message_id: str) -> bool:
@@ -575,6 +634,8 @@ def submit_browser_native(
     on_token: Callable[[str], None] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     attachment_paths: Sequence[str | Path] | None = None,
+    _prewrite_canonical_payload: dict[str, Any] | None = None,
+    _prewrite_canonical_completed_at_ms: int | None = None,
 ) -> BrowserNativeSubmission:
     """Perform exactly one browser-owned write and return before canonical finality."""
 
@@ -628,24 +689,15 @@ def submit_browser_native(
         clear_lease()
     try:
         if conversation is not None:
-            baseline_messages = self.get_messages(
+            (
+                baseline_message_ids,
+                baseline_assistant_ids,
+                canonical_status_before_turn,
+            ) = _canonical_prewrite_snapshot(
+                self,
                 conversation,
-                limit=None,
-                roles=None,
-                include_empty=True,
+                canonical_payload=_prewrite_canonical_payload,
             )
-            baseline_message_ids = {
-                message.message_id
-                for message in baseline_messages
-                if isinstance(getattr(message, "message_id", None), str)
-            }
-            baseline_assistant_ids = {
-                message.message_id
-                for message in baseline_messages
-                if getattr(message, "role", None) == "assistant"
-                and isinstance(getattr(message, "message_id", None), str)
-            }
-            canonical_status_before_turn = _canonical_status_value(self, conversation)
 
         recovery_send = getattr(provider, "send_text_with_stale_ui_recovery", None)
         recovery_stream_send = getattr(
@@ -654,13 +706,35 @@ def submit_browser_native(
         stream_send = getattr(provider, "send_text_streaming", None)
         canonical_status_recovery_confirm = None
         recovery_authorized = False
+        recovery_completed_at_ms: int | None = None
+        supplied_completion_age_ms = None
+        if (
+            isinstance(_prewrite_canonical_completed_at_ms, int)
+            and not isinstance(_prewrite_canonical_completed_at_ms, bool)
+            and _prewrite_canonical_completed_at_ms > 0
+        ):
+            supplied_completion_age_ms = int(time.time() * 1000) - _prewrite_canonical_completed_at_ms
+        reusable_commit_completion = (
+            is_continuation
+            and canonical_status_before_turn == "completed"
+            and isinstance(_prewrite_canonical_payload, dict)
+            and isinstance(supplied_completion_age_ms, int)
+            and 0 <= supplied_completion_age_ms <= _PREWRITE_CANONICAL_COMPLETION_MAX_AGE_MS
+        )
         if (
             is_continuation
             and canonical_status_before_turn == "completed"
             and callable(recovery_send)
         ):
-            canonical_status_recovery_confirm = _canonical_status_value(self, conversation)
-            recovery_authorized = canonical_status_recovery_confirm == "completed"
+            if reusable_commit_completion:
+                canonical_status_recovery_confirm = "completed"
+                recovery_authorized = True
+                recovery_completed_at_ms = _prewrite_canonical_completed_at_ms
+            else:
+                canonical_status_recovery_confirm = _canonical_status_value(self, conversation)
+                recovery_authorized = canonical_status_recovery_confirm == "completed"
+                if recovery_authorized:
+                    recovery_completed_at_ms = int(time.time() * 1000)
     finally:
         if suspend_prewrite_lease:
             set_lease(suspended_lease_id)
@@ -693,7 +767,7 @@ def submit_browser_native(
         else {}
     )
     if recovery_authorized:
-        canonical_completed_at_ms = int(time.time() * 1000)
+        canonical_completed_at_ms = recovery_completed_at_ms or int(time.time() * 1000)
         if streaming_requested and callable(recovery_stream_send):
             if normalized_attachment_paths and not _callable_accepts_attachment_paths(
                 recovery_stream_send
@@ -829,6 +903,7 @@ def await_browser_native_final(
     provider = getattr(self, "_browser_native_turn_provider", None)
     observe_turn = getattr(provider, "observe_turn", None)
     authority_lease_id = getattr(turn, "browser_authority_lease_id", None)
+    observed_turn_exchange_id = getattr(turn, "turn_exchange_id", None)
     passive_observer_used = False
 
     if (
@@ -846,18 +921,35 @@ def await_browser_native_final(
             _emit_revision_safe_event(self, submission.on_event, normalized)
 
         try:
-            observe_turn(
+            observe_result = observe_turn(
                 conversation_id=turn.conversation_id,
-                turn_exchange_id=getattr(turn, "turn_exchange_id", None),
+                turn_exchange_id=observed_turn_exchange_id,
                 browser_authority_lease_id=authority_lease_id,
                 timeout=remaining,
                 on_event=handle_passive_event,
             )
+            learned_turn_exchange_id = (
+                observe_result.get("turnExchangeId")
+                if isinstance(observe_result, dict)
+                else None
+            )
+            if isinstance(learned_turn_exchange_id, str) and learned_turn_exchange_id.strip():
+                observed_turn_exchange_id = learned_turn_exchange_id.strip()
             passive_observer_used = True
             remaining = max(
                 1.0,
                 submission.timeout - (time.monotonic() - submission.started_monotonic),
             )
+            settle_seconds = min(
+                _PASSIVE_FINAL_RECONCILE_SETTLE_SECONDS,
+                max(0.0, remaining - 1.0),
+            )
+            if settle_seconds > 0:
+                time.sleep(settle_seconds)
+                remaining = max(
+                    1.0,
+                    submission.timeout - (time.monotonic() - submission.started_monotonic),
+                )
         except (RequestError, OSError, EOFError, ValueError) as error:
             self._emit_event(
                 submission.on_event,
@@ -874,7 +966,7 @@ def await_browser_native_final(
         timeout=remaining,
         interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS if passive_observer_used else submission.poll_interval,
         include_readback=True,
-        turn_exchange_id=getattr(turn, "turn_exchange_id", None),
+        turn_exchange_id=observed_turn_exchange_id,
         retry_400_until_timeout=retry_400_until_timeout,
         on_event=None if passive_observer_used else submission.on_event,
         submission_id=submission.submission_id,
@@ -916,7 +1008,7 @@ def await_browser_native_final(
             conversation_id=turn.conversation_id,
             is_continuation=submission.is_continuation,
             observed_model=final_message.model,
-            turn_exchange_id=turn.turn_exchange_id,
+            turn_exchange_id=observed_turn_exchange_id,
         ),
     )
 
@@ -963,6 +1055,8 @@ def send_browser_native(
     on_token: Callable[[str], None] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     attachment_paths: Sequence[str | Path] | None = None,
+    _prewrite_canonical_payload: dict[str, Any] | None = None,
+    _prewrite_canonical_completed_at_ms: int | None = None,
 ) -> ChatResponse:
     """Compatibility composition: submit exactly once, then await canonical finality."""
 
@@ -975,5 +1069,7 @@ def send_browser_native(
         on_token=on_token,
         on_event=on_event,
         attachment_paths=attachment_paths,
+        _prewrite_canonical_payload=_prewrite_canonical_payload,
+        _prewrite_canonical_completed_at_ms=_prewrite_canonical_completed_at_ms,
     )
     return await_browser_native_final(self, submission)

@@ -1,6 +1,7 @@
 const _cwaCanonicalPriorOnNativeMessage = onNativeMessage;
 const CWA_CANONICAL_CHUNK_BASE64_CHARS = 600_000;
 const CWA_CANONICAL_READ_TAB_KEY = "browserNativeCanonicalReadTabIdV1";
+const CWA_CANONICAL_READ_URL = `${CHATGPT_ORIGIN}/robots.txt`;
 
 function _cwaCanonicalConversationId(value) {
   const conversationId = typeof value === "string" ? value.trim() : "";
@@ -43,8 +44,14 @@ async function _cwaCanonicalRuntimeTab() {
   const storedId = stored?.[CWA_CANONICAL_READ_TAB_KEY];
   if (Number.isInteger(storedId)) {
     try {
-      const tab = await chrome.tabs.get(storedId);
+      let tab = await chrome.tabs.get(storedId);
       if (isChatGPTUrl(tab?.url || "")) {
+        if (tab.url !== CWA_CANONICAL_READ_URL) {
+          tab = await chrome.tabs.update(storedId, {
+            url: CWA_CANONICAL_READ_URL,
+            active: false,
+          });
+        }
         const ready = tab.status === "complete" ? tab : await waitForTabComplete(storedId);
         await _cwaCanonicalPruneOrphanedChatGPTTabs(storedId);
         return ready;
@@ -54,7 +61,7 @@ async function _cwaCanonicalRuntimeTab() {
     }
   }
 
-  const tab = await chrome.tabs.create({ url: `${CHATGPT_ORIGIN}/`, active: false });
+  const tab = await chrome.tabs.create({ url: CWA_CANONICAL_READ_URL, active: false });
   if (!Number.isInteger(tab?.id)) {
     throw new Error("CANONICAL_READ_RUNTIME_TAB_CREATE_FAILED");
   }
@@ -78,39 +85,80 @@ async function _cwaCanonicalFetch(tabId, conversationId, timeoutMs) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ${JSON.stringify(timeoutMs)});
     try {
-      const sessionResponse = await fetch("/api/auth/session", {
-        method: "GET",
-        credentials: "include",
-        cache: "no-store",
-        headers: { accept: "application/json" },
-        signal: controller.signal
-      });
-      let sessionPayload = null;
-      try {
-        sessionPayload = await sessionResponse.json();
-      } catch {}
-      const accessToken = typeof sessionPayload?.accessToken === "string"
-        ? sessionPayload.accessToken.trim()
-        : "";
-      if (!sessionResponse.ok || !accessToken) {
-        return {
-          ok: false,
-          status: sessionResponse.status,
-          contentType: (sessionResponse.headers.get("content-type") || "").slice(0, 128),
-          reasonCode: "CANONICAL_READ_AUTHENTICATION_REQUIRED",
-          retryable: false
-        };
+      const cacheKey = "__cwaCanonicalAccessTokenV1";
+      const cacheTtlMs = 60_000;
+      const now = Date.now();
+      const cached = globalThis[cacheKey];
+      let accessToken = (
+        cached &&
+        typeof cached.token === "string" &&
+        cached.token &&
+        Number.isFinite(cached.cachedAtMs) &&
+        now - cached.cachedAtMs >= 0 &&
+        now - cached.cachedAtMs < cacheTtlMs
+      ) ? cached.token : "";
+
+      const refreshAccessToken = async () => {
+        const sessionResponse = await fetch("/api/auth/session", {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+          headers: { accept: "application/json" },
+          signal: controller.signal
+        });
+        let sessionPayload = null;
+        try {
+          sessionPayload = await sessionResponse.json();
+        } catch {}
+        const token = typeof sessionPayload?.accessToken === "string"
+          ? sessionPayload.accessToken.trim()
+          : "";
+        if (!sessionResponse.ok || !token) {
+          return {
+            ok: false,
+            status: sessionResponse.status,
+            contentType: (sessionResponse.headers.get("content-type") || "").slice(0, 128),
+            token: ""
+          };
+        }
+        globalThis[cacheKey] = { token, cachedAtMs: Date.now() };
+        return { ok: true, status: sessionResponse.status, contentType: "", token };
+      };
+
+      if (!accessToken) {
+        const refreshed = await refreshAccessToken();
+        if (!refreshed.ok) {
+          return {
+            ok: false,
+            status: refreshed.status,
+            contentType: refreshed.contentType,
+            reasonCode: "CANONICAL_READ_AUTHENTICATION_REQUIRED",
+            retryable: false
+          };
+        }
+        accessToken = refreshed.token;
       }
-      const response = await fetch(${JSON.stringify(endpoint)}, {
+
+      const fetchConversation = (token) => fetch(${JSON.stringify(endpoint)}, {
         method: "GET",
         credentials: "include",
         cache: "no-store",
         headers: {
           accept: "application/json",
-          authorization: "Bearer " + accessToken
+          authorization: "Bearer " + token
         },
         signal: controller.signal
       });
+
+      let response = await fetchConversation(accessToken);
+      if ((response.status === 401 || response.status === 403) && globalThis[cacheKey]) {
+        delete globalThis[cacheKey];
+        const refreshed = await refreshAccessToken();
+        if (refreshed.ok) {
+          accessToken = refreshed.token;
+          response = await fetchConversation(accessToken);
+        }
+      }
       const contentType = (response.headers.get("content-type") || "").slice(0, 128);
       if (!response.ok) {
         const reasonCode = response.status === 404

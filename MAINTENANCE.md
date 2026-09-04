@@ -26,12 +26,12 @@ Keep browser/product drift isolated here. Reproduce the smallest failing browser
 The preferred live architecture is:
 
 ```text
-submit proof -> debugger detach -> passive existing Web response stream -> terminal event -> canonical final reconcile
+submit proof -> debugger detach -> passive page fetch/WebSocket stream -> terminal event -> short settle -> canonical final reconcile
 ```
 
-Normal live observation must not poll ChatGPT. Polling is only a bounded fallback if the passive stream cannot be observed. Avoid DOM scraping as the primary path and never move browser transport work into `gptty`.
+Normal live observation must not poll ChatGPT. Observe the page's existing conversation `fetch` response and any `subscribe_ws_topic` handoff on the page's own WebSocket; never create a second stream connection. Polling is only a bounded fallback if passive transport cannot be observed or ends without a terminal event. Avoid DOM scraping as the primary path and never move browser transport work into `gptty`.
 
-The dedicated CWA browser profile is CWA-owned. Its steady state is exactly two ChatGPT tabs: the runtime tab and the canonical-read tab. Canonical reconcile prunes orphaned `chatgpt.com` tabs left by browser session restore or previous runs.
+The dedicated CWA browser profile is CWA-owned. Its steady state is exactly two ChatGPT tabs: the runtime tab and a minimal same-origin canonical-read tab at `https://chatgpt.com/robots.txt`. The read tab deliberately avoids loading a second ChatGPT application while retaining authenticated same-origin canonical fetches. Its access token is cached in-page for at most 60 seconds and refreshed on authentication failure so canonical reads do not fetch `/api/auth/session` every time. Canonical reconcile prunes orphaned `chatgpt.com` tabs left by browser session restore or previous runs.
 
 After reinstalling changed extension assets, explicitly reload the unpacked extension before live verification. A Chrome process restart alone can retain stale MV3 imported-worker code.
 

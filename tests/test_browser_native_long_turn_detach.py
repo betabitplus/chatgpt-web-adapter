@@ -65,11 +65,13 @@ def test_canonical_reads_use_separate_persistent_tab() -> None:
     block = source[start:end]
 
     assert 'CWA_CANONICAL_READ_TAB_KEY = "browserNativeCanonicalReadTabIdV1"' in source
+    assert 'CWA_CANONICAL_READ_URL = `${CHATGPT_ORIGIN}/robots.txt`' in source
     assert "chrome.storage.local.get(CWA_CANONICAL_READ_TAB_KEY)" in block
     assert "chrome.storage.local.set({ [CWA_CANONICAL_READ_TAB_KEY]: tab.id })" in block
     assert "storedRuntimeTabId" not in block
     assert "storeRuntimeTabId" not in block
-    assert "chrome.tabs.create" in block
+    assert "chrome.tabs.create({ url: CWA_CANONICAL_READ_URL, active: false })" in block
+    assert "chrome.tabs.update(storedId" in block
     assert "active: false" in block
 
 

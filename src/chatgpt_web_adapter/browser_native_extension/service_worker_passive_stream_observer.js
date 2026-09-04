@@ -11,6 +11,8 @@ const _cwaPassivePriorOnNativeMessage = onNativeMessage;
 const CWA_PASSIVE_MAX_BUFFERED_EVENTS = 128;
 const CWA_PASSIVE_MAX_TEXT_CHARS = 12_000;
 const CWA_PASSIVE_STREAM_START_GRACE_MS = 2_000;
+const CWA_PASSIVE_STREAM_END_GRACE_MS = 2_000;
+const CWA_PASSIVE_HANDOFF_START_GRACE_MS = 5_000;
 
 let _cwaPassivePendingLeaseId = null;
 const _cwaPassiveSessions = new Map();
@@ -130,6 +132,10 @@ function _cwaPassiveCompleteSubscription(session, terminal) {
     clearTimeout(session.observeTimer);
     session.observeTimer = null;
   }
+  if (session.streamEndTimer !== null) {
+    clearTimeout(session.streamEndTimer);
+    session.streamEndTimer = null;
+  }
   postNative({
     protocol: BRIDGE_PROTOCOL_VERSION,
     type: "observe_turn_result",
@@ -143,15 +149,47 @@ function _cwaPassiveCompleteSubscription(session, terminal) {
   });
 }
 
+function _cwaPassiveScheduleEndedFallback(session) {
+  if (
+    !session?.subscriberRequestId ||
+    session.terminal ||
+    session.activeStreamCount !== 0 ||
+    session.streamEndTimer !== null
+  ) return;
+  const graceMs = session.handoffPending
+    ? CWA_PASSIVE_HANDOFF_START_GRACE_MS
+    : CWA_PASSIVE_STREAM_END_GRACE_MS;
+  session.streamEndTimer = setTimeout(() => {
+    session.streamEndTimer = null;
+    if (
+      !session.subscriberRequestId ||
+      session.terminal ||
+      session.activeStreamCount !== 0
+    ) return;
+    const requestId = session.subscriberRequestId;
+    session.subscriberRequestId = null;
+    postNative({
+      protocol: BRIDGE_PROTOCOL_VERSION,
+      type: "observe_turn_result",
+      request_id: requestId,
+      ok: false,
+      error: "PASSIVE_OBSERVER_STREAM_ENDED_WITHOUT_TERMINAL",
+    });
+    void _cwaPassiveCloseSession(session);
+  }, graceMs);
+}
+
 async function _cwaPassiveCloseSession(session) {
   if (!session) return;
   _cwaPassiveSessions.delete(session.leaseId);
   _cwaPassiveSessionsByObserverId.delete(session.observerId);
   if (session.observeTimer !== null) clearTimeout(session.observeTimer);
   if (session.startupTimer !== null) clearTimeout(session.startupTimer);
+  if (session.streamEndTimer !== null) clearTimeout(session.streamEndTimer);
   if (session.heartbeatTimer !== null) clearInterval(session.heartbeatTimer);
   session.observeTimer = null;
   session.startupTimer = null;
+  session.streamEndTimer = null;
   session.heartbeatTimer = null;
   try {
     await _cwaPassiveSendTabControl(session.tabId, "cwa_passive_disarm", session.observerId);
@@ -197,12 +235,31 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   const observerId = typeof message.observerId === "string" ? message.observerId.trim() : "";
   const session = observerId ? _cwaPassiveSessionsByObserverId.get(observerId) || null : null;
   if (!session || sender?.tab?.id !== session.tabId) return false;
+  if (message.event?.type === "passive_stream_handoff") {
+    session.handoffPending = true;
+    if (session.streamEndTimer !== null) {
+      clearTimeout(session.streamEndTimer);
+      session.streamEndTimer = null;
+    }
+    return false;
+  }
   if (message.event?.type === "passive_stream_started") {
     session.streamObserved = true;
+    session.handoffPending = false;
+    session.activeStreamCount += 1;
     if (session.startupTimer !== null) {
       clearTimeout(session.startupTimer);
       session.startupTimer = null;
     }
+    if (session.streamEndTimer !== null) {
+      clearTimeout(session.streamEndTimer);
+      session.streamEndTimer = null;
+    }
+    return false;
+  }
+  if (message.event?.type === "passive_stream_ended") {
+    session.activeStreamCount = Math.max(0, session.activeStreamCount - 1);
+    _cwaPassiveScheduleEndedFallback(session);
     return false;
   }
   const event = _cwaPassiveNormalizeEvent(message.event);
@@ -259,9 +316,12 @@ executeOfficialPageTurn = async function _cwaExecuteOfficialPageTurnWithPassiveA
     buffer: [],
     terminal: null,
     streamObserved: false,
+    handoffPending: false,
+    activeStreamCount: 0,
     subscriberRequestId: null,
     observeTimer: null,
     startupTimer: null,
+    streamEndTimer: null,
     heartbeatTimer: null,
   };
   _cwaPassiveSessions.set(leaseId, session);
@@ -345,6 +405,8 @@ onNativeMessage = async function _cwaOnNativeMessageWithPassiveObserve(message, 
       });
       void _cwaPassiveCloseSession(session);
     }, CWA_PASSIVE_STREAM_START_GRACE_MS);
+  } else if (session.activeStreamCount === 0) {
+    _cwaPassiveScheduleEndedFallback(session);
   }
 
   const timeoutMs = Number.isFinite(message.timeoutMs)
@@ -363,5 +425,6 @@ onNativeMessage = async function _cwaOnNativeMessageWithPassiveObserve(message, 
       ok: false,
       error: "PASSIVE_OBSERVER_TIMEOUT",
     });
+    void _cwaPassiveCloseSession(session);
   }, timeoutMs);
 };

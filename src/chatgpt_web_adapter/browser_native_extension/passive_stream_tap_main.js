@@ -15,11 +15,14 @@
   });
 
   let activeObserverId = null;
+  let activeWsTopicId = null;
   let syntheticId = 0;
   let currentPatchMessage = null;
   const emittedMessageIds = new Set();
   const pendingThinking = new Map();
-  const originalFetch = window.fetch.bind(window);
+  const originalFetch = window.fetch;
+  const originalWebSocket = window.WebSocket;
+  const websocketStates = new WeakMap();
 
   function stringValue(value) {
     return typeof value === "string" && value.trim() ? value.trim() : null;
@@ -256,6 +259,15 @@
     if (value.type === "stream_handoff") {
       context.conversationId = stringValue(value.conversation_id) || context.conversationId;
       context.turnExchangeId = stringValue(value.turn_exchange_id) || context.turnExchangeId;
+      const options = Array.isArray(value.options) ? value.options : [];
+      for (const option of options.slice(0, 16)) {
+        if (!option || typeof option !== "object" || option.type !== "subscribe_ws_topic") continue;
+        const topicId = stringValue(option.topic_id);
+        if (topicId && topicId !== activeWsTopicId) {
+          activeWsTopicId = topicId;
+          emit({ type: "passive_stream_handoff" });
+        }
+      }
     }
     for (const key of ["message", "messages", "data", "result", "payload", "turn", "v", "value"]) {
       if (Object.prototype.hasOwnProperty.call(value, key)) inspectIdentity(value[key], context, depth + 1);
@@ -324,6 +336,115 @@
     }
   }
 
+  function parseEncodedStreamItem(encodedItem) {
+    if (typeof encodedItem !== "string" || !encodedItem) return null;
+    let lastData = null;
+    let currentData = [];
+    for (const line of encodedItem.replace(/\r\n/g, "\n").split("\n")) {
+      if (!line) {
+        if (currentData.length) lastData = currentData.join("\n");
+        currentData = [];
+        continue;
+      }
+      if (line.startsWith("data:")) currentData.push(line.slice(5).trimStart());
+    }
+    if (currentData.length) lastData = currentData.join("\n");
+    return typeof lastData === "string" ? lastData.trim() : null;
+  }
+
+  function websocketObserverState(socket) {
+    if (!activeObserverId || !activeWsTopicId) return null;
+    let state = websocketStates.get(socket);
+    if (
+      !state ||
+      state.observerId !== activeObserverId ||
+      state.topicId !== activeWsTopicId
+    ) {
+      state = {
+        observerId: activeObserverId,
+        topicId: activeWsTopicId,
+        started: false,
+        ended: false,
+        context: { conversationId: null, turnExchangeId: null },
+      };
+      websocketStates.set(socket, state);
+    }
+    return state;
+  }
+
+  function startWebSocketObservation(state) {
+    if (!state || state.started) return;
+    state.started = true;
+    emit({ type: "passive_stream_started" });
+  }
+
+  function endWebSocketObservation(state) {
+    if (!state || state.ended) return;
+    state.ended = true;
+    if (state.started) emit({ type: "passive_stream_ended" });
+  }
+
+  function processWebSocketTopicMessage(socket, item) {
+    if (!activeObserverId || !activeWsTopicId || !item || typeof item !== "object") return;
+    if (stringValue(item.topic_id) !== activeWsTopicId) return;
+    const outer = item.payload;
+    if (!outer || typeof outer !== "object" || outer.type !== "conversation-turn-stream") return;
+    const inner = outer.payload;
+    if (!inner || typeof inner !== "object") return;
+    const state = websocketObserverState(socket);
+    if (!state) return;
+    startWebSocketObservation(state);
+    if (inner.type === "done") {
+      endWebSocketObservation(state);
+      return;
+    }
+    if (inner.type !== "stream-item") return;
+    const data = parseEncodedStreamItem(inner.encoded_item);
+    if (!data) return;
+    if (data === "[DONE]") {
+      endWebSocketObservation(state);
+      return;
+    }
+    let payload;
+    try { payload = JSON.parse(data); } catch { return; }
+    processPayload(payload, state.context);
+  }
+
+  function processWebSocketFrame(socket, rawFrame) {
+    if (!activeObserverId || !activeWsTopicId || typeof rawFrame !== "string") return;
+    let parsed;
+    try { parsed = JSON.parse(rawFrame); } catch { return; }
+    const items = Array.isArray(parsed) ? parsed.slice(0, 128) : [parsed];
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      if (item.type === "message") processWebSocketTopicMessage(socket, item);
+      const catchups = item?.reply?.catchups;
+      if (!Array.isArray(catchups)) continue;
+      for (const catchup of catchups.slice(0, 128)) {
+        if (catchup && stringValue(catchup.topic_id) === activeWsTopicId) {
+          processWebSocketTopicMessage(socket, catchup);
+        }
+      }
+    }
+  }
+
+  if (typeof originalWebSocket === "function") {
+    let WebSocketProxy = null;
+    WebSocketProxy = new Proxy(originalWebSocket, {
+      construct(target, args, newTarget) {
+        const constructor = newTarget === WebSocketProxy ? target : newTarget;
+        const socket = Reflect.construct(target, args, constructor);
+        try {
+          socket.addEventListener("message", (event) => {
+            processWebSocketFrame(socket, event?.data);
+          });
+        } catch {}
+        return socket;
+      },
+    });
+    window.WebSocket = WebSocketProxy;
+  }
+
   function isConversationWrite(url, method) {
     if (String(method || "GET").toUpperCase() !== "POST") return false;
     try {
@@ -369,33 +490,40 @@
       // Passive observation must never perturb the page request.
     } finally {
       try { reader.releaseLock(); } catch {}
+      if (activeObserverId === observerId) {
+        emit({ type: "passive_stream_ended" });
+      }
     }
   }
 
-  window.fetch = async function cwaPassiveFetch(input, init) {
-    const response = await originalFetch(input, init);
-    const observerId = activeObserverId;
-    if (!observerId) return response;
-    let url = "";
-    let method = "GET";
-    try {
-      if (input instanceof Request) {
-        url = input.url;
-        method = init?.method || input.method;
-      } else {
-        url = String(input || "");
-        method = init?.method || "GET";
-      }
-    } catch {}
-    if (!isConversationWrite(url, method)) return response;
-    try {
-      const clone = response.clone();
-      void observeResponse(clone, observerId);
-    } catch {
-      // Clone failure is observation-only.
-    }
-    return response;
-  };
+  window.fetch = new Proxy(originalFetch, {
+    apply(target, thisArg, args) {
+      const [input, init] = args;
+      return Reflect.apply(target, thisArg, args).then((response) => {
+        const observerId = activeObserverId;
+        if (!observerId) return response;
+        let url = "";
+        let method = "GET";
+        try {
+          if (input instanceof Request) {
+            url = input.url;
+            method = init?.method || input.method;
+          } else {
+            url = String(input || "");
+            method = init?.method || "GET";
+          }
+        } catch {}
+        if (!isConversationWrite(url, method)) return response;
+        try {
+          const clone = response.clone();
+          void observeResponse(clone, observerId);
+        } catch {
+          // Clone failure is observation-only.
+        }
+        return response;
+      });
+    },
+  });
 
   window.addEventListener("message", (event) => {
     if (event.source !== window || event.origin !== location.origin) return;
@@ -404,11 +532,13 @@
     const observerId = stringValue(data.observerId);
     if (data.action === "arm" && observerId) {
       activeObserverId = observerId;
+      activeWsTopicId = null;
       currentPatchMessage = null;
       emittedMessageIds.clear();
       pendingThinking.clear();
     } else if (data.action === "disarm" && (!observerId || observerId === activeObserverId)) {
       activeObserverId = null;
+      activeWsTopicId = null;
       currentPatchMessage = null;
       emittedMessageIds.clear();
       pendingThinking.clear();

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
+import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -9,6 +11,7 @@ from typing import Any, Callable, Sequence
 
 from .browser_native_provider import BrowserNativeTurnProvider
 from .exceptions import ConversationTimeoutError, RequestError
+from .message_text import extract_message_text
 from .messages import _chat_message_from_node, _current_branch_nodes
 from .product_media import current_browser_owned_attachment_paths
 from .revision_safe_streaming_pr8_9 import RevisionSafeTextAccumulator
@@ -30,6 +33,7 @@ class BrowserNativeSubmission:
     submission_id: str
     turn: Any
     baseline_assistant_ids: frozenset[str]
+    baseline_message_ids: frozenset[str]
     timeout: float
     poll_interval: float
     started_monotonic: float
@@ -40,6 +44,22 @@ class BrowserNativeSubmission:
     on_token: Callable[[str], None] | None
     on_event: Callable[[dict[str, Any]], None] | None
     final_response: ChatResponse | None = None
+
+
+_CANONICAL_LIVE_POLL_INTERVAL_SECONDS = 5.0
+_CANONICAL_RATE_LIMIT_BACKOFF_SECONDS = 15.0
+_CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS = 6_000
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?:authorization|cookie|set[-_]?cookie|access[-_]?token|refresh[-_]?token|"
+    r"id[-_]?token|api[-_]?key|password|passwd|secret|session[-_]?token|csrf)",
+    re.IGNORECASE,
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
+_SENSITIVE_LINE_RE = re.compile(
+    r"(?im)^(\s*(?:authorization|cookie|set[-_]?cookie|access[-_]?token|"
+    r"refresh[-_]?token|id[-_]?token|api[-_]?key|password|passwd|secret|"
+    r"session[-_]?token|csrf)\s*[:=]\s*).+$"
+)
 
 
 def set_browser_native_turn_provider(self: Any, provider: BrowserNativeTurnProvider | None) -> None:
@@ -94,6 +114,208 @@ def _node_turn_exchange_id(node: dict[str, Any]) -> str | None:
     return None
 
 
+def _redact_intermediate_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > 8:
+        return "[TRUNCATED]"
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 128:
+                redacted["..."] = "[TRUNCATED]"
+                break
+            rendered_key = str(key)
+            if _SENSITIVE_KEY_RE.search(rendered_key):
+                redacted[rendered_key] = "[REDACTED]"
+            else:
+                redacted[rendered_key] = _redact_intermediate_value(item, depth=depth + 1)
+        return redacted
+    if isinstance(value, list):
+        items = [_redact_intermediate_value(item, depth=depth + 1) for item in value[:128]]
+        if len(value) > 128:
+            items.append("[TRUNCATED]")
+        return items
+    if isinstance(value, str):
+        return _redact_intermediate_string(value)
+    return value
+
+
+def _redact_intermediate_string(value: str) -> str:
+    text = _BEARER_RE.sub("Bearer [REDACTED]", value)
+    return _SENSITIVE_LINE_RE.sub(lambda match: f"{match.group(1)}[REDACTED]", text)
+
+
+def _sanitize_intermediate_text(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) <= 200_000 and text[:1] in {"{", "["}:
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            pass
+        else:
+            text = json.dumps(
+                _redact_intermediate_value(parsed),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+    text = _redact_intermediate_string(text)
+    if len(text) > _CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS:
+        text = text[:_CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS].rstrip() + "\n…[truncated]"
+    return text
+
+
+def _tool_call_label(raw_message: dict[str, Any], metadata: dict[str, Any], recipient: str) -> str | None:
+    explicit = metadata.get("tool_invoking_message")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    raw = extract_message_text(raw_message).strip()
+    if not raw or len(raw) > 200_000 or raw[:1] not in {"{", "["}:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    if recipient == "api_tool.list_resources":
+        query = payload.get("query")
+        if isinstance(query, str) and query.strip():
+            return f"Discovering {query.strip()}..."
+        paths = payload.get("paths")
+        if isinstance(paths, list) and paths and isinstance(paths[0], str):
+            return f"Discovering {paths[0]} tools..."
+        return "Discovering tools..."
+
+    if recipient != "api_tool.call_tool":
+        return None
+
+    resource_path = payload.get("path")
+    action = None
+    if isinstance(resource_path, str) and resource_path.strip():
+        action = resource_path.rstrip("/").rsplit("/", 1)[-1].strip() or None
+    args = payload.get("args")
+    if not isinstance(args, dict):
+        args = {}
+
+    if action == "git_status":
+        return "Reading git status..."
+    if action == "show_changes":
+        return "Reviewing changes..."
+    if action == "open_workspace":
+        return "Opening workspace..."
+    if action == "read":
+        path = args.get("path")
+        if isinstance(path, str) and path.strip():
+            return f"Reading {path.strip()}..."
+        return "Reading file..."
+    if action == "tree":
+        path = args.get("path")
+        if isinstance(path, str) and path.strip():
+            return f"Reading tree {path.strip()}..."
+        return "Reading tree..."
+    if action == "search":
+        query = args.get("query")
+        if isinstance(query, str) and query.strip():
+            return f"Searching {query.strip()}..."
+        return "Searching workspace..."
+    if action == "bash":
+        return "Running command..."
+    if action:
+        return f"Calling {action.replace('_', ' ')}..."
+    return None
+
+
+def _canonical_intermediate_events(
+    payload: dict[str, Any],
+    *,
+    baseline_message_ids: set[str] | frozenset[str],
+    emitted_message_ids: set[str],
+    submission_id: str | None,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for node_id, node in _current_branch_nodes(payload):
+        raw_message = node.get("message")
+        if not isinstance(raw_message, dict):
+            continue
+        metadata = raw_message.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if metadata.get("is_visually_hidden_from_conversation") is True:
+            continue
+        message_id = raw_message.get("id")
+        if not isinstance(message_id, str) or not message_id.strip():
+            message_id = node_id
+        if message_id in baseline_message_ids or message_id in emitted_message_ids:
+            continue
+
+        author = raw_message.get("author")
+        if not isinstance(author, dict):
+            author = {}
+        role = author.get("role")
+        recipient = raw_message.get("recipient")
+        recipient = recipient.strip() if isinstance(recipient, str) else "all"
+        content = raw_message.get("content")
+        if not isinstance(content, dict):
+            content = {}
+        content_type = content.get("content_type")
+        text = ""
+        kind: str | None = None
+        label: str | None = None
+        tool_name: str | None = None
+
+        if role == "assistant" and recipient not in {"", "all"}:
+            kind = "tool_call"
+            tool_name = recipient
+            label = _tool_call_label(raw_message, metadata, recipient)
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+        elif role == "tool":
+            kind = "tool_result"
+            raw_name = author.get("name")
+            tool_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else recipient
+            label = metadata.get("tool_invoked_message")
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+        elif role == "assistant" and content_type == "reasoning_recap":
+            kind = "reasoning"
+            label = metadata.get("reasoning_title") or "Reasoning summary"
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+        elif role == "assistant" and content_type == "thoughts":
+            reasoning_title = metadata.get("reasoning_title")
+            if isinstance(reasoning_title, str) and reasoning_title.strip():
+                kind = "reasoning"
+                label = reasoning_title.strip()
+        elif (
+            role == "assistant"
+            and recipient in {"", "all"}
+            and metadata.get("is_thinking_preamble_message") is True
+        ):
+            kind = "assistant_progress"
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+        elif content_type == "tether_browsing_display":
+            kind = "activity"
+            label = "Browsing update"
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+
+        if kind is None:
+            continue
+        emitted_message_ids.add(message_id)
+        event = {
+            "type": "canonical_intermediate_message",
+            "message_id": message_id,
+            "message_kind": kind,
+            "text": text,
+            "label": label.strip() if isinstance(label, str) and label.strip() else None,
+            "tool_name": tool_name.strip() if isinstance(tool_name, str) and tool_name.strip() else None,
+        }
+        if submission_id is not None:
+            event["submission_id"] = submission_id
+        events.append(event)
+    return events
+
+
 def _assistant_candidates_from_payload(
     payload: dict[str, Any],
     *,
@@ -137,11 +359,14 @@ def _wait_for_new_final_assistant(
     conversation_id: str,
     *,
     baseline_assistant_ids: set[str] | frozenset[str],
+    baseline_message_ids: set[str] | frozenset[str] = frozenset(),
     timeout: float,
     interval: float,
     include_readback: bool = False,
     turn_exchange_id: str | None = None,
     retry_400_until_timeout: bool = False,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    submission_id: str | None = None,
 ) -> Any | tuple[Any, dict[str, Any] | None, int | None]:
     """Wait for canonical finality, optionally returning the reused payload.
 
@@ -159,9 +384,9 @@ def _wait_for_new_final_assistant(
     canonical_reader = getattr(self, "_get_conversation_payload", None)
     use_single_payload = callable(canonical_reader)
     canonical_payload_read_count = 0
+    emitted_message_ids = set(baseline_message_ids)
 
     while True:
-        transient_read_failure = False
         rate_limited_read_failure = False
         if use_single_payload:
             payload = None
@@ -180,12 +405,18 @@ def _wait_for_new_final_assistant(
                 retryable_error = bool(getattr(error, "retryable", False))
                 if error.status_code != 404 and not transient_400 and not retryable_error:
                     raise
-                transient_read_failure = True
                 rate_limited_read_failure = error.status_code == 429
                 payload = None
 
             if isinstance(payload, dict):
                 last_status = _status_from_payload(payload)
+                for event in _canonical_intermediate_events(
+                    payload,
+                    baseline_message_ids=baseline_message_ids,
+                    emitted_message_ids=emitted_message_ids,
+                    submission_id=submission_id,
+                ):
+                    _emit_revision_safe_event(self, on_event, event)
                 candidates = _assistant_candidates_from_payload(
                     payload,
                     baseline_assistant_ids=baseline_assistant_ids,
@@ -240,8 +471,15 @@ def _wait_for_new_final_assistant(
                 timeout=timeout,
                 last_status=last_status,
             )
-        retry_floor = 5.0 if rate_limited_read_failure else (2.0 if transient_read_failure else 0.2)
-        time.sleep(max(retry_floor, interval))
+        retry_floor = (
+            _CANONICAL_RATE_LIMIT_BACKOFF_SECONDS
+            if rate_limited_read_failure
+            else _CANONICAL_LIVE_POLL_INTERVAL_SECONDS
+        )
+        sleep_for = max(retry_floor, interval)
+        remaining_sleep = max(0.0, deadline - time.monotonic())
+        if remaining_sleep > 0:
+            time.sleep(min(sleep_for, remaining_sleep))
 
 
 def _emit_revision_safe_event(
@@ -331,6 +569,7 @@ def submit_browser_native(
     started = time.monotonic()
     submission_id = str(uuid.uuid4())
     baseline_assistant_ids: set[str] = set()
+    baseline_message_ids: set[str] = set()
     is_continuation = conversation is not None
     canonical_status_before_turn = None
 
@@ -355,7 +594,23 @@ def submit_browser_native(
         clear_lease()
     try:
         if conversation is not None:
-            baseline_assistant_ids = _assistant_message_ids(self, conversation)
+            baseline_messages = self.get_messages(
+                conversation,
+                limit=None,
+                roles=None,
+                include_empty=True,
+            )
+            baseline_message_ids = {
+                message.message_id
+                for message in baseline_messages
+                if isinstance(getattr(message, "message_id", None), str)
+            }
+            baseline_assistant_ids = {
+                message.message_id
+                for message in baseline_messages
+                if getattr(message, "role", None) == "assistant"
+                and isinstance(getattr(message, "message_id", None), str)
+            }
             canonical_status_before_turn = _canonical_status_value(self, conversation)
 
         recovery_send = getattr(provider, "send_text_with_stale_ui_recovery", None)
@@ -507,6 +762,7 @@ def submit_browser_native(
         submission_id=submission_id,
         turn=turn,
         baseline_assistant_ids=frozenset(baseline_assistant_ids),
+        baseline_message_ids=frozenset(baseline_message_ids),
         timeout=float(timeout),
         poll_interval=float(poll_interval),
         started_monotonic=started,
@@ -540,11 +796,14 @@ def await_browser_native_final(
         self,
         turn.conversation_id,
         baseline_assistant_ids=submission.baseline_assistant_ids,
+        baseline_message_ids=submission.baseline_message_ids,
         timeout=remaining,
         interval=submission.poll_interval,
         include_readback=True,
         turn_exchange_id=getattr(turn, "turn_exchange_id", None),
         retry_400_until_timeout=retry_400_until_timeout,
+        on_event=submission.on_event,
+        submission_id=submission.submission_id,
     )
 
     if canonical_payload is not None:

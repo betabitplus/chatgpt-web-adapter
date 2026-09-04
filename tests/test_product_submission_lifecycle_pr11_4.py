@@ -114,6 +114,7 @@ def _install_split_stubs(monkeypatch, provider: FakeProvider):
             submission_id="submission-1",
             turn=turn,
             baseline_assistant_ids=frozenset(),
+            baseline_message_ids=frozenset(),
             timeout=float(kwargs["timeout"]),
             poll_interval=float(kwargs["poll_interval"]),
             started_monotonic=1.0,

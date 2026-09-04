@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import json
 
 import pytest
 
 from chatgpt_web_adapter.browser_native_client import (
+    _canonical_intermediate_events,
+    _sanitize_intermediate_text,
     _wait_for_new_final_assistant,
     send_browser_native,
 )
@@ -359,13 +362,291 @@ def test_retryable_canonical_429_backs_off_and_recovers(monkeypatch) -> None:
         client,
         "conversation-1",
         baseline_assistant_ids=frozenset(),
-        timeout=0.5,
+        timeout=30.0,
         interval=0.01,
         include_readback=True,
     )
 
     assert client.calls == 2
-    assert sleeps == [5.0]
+    assert sleeps == [15.0]
     assert reads == 2
     assert payload is not None
     assert message.text == "done"
+
+
+def test_successful_canonical_polling_has_five_second_floor(monkeypatch) -> None:
+    pending = {
+        "conversation_id": "conversation-1",
+        "current_node": "user-node",
+        "mapping": {
+            "user-node": {
+                "id": "user-node",
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": "user-1",
+                    "author": {"role": "user"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["hello"]},
+                },
+            }
+        },
+    }
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _get_conversation_payload(self, conversation_id):
+            self.calls += 1
+            return pending if self.calls == 1 else _completed_canonical_payload()
+
+    sleeps = []
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client.time.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+    client = Client()
+    message, _, _ = _wait_for_new_final_assistant(
+        client,
+        "conversation-1",
+        baseline_assistant_ids=frozenset(),
+        timeout=30.0,
+        interval=0.01,
+        include_readback=True,
+    )
+
+    assert message.text == "done"
+    assert client.calls == 2
+    assert sleeps == [5.0]
+
+
+def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitive_fields() -> None:
+    sensitive_key = "access_" + "token"
+    sensitive_value = "hide-" + "this-value"
+
+    def node(node_id, parent, message):
+        return {"id": node_id, "parent": parent, "children": [], "message": message}
+
+    mapping = {
+        "user": node(
+            "user",
+            None,
+            {
+                "id": "m-user",
+                "author": {"role": "user"},
+                "recipient": "all",
+                "content": {"content_type": "text", "parts": ["work"]},
+            },
+        ),
+        "preamble": node(
+            "preamble",
+            "user",
+            {
+                "id": "m-preamble",
+                "author": {"role": "assistant"},
+                "recipient": "all",
+                "content": {"content_type": "text", "parts": ["Reading files…"]},
+                "metadata": {"is_thinking_preamble_message": True},
+                "end_turn": False,
+            },
+        ),
+        "call": node(
+            "call",
+            "preamble",
+            {
+                "id": "m-call",
+                "author": {"role": "assistant"},
+                "recipient": "api_tool.call_tool",
+                "content": {
+                    "content_type": "code",
+                    "text": json.dumps({"args": {"path": "/tmp/readme", sensitive_key: sensitive_value}}),
+                },
+                "metadata": {"tool_invoking_message": "Reading README…"},
+                "end_turn": False,
+            },
+        ),
+        "result": node(
+            "result",
+            "call",
+            {
+                "id": "m-result",
+                "author": {"role": "tool", "name": "api_tool.call_tool"},
+                "recipient": "all",
+                "content": {"content_type": "code", "text": json.dumps({"ok": True})},
+                "metadata": {"tool_invoked_message": "README read"},
+            },
+        ),
+        "thoughts": node(
+            "thoughts",
+            "result",
+            {
+                "id": "m-thoughts",
+                "author": {"role": "assistant"},
+                "recipient": "all",
+                "content": {"content_type": "thoughts", "parts": ["private raw reasoning"]},
+                "metadata": {"reasoning_title": "Checking context"},
+                "end_turn": False,
+            },
+        ),
+        "recap": node(
+            "recap",
+            "thoughts",
+            {
+                "id": "m-recap",
+                "author": {"role": "assistant"},
+                "recipient": "all",
+                "content": {"content_type": "reasoning_recap", "parts": ["Worked for 12s"]},
+                "end_turn": False,
+            },
+        ),
+        "final": node(
+            "final",
+            "recap",
+            {
+                "id": "m-final",
+                "author": {"role": "assistant"},
+                "recipient": "all",
+                "content": {"content_type": "text", "parts": ["done"]},
+                "end_turn": True,
+            },
+        ),
+    }
+    payload = {"conversation_id": "conversation-1", "current_node": "final", "mapping": mapping}
+    emitted = set()
+
+    events = _canonical_intermediate_events(
+        payload,
+        baseline_message_ids=frozenset(),
+        emitted_message_ids=emitted,
+        submission_id="submission-1",
+    )
+
+    assert [event["message_kind"] for event in events] == [
+        "assistant_progress",
+        "tool_call",
+        "tool_result",
+        "reasoning",
+        "reasoning",
+    ]
+    assert events[0]["text"] == "Reading files…"
+    assert events[1]["label"] == "Reading README…"
+    assert sensitive_value not in events[1]["text"]
+    assert "[REDACTED]" in events[1]["text"]
+    assert events[2]["label"] == "README read"
+    assert events[3]["label"] == "Checking context"
+    assert events[3]["text"] == ""
+    assert "private raw reasoning" not in repr(events)
+    assert events[4]["text"] == "Worked for 12s"
+    assert "m-final" not in emitted
+
+
+def test_unlabeled_tool_calls_get_concise_context_and_plain_thoughts_are_suppressed() -> None:
+    payload = {
+        "conversation_id": "conversation-1",
+        "current_node": "thoughts",
+        "mapping": {
+            "call": {
+                "id": "call",
+                "parent": None,
+                "children": ["thoughts"],
+                "message": {
+                    "id": "m-call",
+                    "author": {"role": "assistant"},
+                    "recipient": "api_tool.call_tool",
+                    "content": {
+                        "content_type": "code",
+                        "text": json.dumps(
+                            {
+                                "path": "/CodexTool/link_x/read",
+                                "args": {"workspace_id": "ws-1", "path": "README.md"},
+                            }
+                        ),
+                    },
+                    "metadata": {},
+                    "end_turn": False,
+                },
+            },
+            "thoughts": {
+                "id": "thoughts",
+                "parent": "call",
+                "children": [],
+                "message": {
+                    "id": "m-thoughts-plain",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "thoughts", "parts": ["private raw reasoning"]},
+                    "metadata": {},
+                    "end_turn": False,
+                },
+            },
+        },
+    }
+    emitted: set[str] = set()
+
+    events = _canonical_intermediate_events(
+        payload,
+        baseline_message_ids=frozenset(),
+        emitted_message_ids=emitted,
+        submission_id="submission-1",
+    )
+
+    assert [event["message_kind"] for event in events] == ["tool_call"]
+    assert events[0]["label"] == "Reading README.md..."
+    assert "private raw reasoning" not in repr(events)
+
+
+def test_current_canonical_progress_node_is_emitted_immediately() -> None:
+    payload = {
+        "conversation_id": "conversation-1",
+        "current_node": "progress",
+        "mapping": {
+            "user": {
+                "id": "user",
+                "parent": None,
+                "children": ["progress"],
+                "message": {
+                    "id": "m-user",
+                    "author": {"role": "user"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["work"]},
+                },
+            },
+            "progress": {
+                "id": "progress",
+                "parent": "user",
+                "children": [],
+                "message": {
+                    "id": "m-progress",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {
+                        "content_type": "text",
+                        "parts": ["Первый файл большой, читаю его диапазонами."],
+                    },
+                    "metadata": {"is_thinking_preamble_message": True},
+                    "end_turn": False,
+                },
+            },
+        },
+    }
+    emitted: set[str] = set()
+
+    events = _canonical_intermediate_events(
+        payload,
+        baseline_message_ids=frozenset({"m-user"}),
+        emitted_message_ids=emitted,
+        submission_id="submission-1",
+    )
+
+    assert events == [
+        {
+            "type": "canonical_intermediate_message",
+            "message_id": "m-progress",
+            "message_kind": "assistant_progress",
+            "text": "Первый файл большой, читаю его диапазонами.",
+            "label": None,
+            "tool_name": None,
+            "submission_id": "submission-1",
+        }
+    ]

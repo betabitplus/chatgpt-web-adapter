@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from chatgpt_web_adapter.browser_native_client import send_browser_native
+import pytest
+
+from chatgpt_web_adapter.browser_native_client import (
+    _wait_for_new_final_assistant,
+    send_browser_native,
+)
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeTurnResult
+from chatgpt_web_adapter.exceptions import RequestError
 from chatgpt_web_adapter.types import ChatConversation
 
 
@@ -255,3 +261,111 @@ def test_new_chat_never_authorizes_stale_ui_recovery() -> None:
 
     assert provider.normal_calls == [("hello", None, 2)]
     assert provider.recovery_calls == []
+
+
+def _completed_canonical_payload() -> dict:
+    return {
+        "conversation_id": "conversation-1",
+        "title": "Committed new chat",
+        "current_node": "assistant-node",
+        "mapping": {
+            "assistant-node": {
+                "id": "assistant-node",
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": "assistant-1",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["done"]},
+                    "metadata": {
+                        "finish_details": {"type": "stop"},
+                        "message_status": "finished_successfully",
+                    },
+                    "end_turn": True,
+                },
+            }
+        },
+    }
+
+
+def test_committed_new_chat_treats_initial_canonical_400_as_transient() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _get_conversation_payload(self, conversation_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise RequestError("canonical status=400", status_code=400)
+            return _completed_canonical_payload()
+
+    client = Client()
+    message, payload, reads = _wait_for_new_final_assistant(
+        client,
+        "conversation-1",
+        baseline_assistant_ids=frozenset(),
+        timeout=0.5,
+        interval=0.01,
+        include_readback=True,
+        retry_400_until_timeout=True,
+    )
+
+    assert client.calls == 2
+    assert reads == 2
+    assert payload is not None
+    assert message.text == "done"
+
+
+def test_canonical_400_without_committed_new_chat_grace_fails_fast() -> None:
+    class Client:
+        def _get_conversation_payload(self, conversation_id):
+            raise RequestError("canonical status=400", status_code=400)
+
+    with pytest.raises(RequestError) as raised:
+        _wait_for_new_final_assistant(
+            Client(),
+            "conversation-1",
+            baseline_assistant_ids=frozenset(),
+            timeout=0.5,
+            interval=0.01,
+            retry_400_until_timeout=False,
+        )
+
+    assert raised.value.status_code == 400
+
+
+def test_retryable_canonical_429_backs_off_and_recovers(monkeypatch) -> None:
+    class RateLimited(RequestError):
+        retryable = True
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _get_conversation_payload(self, conversation_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise RateLimited("canonical status=429", status_code=429)
+            return _completed_canonical_payload()
+
+    sleeps = []
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client.time.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+    client = Client()
+    message, payload, reads = _wait_for_new_final_assistant(
+        client,
+        "conversation-1",
+        baseline_assistant_ids=frozenset(),
+        timeout=0.5,
+        interval=0.01,
+        include_readback=True,
+    )
+
+    assert client.calls == 2
+    assert sleeps == [5.0]
+    assert reads == 2
+    assert payload is not None
+    assert message.text == "done"

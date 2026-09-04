@@ -7,9 +7,13 @@
 // outcome is ambiguous on ACK loss and a second submit is forbidden.
 
 const _pr113PriorSubmitOfficialPageTurn = submitOfficialPageTurn;
+const _pr113PriorExecuteOfficialPageTurn = (
+  typeof executeOfficialPageTurn === "function" ? executeOfficialPageTurn : null
+);
 const PR113_TEXT_SUBMIT_SCHEMA = 3;
 const PR113_MOUSE_RELEASE_UNCONFIRMED = "PR11_3_TEXT_MOUSE_RELEASE_OUTCOME_UNCONFIRMED";
 const PR113_ENTER_KEYDOWN_UNCONFIRMED = "PR11_3_TEXT_ENTER_KEYDOWN_OUTCOME_UNCONFIRMED";
+const PR113_COMMIT_DETACH_FLAG = "__cwaPr113OrdinaryTextCommitDetachActive";
 
 function _pr113SpecialSubmitContextActive() {
   try {
@@ -154,3 +158,23 @@ submitOfficialPageTurn = async function _pr113SubmitOfficialTextWithoutPostCommi
     return _pr113SubmitTextWithEnterOnce(debuggee);
   }
 };
+
+if (_pr113PriorExecuteOfficialPageTurn !== null) {
+  executeOfficialPageTurn = async function _pr113ExecuteOfficialTextWithCommitDetachSignal(args) {
+    if (_pr113SpecialSubmitContextActive()) {
+      return _pr113PriorExecuteOfficialPageTurn(args);
+    }
+
+    const previous = globalThis[PR113_COMMIT_DETACH_FLAG];
+    globalThis[PR113_COMMIT_DETACH_FLAG] = true;
+    try {
+      return await _pr113PriorExecuteOfficialPageTurn(args);
+    } finally {
+      if (previous === undefined) {
+        delete globalThis[PR113_COMMIT_DETACH_FLAG];
+      } else {
+        globalThis[PR113_COMMIT_DETACH_FLAG] = previous;
+      }
+    }
+  };
+}

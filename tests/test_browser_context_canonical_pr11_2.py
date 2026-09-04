@@ -213,6 +213,9 @@ def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -
     assert 'crypto.subtle.digest("SHA-256", bytes)' in source
     assert "CWA_CANONICAL_CHUNK_BASE64_CHARS = 600_000" in source
     assert 'response.status === 404' in source
+    assert 'response.status === 429' in source
+    assert '"CANONICAL_READ_RATE_LIMITED"' in source
+    assert 'response.status === 404 || response.status === 429' in source
     assert '"CANONICAL_READ_AUTHENTICATION_REQUIRED"' in source
     assert '"CANONICAL_READ_ACCESS_CHALLENGED"' in source
     assert "document.cookie" not in source

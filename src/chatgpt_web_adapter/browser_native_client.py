@@ -141,6 +141,7 @@ def _wait_for_new_final_assistant(
     interval: float,
     include_readback: bool = False,
     turn_exchange_id: str | None = None,
+    retry_400_until_timeout: bool = False,
 ) -> Any | tuple[Any, dict[str, Any] | None, int | None]:
     """Wait for canonical finality, optionally returning the reused payload.
 
@@ -152,13 +153,16 @@ def _wait_for_new_final_assistant(
     previous get_status/get_messages path.
     """
 
-    deadline = time.monotonic() + timeout
+    poll_started = time.monotonic()
+    deadline = poll_started + timeout
     last_status = None
     canonical_reader = getattr(self, "_get_conversation_payload", None)
     use_single_payload = callable(canonical_reader)
     canonical_payload_read_count = 0
 
     while True:
+        transient_read_failure = False
+        rate_limited_read_failure = False
         if use_single_payload:
             payload = None
             try:
@@ -166,10 +170,18 @@ def _wait_for_new_final_assistant(
                 payload = canonical_reader(conversation_id)
             except RequestError as error:
                 # A freshly created conversation can briefly be absent from the
-                # canonical read plane. Other request failures are deterministic
-                # for this attempt and must not be hidden until the turn timeout.
-                if error.status_code != 404:
+                # canonical read plane. After an early-detached new-chat write, the
+                # browser route may also resolve while canonical GET still returns
+                # 400. Retry that new-chat-only condition until the caller's overall
+                # turn deadline; continuations keep failing deterministic 400s fast.
+                # Explicitly retry transport-marked temporary failures such as 429
+                # without turning backend throttling into a semantic turn failure.
+                transient_400 = error.status_code == 400 and retry_400_until_timeout
+                retryable_error = bool(getattr(error, "retryable", False))
+                if error.status_code != 404 and not transient_400 and not retryable_error:
                     raise
+                transient_read_failure = True
+                rate_limited_read_failure = error.status_code == 429
                 payload = None
 
             if isinstance(payload, dict):
@@ -228,7 +240,8 @@ def _wait_for_new_final_assistant(
                 timeout=timeout,
                 last_status=last_status,
             )
-        time.sleep(max(0.2, interval))
+        retry_floor = 5.0 if rate_limited_read_failure else (2.0 if transient_read_failure else 0.2)
+        time.sleep(max(retry_floor, interval))
 
 
 def _emit_revision_safe_event(
@@ -522,6 +535,7 @@ def await_browser_native_final(
         1.0,
         submission.timeout - (time.monotonic() - submission.started_monotonic),
     )
+    retry_400_until_timeout = not submission.is_continuation
     final_message, canonical_payload, canonical_payload_read_count = _wait_for_new_final_assistant(
         self,
         turn.conversation_id,
@@ -530,6 +544,7 @@ def await_browser_native_final(
         interval=submission.poll_interval,
         include_readback=True,
         turn_exchange_id=getattr(turn, "turn_exchange_id", None),
+        retry_400_until_timeout=retry_400_until_timeout,
     )
 
     if canonical_payload is not None:

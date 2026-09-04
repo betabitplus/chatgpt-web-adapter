@@ -1,5 +1,6 @@
 const _cwaCanonicalPriorOnNativeMessage = onNativeMessage;
 const CWA_CANONICAL_CHUNK_BASE64_CHARS = 600_000;
+const CWA_CANONICAL_READ_TAB_KEY = "browserNativeCanonicalReadTabIdV1";
 
 function _cwaCanonicalConversationId(value) {
   const conversationId = typeof value === "string" ? value.trim() : "";
@@ -22,7 +23,8 @@ function _cwaCanonicalStableReason(error) {
 }
 
 async function _cwaCanonicalRuntimeTab() {
-  const storedId = await storedRuntimeTabId();
+  const stored = await chrome.storage.local.get(CWA_CANONICAL_READ_TAB_KEY);
+  const storedId = stored?.[CWA_CANONICAL_READ_TAB_KEY];
   if (Number.isInteger(storedId)) {
     try {
       const tab = await chrome.tabs.get(storedId);
@@ -30,7 +32,7 @@ async function _cwaCanonicalRuntimeTab() {
         return tab.status === "complete" ? tab : waitForTabComplete(storedId);
       }
     } catch {
-      // Stale runtime-tab state is replaced without navigating another tab.
+      await chrome.storage.local.remove(CWA_CANONICAL_READ_TAB_KEY);
     }
   }
 
@@ -38,9 +40,16 @@ async function _cwaCanonicalRuntimeTab() {
   if (!Number.isInteger(tab?.id)) {
     throw new Error("CANONICAL_READ_RUNTIME_TAB_CREATE_FAILED");
   }
-  await storeRuntimeTabId(tab.id);
+  await chrome.storage.local.set({ [CWA_CANONICAL_READ_TAB_KEY]: tab.id });
   return waitForTabComplete(tab.id);
 }
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const stored = await chrome.storage.local.get(CWA_CANONICAL_READ_TAB_KEY);
+  if (stored?.[CWA_CANONICAL_READ_TAB_KEY] === tabId) {
+    await chrome.storage.local.remove(CWA_CANONICAL_READ_TAB_KEY);
+  }
+});
 
 async function _cwaCanonicalFetch(tabId, conversationId, timeoutMs) {
   const debuggee = { tabId };
@@ -90,13 +99,15 @@ async function _cwaCanonicalFetch(tabId, conversationId, timeoutMs) {
             ? "CANONICAL_READ_AUTHENTICATION_REQUIRED"
             : response.status === 403
               ? "CANONICAL_READ_ACCESS_CHALLENGED"
-              : "CANONICAL_READ_HTTP_ERROR";
+              : response.status === 429
+                ? "CANONICAL_READ_RATE_LIMITED"
+                : "CANONICAL_READ_HTTP_ERROR";
         return {
           ok: false,
           status: response.status,
           contentType,
           reasonCode,
-          retryable: response.status === 404
+          retryable: response.status === 404 || response.status === 429
         };
       }
       if (!contentType.toLowerCase().includes("json")) {

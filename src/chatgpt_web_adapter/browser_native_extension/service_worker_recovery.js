@@ -2,6 +2,7 @@ importScripts("service_worker_hotfix.js");
 
 const STALE_UI_COMPLETION_EVIDENCE_MAX_AGE_MS = 5_000;
 const STALE_UI_RELOAD_TIMEOUT_MS = 45_000;
+const CWA_ORDINARY_TEXT_COMMIT_ROUTE_TIMEOUT_MS = 60_000;
 const _pr811OriginalExecuteNativeTurn = executeNativeTurn;
 
 // PR8.11.1 installs a per-turn promise here from the later response-stream
@@ -28,6 +29,35 @@ function _pr811FreshCanonicalCompletionEvidence(message) {
   if (!Number.isFinite(message?.canonicalCompletedAtMs)) return false;
   const ageMs = Date.now() - Number(message.canonicalCompletedAtMs);
   return ageMs >= 0 && ageMs <= STALE_UI_COMPLETION_EVIDENCE_MAX_AGE_MS;
+}
+
+async function _cwaWaitForCommittedConversationRoute(
+  tabId,
+  expectedConversationId,
+  timeoutMs
+) {
+  const startedAt = performance.now();
+  while (elapsedMs(startedAt) < timeoutMs) {
+    const tab = await chrome.tabs.get(tabId);
+    const routeConversationId = conversationIdFromUrl(tab.url || "");
+    const conversationId = (
+      routeConversationId && !routeConversationId.startsWith("WEB:")
+        ? routeConversationId
+        : null
+    );
+    if (
+      (expectedConversationId && conversationId === expectedConversationId) ||
+      (!expectedConversationId && conversationId)
+    ) {
+      return {
+        conversationId: expectedConversationId || conversationId,
+        finalUrl: tab.url || "",
+        waitMs: elapsedMs(startedAt)
+      };
+    }
+    await sleep(100);
+  }
+  return null;
 }
 
 async function _pr811ReloadRuntimeTabAndWait(tabId, expectedConversationId) {
@@ -116,6 +146,7 @@ executeOfficialPageTurn = async function _executeOfficialPageTurnWithEarlyTermin
   const startedAt = performance.now();
   const tab = await chrome.tabs.get(tabId);
   if (!isChatGPTUrl(tab.url || "")) throw new Error("RUNTIME_TAB_IS_NOT_CHATGPT");
+  const initialConversationId = conversationIdFromUrl(tab.url || "");
   const debuggee = { tabId };
   const diagnostics = {
     tabId,
@@ -135,6 +166,9 @@ executeOfficialPageTurn = async function _executeOfficialPageTurnWithEarlyTermin
     earlyCompletionAccepted: false,
     earlyCompletionKind: null,
     earlyCompletionRejectedReason: null,
+    submissionCommitDetachRequested: false,
+    submissionCommitDetachedEarly: false,
+    submissionCommitRouteWaitMs: null,
     debuggerAttachedAfter: null,
     elapsedMs: null
   };
@@ -153,10 +187,14 @@ executeOfficialPageTurn = async function _executeOfficialPageTurnWithEarlyTermin
 
     let conversationRequestId = null;
     let resolveRequestSeen;
+    let resolveResponseSeen;
     let resolveCompleted;
     let rejectCompleted;
     const requestSeen = new Promise((resolve) => {
       resolveRequestSeen = resolve;
+    });
+    const responseSeen = new Promise((resolve) => {
+      resolveResponseSeen = resolve;
     });
     const completed = new Promise((resolve, reject) => {
       resolveCompleted = resolve;
@@ -179,6 +217,7 @@ executeOfficialPageTurn = async function _executeOfficialPageTurnWithEarlyTermin
         diagnostics.conversationResponseSeen = true;
         diagnostics.responseStatus = params?.response?.status ?? null;
         diagnostics.responseMimeType = params?.response?.mimeType ?? null;
+        resolveResponseSeen(conversationRequestId);
         return;
       }
       if (method === "Network.loadingFailed") {
@@ -212,6 +251,59 @@ executeOfficialPageTurn = async function _executeOfficialPageTurnWithEarlyTermin
       ))
     ]);
     diagnostics.submitAckMs = elapsedMs(submitStartedAt);
+
+    diagnostics.submissionCommitDetachRequested = (
+      globalThis.__cwaPr113OrdinaryTextCommitDetachActive === true
+    );
+    if (diagnostics.submissionCommitDetachRequested) {
+      const commitBoundary = await Promise.race([
+        responseSeen.then((requestId) => ({ kind: "response_headers", requestId })),
+        completed.then((requestId) => ({ kind: "network_complete", requestId })),
+        new Promise((_, reject) => setTimeout(
+          () => reject(new Error("CHATGPT_TURN_TIMEOUT")),
+          remainingMs(startedAt, timeoutMs)
+        ))
+      ]);
+      if (
+        commitBoundary?.kind === "response_headers" &&
+        diagnostics.conversationResponseSeen === true &&
+        diagnostics.responseStatus === 200
+      ) {
+        if (eventListener) {
+          chrome.debugger.onEvent.removeListener(eventListener);
+          eventListener = null;
+        }
+        try {
+          await chrome.debugger.detach(debuggee);
+          attached = false;
+        } catch {
+          throw new Error("CHATGPT_SUBMISSION_COMMITTED_DEBUGGER_DETACH_FAILED");
+        }
+        diagnostics.submissionCommitDetachedEarly = true;
+
+        const routeBudgetMs = Math.min(
+          remainingMs(startedAt, timeoutMs),
+          CWA_ORDINARY_TEXT_COMMIT_ROUTE_TIMEOUT_MS
+        );
+        const committedRoute = await _cwaWaitForCommittedConversationRoute(
+          tabId,
+          initialConversationId,
+          routeBudgetMs
+        );
+        if (committedRoute === null) {
+          throw new Error("CHATGPT_SUBMISSION_COMMITTED_CONVERSATION_ID_UNRESOLVED");
+        }
+        diagnostics.submissionCommitRouteWaitMs = committedRoute.waitMs;
+        diagnostics.completionBoundary = "response_headers_commit";
+        diagnostics.elapsedMs = elapsedMs(startedAt);
+        return {
+          diagnostics,
+          finalUrl: committedRoute.finalUrl,
+          conversationId: committedRoute.conversationId,
+          turnExchangeId: null
+        };
+      }
+    }
 
     const earlySignalPromise = _cwaOfficialPageEarlyCompletionSignalPromise;
     const timeoutResult = new Promise((_, reject) => setTimeout(

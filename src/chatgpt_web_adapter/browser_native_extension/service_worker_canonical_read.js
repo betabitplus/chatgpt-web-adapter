@@ -78,9 +78,8 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   }
 });
 
-async function _cwaCanonicalFetch(tabId, conversationId, timeoutMs) {
+async function _cwaCanonicalFetch(tabId, endpoint, timeoutMs) {
   const debuggee = { tabId };
-  const endpoint = `${CHATGPT_ORIGIN}/backend-api/conversation/${encodeURIComponent(conversationId)}`;
   const expression = `(async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ${JSON.stringify(timeoutMs)});
@@ -274,7 +273,8 @@ async function _cwaCanonicalRead(message, port) {
   if (!Number.isInteger(tab?.id)) {
     throw new Error("CANONICAL_READ_RUNTIME_TAB_REQUIRED");
   }
-  const fetched = await _cwaCanonicalFetch(tab.id, conversationId, timeoutMs);
+  const endpoint = `${CHATGPT_ORIGIN}/backend-api/conversation/${encodeURIComponent(conversationId)}`;
+  const fetched = await _cwaCanonicalFetch(tab.id, endpoint, timeoutMs);
   if (fetched.ok !== true) {
     safePortPost(port, {
       protocol: BRIDGE_PROTOCOL_VERSION,
@@ -335,10 +335,94 @@ async function _cwaCanonicalRead(message, port) {
   });
 }
 
+function _cwaCatalogEndpoint(message) {
+  const catalog = typeof message.catalog === "string" ? message.catalog.trim() : "";
+  if (catalog === "models") {
+    return `${CHATGPT_ORIGIN}/backend-api/models?history_and_training_disabled=false`;
+  }
+  if (catalog !== "conversations") throw new Error("CATALOG_READ_KIND_UNSUPPORTED");
+
+  const offset = Number.isInteger(message.offset) && message.offset >= 0 ? message.offset : 0;
+  const limit = Number.isInteger(message.limit)
+    ? Math.max(1, Math.min(message.limit, 100))
+    : 100;
+  const params = new URLSearchParams({
+    offset: String(offset),
+    limit: String(limit),
+    order: "updated",
+    is_archived: String(message.isArchived === true),
+    is_starred: String(message.isStarred === true),
+  });
+  return `${CHATGPT_ORIGIN}/backend-api/conversations?${params.toString()}`;
+}
+
+async function _cwaCatalogRead(message, port) {
+  const requestId = message.request_id;
+  const timeoutMs = Number.isFinite(message.timeoutMs)
+    ? Math.max(1_000, Math.min(Number(message.timeoutMs), 120_000))
+    : 30_000;
+  const endpoint = _cwaCatalogEndpoint(message);
+  const tab = await _cwaCanonicalRuntimeTab();
+  if (!Number.isInteger(tab?.id)) throw new Error("CANONICAL_READ_RUNTIME_TAB_REQUIRED");
+  const fetched = await _cwaCanonicalFetch(tab.id, endpoint, timeoutMs);
+  if (fetched.ok !== true) {
+    safePortPost(port, {
+      protocol: BRIDGE_PROTOCOL_VERSION,
+      type: "catalog_read_result",
+      request_id: requestId,
+      ok: false,
+      reasonCode: fetched.reasonCode,
+      status: fetched.status,
+      contentType: fetched.contentType,
+      retryable: fetched.retryable === true
+    });
+    return;
+  }
+
+  const bodyBase64 = fetched.bodyBase64;
+  if (typeof bodyBase64 !== "string" || !/^[0-9a-f]{64}$/.test(fetched.sha256 || "")) {
+    throw new Error("CANONICAL_READ_TRANSFER_SOURCE_INVALID");
+  }
+  const chunkCount = Math.max(
+    1,
+    Math.ceil(bodyBase64.length / CWA_CANONICAL_CHUNK_BASE64_CHARS)
+  );
+  for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+    const data = bodyBase64.slice(
+      chunkIndex * CWA_CANONICAL_CHUNK_BASE64_CHARS,
+      (chunkIndex + 1) * CWA_CANONICAL_CHUNK_BASE64_CHARS
+    );
+    if (!safePortPost(port, {
+      protocol: BRIDGE_PROTOCOL_VERSION,
+      type: "canonical_read_chunk",
+      request_id: requestId,
+      chunkIndex,
+      chunkCount,
+      totalBytes: fetched.totalBytes,
+      sha256: fetched.sha256,
+      data
+    })) {
+      throw new Error("CANONICAL_READ_CHUNK_DELIVERY_FAILED");
+    }
+  }
+  safePortPost(port, {
+    protocol: BRIDGE_PROTOCOL_VERSION,
+    type: "catalog_read_result",
+    request_id: requestId,
+    ok: true,
+    status: fetched.status,
+    contentType: fetched.contentType,
+    chunkCount,
+    totalBytes: fetched.totalBytes,
+    sha256: fetched.sha256,
+    runtimeTabId: tab.id
+  });
+}
+
 onNativeMessage = async function _cwaOnNativeMessageWithCanonicalRead(message, port) {
   if (
     message?.protocol !== BRIDGE_PROTOCOL_VERSION ||
-    message?.type !== "canonical_read"
+    !["canonical_read", "catalog_read"].includes(message?.type)
   ) {
     return _cwaCanonicalPriorOnNativeMessage(message, port);
   }
@@ -358,11 +442,12 @@ onNativeMessage = async function _cwaOnNativeMessageWithCanonicalRead(message, p
 
   activeRequestId = requestId;
   try {
-    await _cwaCanonicalRead(message, port);
+    if (message.type === "catalog_read") await _cwaCatalogRead(message, port);
+    else await _cwaCanonicalRead(message, port);
   } catch (error) {
     safePortPost(port, {
       protocol: BRIDGE_PROTOCOL_VERSION,
-      type: "canonical_read_result",
+      type: message.type === "catalog_read" ? "catalog_read_result" : "canonical_read_result",
       request_id: requestId,
       ok: false,
       reasonCode: _cwaCanonicalStableReason(error),

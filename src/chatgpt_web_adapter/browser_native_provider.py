@@ -258,6 +258,7 @@ class BrowserNativeTurnProvider:
         timeout: float | None,
         canonical_completed_at_ms: int | None,
         attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
         on_text_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> BrowserNativeTurnResult:
         if not isinstance(text, str) or not text.strip():
@@ -265,6 +266,13 @@ class BrowserNativeTurnProvider:
         if len(text) > 200_000:
             raise ValueError("text is too large for browser-native turn")
         normalized_attachment_paths = self._normalize_attachment_paths(attachment_paths)
+        normalized_model_slug = None
+        if model_slug is not None:
+            if not isinstance(model_slug, str) or not model_slug.strip():
+                raise ValueError("model_slug must be a non-empty string or None")
+            normalized_model_slug = model_slug.strip()
+            if len(normalized_model_slug) > 256:
+                raise ValueError("model_slug is too long")
         conversation_id = None
         if conversation is not None:
             conversation_id = ConversationRef.from_any(conversation).conversation_id
@@ -286,6 +294,7 @@ class BrowserNativeTurnProvider:
                 "request_id": request_id,
                 "conversationId": conversation_id,
                 "text": text,
+                "modelSlug": normalized_model_slug,
                 "attachmentPaths": normalized_attachment_paths,
                 "timeoutMs": int(total_timeout * 1000),
                 "canonicalCompleted": canonical_completed_at_ms is not None,
@@ -417,6 +426,7 @@ class BrowserNativeTurnProvider:
         conversation: ConversationRef | ChatConversation | dict[str, Any] | str | None = None,
         timeout: float | None = None,
         attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
     ) -> BrowserNativeTurnResult:
         return self._send_text_request(
             text,
@@ -424,6 +434,7 @@ class BrowserNativeTurnProvider:
             timeout=timeout,
             canonical_completed_at_ms=None,
             attachment_paths=attachment_paths,
+            model_slug=model_slug,
         )
 
     def send_text_streaming(
@@ -433,6 +444,7 @@ class BrowserNativeTurnProvider:
         conversation: ConversationRef | ChatConversation | dict[str, Any] | str | None = None,
         timeout: float | None = None,
         attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
         on_text_event: Callable[[dict[str, Any]], None],
     ) -> BrowserNativeTurnResult:
         if not callable(on_text_event):
@@ -443,6 +455,7 @@ class BrowserNativeTurnProvider:
             timeout=timeout,
             canonical_completed_at_ms=None,
             attachment_paths=attachment_paths,
+            model_slug=model_slug,
             on_text_event=on_text_event,
         )
 
@@ -454,6 +467,7 @@ class BrowserNativeTurnProvider:
         timeout: float | None = None,
         canonical_completed_at_ms: int,
         attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
     ) -> BrowserNativeTurnResult:
         return self._send_text_request(
             text,
@@ -461,6 +475,7 @@ class BrowserNativeTurnProvider:
             timeout=timeout,
             canonical_completed_at_ms=canonical_completed_at_ms,
             attachment_paths=attachment_paths,
+            model_slug=model_slug,
         )
 
     def send_text_with_stale_ui_recovery_streaming(
@@ -471,6 +486,7 @@ class BrowserNativeTurnProvider:
         timeout: float | None = None,
         canonical_completed_at_ms: int,
         attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
         on_text_event: Callable[[dict[str, Any]], None],
     ) -> BrowserNativeTurnResult:
         if not callable(on_text_event):
@@ -481,6 +497,7 @@ class BrowserNativeTurnProvider:
             timeout=timeout,
             canonical_completed_at_ms=canonical_completed_at_ms,
             attachment_paths=attachment_paths,
+            model_slug=model_slug,
             on_text_event=on_text_event,
         )
 

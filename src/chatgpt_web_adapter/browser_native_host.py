@@ -46,7 +46,7 @@ class _BrokerHandler(socketserver.BaseRequestHandler):
                 request,
                 event_sink=emit_event
                 if request.get("streamTextObservations") is True
-                or operation in {"canonical_read", "observe_turn"}
+                or operation in {"canonical_read", "catalog_read", "observe_turn"}
                 else None,
             )
         except Exception as error:
@@ -379,6 +379,7 @@ class BrowserNativeBroker:
             "turn",
             "observe_turn",
             "canonical_read",
+            "catalog_read",
             "canonical_read_complete",
             "release_runtime_tab",
         }:
@@ -436,6 +437,7 @@ class BrowserNativeBroker:
             default_timeout_ms = {
                 "turn": 120_000,
                 "canonical_read": 30_000,
+                "catalog_read": 30_000,
                 "release_runtime_tab": 10_000,
             }[operation]
             timeout = max(

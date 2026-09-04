@@ -624,6 +624,20 @@ def _callable_accepts_attachment_paths(value: Any) -> bool:
     )
 
 
+def _callable_accepts_model_slug(value: Any) -> bool:
+    if not callable(value):
+        return False
+    try:
+        parameters = inspect.signature(value).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "model_slug"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def submit_browser_native(
     self: Any,
     prompt: str,
@@ -634,6 +648,7 @@ def submit_browser_native(
     on_token: Callable[[str], None] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     attachment_paths: Sequence[str | Path] | None = None,
+    model_slug: str | None = None,
     _prewrite_canonical_payload: dict[str, Any] | None = None,
     _prewrite_canonical_completed_at_ms: int | None = None,
 ) -> BrowserNativeSubmission:
@@ -658,6 +673,14 @@ def submit_browser_native(
     if normalized_attachment_paths and not _callable_accepts_attachment_paths(provider.send_text):
         raise RequestError(
             "BROWSER_NATIVE_RICH_INPUT_PROVIDER_UNSUPPORTED",
+            request_stage="browser_native_turn_preflight",
+        )
+    normalized_model_slug = model_slug.strip() if isinstance(model_slug, str) else None
+    if model_slug is not None and not normalized_model_slug:
+        raise ValueError("model_slug must be a non-empty string or None")
+    if normalized_model_slug and not _callable_accepts_model_slug(provider.send_text):
+        raise RequestError(
+            "BROWSER_NATIVE_MODEL_SLUG_PROVIDER_UNSUPPORTED",
             request_stage="browser_native_turn_preflight",
         )
 
@@ -766,6 +789,8 @@ def submit_browser_native(
         if normalized_attachment_paths
         else {}
     )
+    model_kwargs = {"model_slug": normalized_model_slug} if normalized_model_slug else {}
+    provider_kwargs = {**attachment_kwargs, **model_kwargs}
     if recovery_authorized:
         canonical_completed_at_ms = recovery_completed_at_ms or int(time.time() * 1000)
         if streaming_requested and callable(recovery_stream_send):
@@ -782,7 +807,7 @@ def submit_browser_native(
                 timeout=timeout,
                 canonical_completed_at_ms=canonical_completed_at_ms,
                 on_text_event=handle_text_event,
-                **attachment_kwargs,
+                **provider_kwargs,
             )
         else:
             if normalized_attachment_paths and not _callable_accepts_attachment_paths(
@@ -797,7 +822,7 @@ def submit_browser_native(
                 conversation=conversation,
                 timeout=timeout,
                 canonical_completed_at_ms=canonical_completed_at_ms,
-                **attachment_kwargs,
+                **provider_kwargs,
             )
     elif streaming_requested and callable(stream_send):
         if normalized_attachment_paths and not _callable_accepts_attachment_paths(stream_send):
@@ -810,14 +835,14 @@ def submit_browser_native(
             conversation=conversation,
             timeout=timeout,
             on_text_event=handle_text_event,
-            **attachment_kwargs,
+            **provider_kwargs,
         )
     else:
         turn = provider.send_text(
             prompt,
             conversation=conversation,
             timeout=timeout,
-            **attachment_kwargs,
+            **provider_kwargs,
         )
 
     raw_attachment_count = getattr(turn, "attachment_count", None)
@@ -1055,6 +1080,7 @@ def send_browser_native(
     on_token: Callable[[str], None] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     attachment_paths: Sequence[str | Path] | None = None,
+    model_slug: str | None = None,
     _prewrite_canonical_payload: dict[str, Any] | None = None,
     _prewrite_canonical_completed_at_ms: int | None = None,
 ) -> ChatResponse:
@@ -1069,6 +1095,7 @@ def send_browser_native(
         on_token=on_token,
         on_event=on_event,
         attachment_paths=attachment_paths,
+        model_slug=model_slug,
         _prewrite_canonical_payload=_prewrite_canonical_payload,
         _prewrite_canonical_completed_at_ms=_prewrite_canonical_completed_at_ms,
     )

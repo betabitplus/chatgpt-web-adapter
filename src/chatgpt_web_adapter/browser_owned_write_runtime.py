@@ -720,6 +720,7 @@ class BrowserOwnedProductWriteRuntime:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         browser_authority_policy: BrowserAuthorityPolicy | str | None = None,
         browser_authority_ttl_ms: int | None = None,
+        model_slug: str | None = None,
     ) -> ChatResponse:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text is required")
@@ -883,6 +884,7 @@ class BrowserOwnedProductWriteRuntime:
                 poll_interval=poll_interval,
                 on_token=on_token,
                 on_event=runtime_event,
+                model_slug=model_slug,
                 _prewrite_canonical_payload=commit_payload,
                 _prewrite_canonical_completed_at_ms=commit_checked_at_ms,
             )
@@ -979,6 +981,7 @@ class BrowserOwnedProductWriteRuntime:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         browser_authority_policy: BrowserAuthorityPolicy | str | None = None,
         browser_authority_ttl_ms: int | None = None,
+        model_slug: str | None = None,
     ) -> BrowserOwnedWriteExecution:
         write_event: dict[str, Any] | None = None
 
@@ -1011,6 +1014,7 @@ class BrowserOwnedProductWriteRuntime:
             on_event=capture_event,
             browser_authority_policy=browser_authority_policy,
             browser_authority_ttl_ms=browser_authority_ttl_ms,
+            model_slug=model_slug,
         )
         return BrowserOwnedWriteExecution(
             response=response,

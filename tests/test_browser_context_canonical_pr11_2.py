@@ -140,6 +140,64 @@ def test_browser_context_client_keeps_python_status_interpreter(tmp_path, monkey
     assert status.message_id == "assistant-1"
 
 
+def test_browser_context_client_lists_real_catalog_payloads(tmp_path, monkeypatch) -> None:
+    provider = BrowserNativeTurnProvider(state_dir=tmp_path)
+    client = BrowserContextCanonicalClient(object(), provider)
+    calls = []
+
+    def fake_catalog(kind, **kwargs):
+        calls.append((kind, kwargs))
+        if kind == "models":
+            return {"models": [{"slug": "gpt-real", "title": "Real"}, {"slug": ""}]}
+        archived = kwargs["is_archived"]
+        starred = kwargs["is_starred"]
+        if not archived and not starred:
+            return {
+                "items": [
+                    {"id": "new", "title": "New", "update_time": "2026-09-04T20:00:00Z"},
+                    {"id": "dup", "title": "Old duplicate", "update_time": "2026-09-01T20:00:00Z"},
+                ],
+                "total": 2,
+            }
+        if archived and starred:
+            return {
+                "items": [
+                    {"id": "dup", "title": "Latest duplicate", "update_time": "2026-09-05T20:00:00Z"}
+                ],
+                "total": 1,
+            }
+        return {"items": [], "total": 0}
+
+    monkeypatch.setattr(client.transport, "read_catalog", fake_catalog)
+
+    conversations = client.list_conversations()
+    models = client.list_models()
+
+    assert [item["id"] for item in conversations] == ["dup", "new"]
+    assert conversations[0]["title"] == "Latest duplicate"
+    assert models == [{"slug": "gpt-real", "title": "Real"}]
+    assert sum(kind == "conversations" for kind, _kwargs in calls) == 4
+    assert sum(kind == "models" for kind, _kwargs in calls) == 1
+
+
+def test_conversation_snapshot_reuses_one_canonical_payload(tmp_path, monkeypatch) -> None:
+    provider = BrowserNativeTurnProvider(state_dir=tmp_path)
+    client = BrowserContextCanonicalClient(object(), provider)
+    reads = []
+
+    def fake_read(conversation_id):
+        reads.append(conversation_id)
+        return _payload()
+
+    monkeypatch.setattr(client, "_get_conversation_payload", fake_read)
+
+    snapshot = client.conversation_snapshot("conversation-1")
+
+    assert reads == ["conversation-1"]
+    assert snapshot["status"].status == "completed"
+    assert [message.text for message in snapshot["messages"]] == ["done"]
+
+
 class _Canonical:
     def get_status(self, conversation):
         raise AssertionError("not used during construction")
@@ -210,6 +268,9 @@ def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -
         'importScripts("service_worker_runtime_read.js");'
     )
     assert 'importScripts("service_worker_browser_runtime_v2.js")' not in source
+    assert '"catalog_read"' in source
+    assert '"models"' in source
+    assert '"conversations"' in source
 
     assert 'credentials: "include"' in source
     assert 'fetch("/api/auth/session"' in source
@@ -239,6 +300,7 @@ def test_host_serializes_write_read_and_close_on_one_authority_lane() -> None:
     ).read_text(encoding="utf-8")
 
     assert '"canonical_read"' in source
+    assert '"catalog_read"' in source
     assert '"canonical_read_complete"' in source
     assert '"release_runtime_tab"' in source
     assert "_authority_reserved_lease_id" in source

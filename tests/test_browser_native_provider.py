@@ -106,7 +106,17 @@ def test_provider_requests_passive_observer_for_turn(tmp_path) -> None:
 
     assert captured["passiveObserve"] is True
     assert captured["streamTextObservations"] is False
+    assert captured["modelSlug"] is None
     assert result.passive_observer_armed is False
+
+
+def test_provider_forwards_real_model_slug_without_mapping(tmp_path) -> None:
+    _, captured, _result = _round_trip(
+        tmp_path,
+        lambda provider: provider.send_text("hello", timeout=2, model_slug="gpt-5-6"),
+    )
+
+    assert captured["modelSlug"] == "gpt-5-6"
 
 
 def test_provider_observe_turn_streams_events_then_returns_terminal(tmp_path) -> None:

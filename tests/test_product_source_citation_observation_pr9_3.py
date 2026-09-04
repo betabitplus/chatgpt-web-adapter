@@ -71,7 +71,7 @@ def test_pr93_overlay_is_loaded_after_schema29_without_changing_manifest_entrypo
     )
     assert manifest["version"] == "0.1.13"
     assert manifest["background"]["service_worker"] == (
-        "service_worker_temporary_chat_route_reopen_probe.js"
+        "service_worker_browser_runtime_v2.js"
     )
 
 

@@ -208,7 +208,7 @@ def test_extension_route_layer_is_additive_and_read_only():
     root = browser_native_extension_dir()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["version"] == "0.1.13"
-    assert manifest["background"]["service_worker"] == "service_worker_temporary_chat_route_reopen_probe.js"
+    assert manifest["background"]["service_worker"] == "service_worker_browser_runtime_v2.js"
 
     observability = (root / "service_worker_observability.js").read_text(encoding="utf-8")
     route_worker = (root / "service_worker_retained_route_identity_pr8_8.js").read_text(encoding="utf-8")

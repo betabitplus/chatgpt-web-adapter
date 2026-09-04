@@ -30,7 +30,7 @@ def test_manifest_presents_a_product_popup_without_expanding_permissions() -> No
     # PR11.0 is a product-surface milestone, not a protocol/worker generation bump.
     assert manifest["version"] == "0.1.13"
     assert manifest["background"]["service_worker"] == (
-        "service_worker_temporary_chat_route_reopen_probe.js"
+        "service_worker_browser_runtime_v2.js"
     )
     assert set(manifest["permissions"]) == {"debugger", "tabs", "storage", "nativeMessaging"}
     assert manifest["host_permissions"] == ["https://chatgpt.com/*"]

@@ -437,12 +437,16 @@ def test_packaged_extension_layers_pr9_2_above_preserved_entrypoint():
     )
     manifest = json.loads((extension / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["version"] == "0.1.13"
-    assert manifest["background"]["service_worker"] == "service_worker_temporary_chat_route_reopen_probe.js"
+    assert manifest["background"]["service_worker"] == "service_worker_browser_runtime_v2.js"
 
     entrypoint = (extension / manifest["background"]["service_worker"]).read_text(
         encoding="utf-8"
     )
-    assert 'importScripts("service_worker_rich_input_pr9_2.js")' in entrypoint
+    assert 'importScripts("service_worker_runtime.js")' in entrypoint
+    runtime = (extension / "service_worker_runtime.js").read_text(encoding="utf-8")
+    assert 'importScripts("service_worker_runtime_write.js")' in runtime
+    write = (extension / "service_worker_runtime_write.js").read_text(encoding="utf-8")
+    assert 'importScripts("service_worker_rich_input_pr9_2.js")' in write
 
     overlay = (extension / "service_worker_rich_input_pr9_2.js").read_text(encoding="utf-8")
     assert "DOM.setFileInputFiles" in overlay

@@ -136,7 +136,7 @@ def test_extension_selection_layer_preserves_manifest_and_import_order():
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["version"] == "0.1.13"
     assert manifest["background"]["service_worker"] == (
-        "service_worker_temporary_chat_route_reopen_probe.js"
+        "service_worker_browser_runtime_v2.js"
     )
 
     observability = (root / "service_worker_observability.js").read_text(encoding="utf-8")

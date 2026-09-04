@@ -47,6 +47,7 @@ class BrowserNativeTurnResult:
     foreground_activation_observed: bool | None = None
     browser_authority_lease_id: str | None = None
     attachment_count: int = 0
+    passive_observer_armed: bool = False
 
 
 @dataclass(frozen=True)
@@ -290,7 +291,8 @@ class BrowserNativeTurnProvider:
                 "canonicalCompleted": canonical_completed_at_ms is not None,
                 "canonicalCompletedAtMs": canonical_completed_at_ms,
                 "browserAuthorityLeaseId": authority_lease_id,
-                "streamTextObservations": on_text_event is not None,
+                "passiveObserve": True,
+                "streamTextObservations": False,
             },
             timeout=total_timeout + self.connect_timeout,
             on_event=on_text_event,
@@ -362,7 +364,51 @@ class BrowserNativeTurnProvider:
             if isinstance(response_lease_id, str)
             else None,
             attachment_count=attachment_count,
+            passive_observer_armed=bool(response.get("passiveObserverArmed")),
         )
+
+    def observe_turn(
+        self,
+        *,
+        conversation_id: str,
+        turn_exchange_id: str | None,
+        browser_authority_lease_id: str,
+        timeout: float,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            raise ValueError("conversation_id is required")
+        if not isinstance(browser_authority_lease_id, str) or not browser_authority_lease_id.strip():
+            raise ValueError("browser_authority_lease_id is required")
+        total_timeout = float(timeout)
+        if total_timeout <= 0:
+            raise ValueError("timeout must be positive")
+        request_id = str(uuid.uuid4())
+        response = self._rpc(
+            {
+                "type": "observe_turn",
+                "request_id": request_id,
+                "conversationId": conversation_id.strip(),
+                "turnExchangeId": turn_exchange_id.strip()
+                if isinstance(turn_exchange_id, str) and turn_exchange_id.strip()
+                else None,
+                "browserAuthorityLeaseId": browser_authority_lease_id.strip(),
+                "timeoutMs": int(total_timeout * 1000),
+            },
+            timeout=total_timeout + self.connect_timeout,
+            on_event=on_event,
+        )
+        if response.get("request_id") != request_id:
+            raise RequestError(
+                "BROWSER_NATIVE_RESPONSE_MISMATCH",
+                request_stage="browser_native_observe_turn",
+            )
+        if not response.get("ok"):
+            raise RequestError(
+                str(response.get("error") or "PASSIVE_OBSERVER_FAILED"),
+                request_stage="browser_native_observe_turn",
+            )
+        return response
 
     def send_text(
         self,

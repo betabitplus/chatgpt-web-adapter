@@ -46,8 +46,9 @@ class BrowserNativeSubmission:
     final_response: ChatResponse | None = None
 
 
-_CANONICAL_LIVE_POLL_INTERVAL_SECONDS = 5.0
+_CANONICAL_LIVE_POLL_INTERVAL_SECONDS = 15.0
 _CANONICAL_RATE_LIMIT_BACKOFF_SECONDS = 15.0
+_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS = 5.0
 _CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS = 6_000
 _SENSITIVE_KEY_RE = re.compile(
     r"(?:authorization|cookie|set[-_]?cookie|access[-_]?token|refresh[-_]?token|"
@@ -355,6 +356,24 @@ def _assistant_candidates_from_payload(
             and _node_turn_exchange_id(node) != normalized_turn_exchange_id
         ):
             continue
+        raw_message = node.get("message")
+        if not isinstance(raw_message, dict):
+            continue
+        metadata = raw_message.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        content = raw_message.get("content")
+        if not isinstance(content, dict):
+            content = {}
+        content_type = content.get("content_type")
+        if metadata.get("is_thinking_preamble_message") is True:
+            continue
+        if content_type in {"thoughts", "reasoning_recap"}:
+            continue
+        finish_reason = getattr(message, "finish_reason", None)
+        has_finish_reason = isinstance(finish_reason, str) and bool(finish_reason.strip())
+        if raw_message.get("end_turn") is not True and not has_finish_reason:
+            continue
         message_id = getattr(message, "message_id", None)
         if not isinstance(message_id, str) or message_id in baseline_assistant_ids:
             continue
@@ -377,6 +396,7 @@ def _wait_for_new_final_assistant(
     retry_400_until_timeout: bool = False,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     submission_id: str | None = None,
+    minimum_poll_interval: float | None = None,
 ) -> Any | tuple[Any, dict[str, Any] | None, int | None]:
     """Wait for canonical finality, optionally returning the reused payload.
 
@@ -484,7 +504,11 @@ def _wait_for_new_final_assistant(
         retry_floor = (
             _CANONICAL_RATE_LIMIT_BACKOFF_SECONDS
             if rate_limited_read_failure
-            else _CANONICAL_LIVE_POLL_INTERVAL_SECONDS
+            else (
+                _CANONICAL_LIVE_POLL_INTERVAL_SECONDS
+                if minimum_poll_interval is None
+                else max(0.0, float(minimum_poll_interval))
+            )
         )
         sleep_for = max(retry_floor, interval)
         remaining_sleep = max(0.0, deadline - time.monotonic())
@@ -802,18 +826,59 @@ def await_browser_native_final(
         submission.timeout - (time.monotonic() - submission.started_monotonic),
     )
     retry_400_until_timeout = not submission.is_continuation
+    provider = getattr(self, "_browser_native_turn_provider", None)
+    observe_turn = getattr(provider, "observe_turn", None)
+    authority_lease_id = getattr(turn, "browser_authority_lease_id", None)
+    passive_observer_used = False
+
+    if (
+        bool(getattr(turn, "passive_observer_armed", False))
+        and callable(observe_turn)
+        and isinstance(authority_lease_id, str)
+        and authority_lease_id
+    ):
+        def handle_passive_event(event: dict[str, Any]) -> None:
+            if not isinstance(event, dict):
+                return
+            if event.get("type") == "passive_observer_heartbeat":
+                return
+            normalized = {**event, "submission_id": submission.submission_id}
+            _emit_revision_safe_event(self, submission.on_event, normalized)
+
+        try:
+            observe_turn(
+                conversation_id=turn.conversation_id,
+                turn_exchange_id=getattr(turn, "turn_exchange_id", None),
+                browser_authority_lease_id=authority_lease_id,
+                timeout=remaining,
+                on_event=handle_passive_event,
+            )
+            passive_observer_used = True
+            remaining = max(
+                1.0,
+                submission.timeout - (time.monotonic() - submission.started_monotonic),
+            )
+        except (RequestError, OSError, EOFError, ValueError) as error:
+            self._emit_event(
+                submission.on_event,
+                "browser_native_passive_observer_fallback",
+                submission_id=submission.submission_id,
+                reason=str(error),
+            )
+
     final_message, canonical_payload, canonical_payload_read_count = _wait_for_new_final_assistant(
         self,
         turn.conversation_id,
         baseline_assistant_ids=submission.baseline_assistant_ids,
         baseline_message_ids=submission.baseline_message_ids,
         timeout=remaining,
-        interval=submission.poll_interval,
+        interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS if passive_observer_used else submission.poll_interval,
         include_readback=True,
         turn_exchange_id=getattr(turn, "turn_exchange_id", None),
         retry_400_until_timeout=retry_400_until_timeout,
-        on_event=submission.on_event,
+        on_event=None if passive_observer_used else submission.on_event,
         submission_id=submission.submission_id,
+        minimum_poll_interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS if passive_observer_used else None,
     )
 
     if canonical_payload is not None:

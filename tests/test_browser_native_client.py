@@ -292,6 +292,60 @@ def _completed_canonical_payload() -> dict:
     }
 
 
+def test_progress_message_cannot_finalize_long_turn(monkeypatch) -> None:
+    progress_payload = {
+        "conversation_id": "conversation-1",
+        "title": "Long turn",
+        "current_node": "progress-node",
+        "mapping": {
+            "progress-node": {
+                "id": "progress-node",
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": "progress-1",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["Core foundation уже не теория..."]},
+                    "metadata": {
+                        "is_thinking_preamble_message": True,
+                        "message_status": "finished_successfully",
+                    },
+                    "end_turn": False,
+                },
+            }
+        },
+    }
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _get_conversation_payload(self, conversation_id):
+            self.calls += 1
+            return progress_payload if self.calls == 1 else _completed_canonical_payload()
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client.time.sleep",
+        lambda seconds: None,
+    )
+    client = Client()
+    message, payload, reads = _wait_for_new_final_assistant(
+        client,
+        "conversation-1",
+        baseline_assistant_ids=frozenset(),
+        timeout=30.0,
+        interval=0.01,
+        include_readback=True,
+    )
+
+    assert client.calls == 2
+    assert reads == 2
+    assert payload is not None
+    assert message.message_id == "assistant-1"
+    assert message.text == "done"
+
+
 def test_committed_new_chat_treats_initial_canonical_400_as_transient() -> None:
     class Client:
         def __init__(self) -> None:
@@ -374,7 +428,7 @@ def test_retryable_canonical_429_backs_off_and_recovers(monkeypatch) -> None:
     assert message.text == "done"
 
 
-def test_successful_canonical_polling_has_five_second_floor(monkeypatch) -> None:
+def test_successful_canonical_polling_has_fifteen_second_floor(monkeypatch) -> None:
     pending = {
         "conversation_id": "conversation-1",
         "current_node": "user-node",
@@ -418,7 +472,7 @@ def test_successful_canonical_polling_has_five_second_floor(monkeypatch) -> None
 
     assert message.text == "done"
     assert client.calls == 2
-    assert sleeps == [5.0]
+    assert sleeps == [15.0]
 
 
 def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitive_fields() -> None:
@@ -676,3 +730,158 @@ def test_current_canonical_progress_waits_for_revision_completion() -> None:
         "Первый нюанс уже появился на уровне инструмента: читаю файл диапазонами."
     )
     assert "m-progress" in emitted
+
+
+def test_passive_observer_waits_without_canonical_polling_then_reconciles_once() -> None:
+    class Provider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.observe_calls = []
+
+        def send_text(self, text, *, conversation=None, timeout=None):
+            self.normal_calls.append((text, conversation, timeout))
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-1",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=17,
+                tab_was_active=False,
+                elapsed_ms=50,
+                browser_authority_lease_id="lease-1",
+                passive_observer_armed=True,
+            )
+
+        def observe_turn(
+            self,
+            *,
+            conversation_id,
+            turn_exchange_id,
+            browser_authority_lease_id,
+            timeout,
+            on_event=None,
+        ):
+            self.observe_calls.append(
+                (conversation_id, turn_exchange_id, browser_authority_lease_id, timeout)
+            )
+            if on_event is not None:
+                on_event(
+                    {
+                        "type": "canonical_intermediate_message",
+                        "message_kind": "assistant_progress",
+                        "text": "Working passively",
+                        "source": "passive_page_stream",
+                    }
+                )
+            return {
+                "ok": True,
+                "conversationId": conversation_id,
+                "turnExchangeId": turn_exchange_id,
+                "messageId": "assistant-1",
+                "finishReason": "stop",
+            }
+
+    provider = Provider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def __init__(self) -> None:
+            self.reads = 0
+            self.events = []
+
+        def _emit_event(self, callback, event_type, **payload):
+            self.events.append((event_type, payload))
+            if callback is not None:
+                callback({"type": event_type, **payload})
+
+        def _get_conversation_payload(self, conversation_id):
+            assert provider.observe_calls, "canonical read happened before passive terminal"
+            self.reads += 1
+            return _completed_canonical_payload()
+
+    client = Client()
+    delivered = []
+    response = send_browser_native(
+        client,
+        "hello",
+        timeout=2,
+        poll_interval=0.01,
+        on_event=delivered.append,
+    )
+
+    assert response.text == "done"
+    assert len(provider.observe_calls) == 1
+    assert client.reads == 1
+    assert any(
+        event.get("type") == "canonical_intermediate_message"
+        and event.get("text") == "Working passively"
+        for event in delivered
+    )
+
+
+def test_passive_observer_stream_start_failure_falls_back_to_bounded_canonical_read() -> None:
+    class Provider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.observe_calls = 0
+
+        def send_text(self, text, *, conversation=None, timeout=None):
+            self.normal_calls.append((text, conversation, timeout))
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-1",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=17,
+                tab_was_active=False,
+                elapsed_ms=50,
+                browser_authority_lease_id="lease-1",
+                passive_observer_armed=True,
+            )
+
+        def observe_turn(self, **_kwargs):
+            self.observe_calls += 1
+            raise RequestError(
+                "PASSIVE_OBSERVER_STREAM_NOT_OBSERVED",
+                request_stage="browser_native_observe_turn",
+            )
+
+    provider = Provider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def __init__(self) -> None:
+            self.reads = 0
+            self.events = []
+
+        def _emit_event(self, callback, event_type, **payload):
+            self.events.append((event_type, payload))
+            if callback is not None:
+                callback({"type": event_type, **payload})
+
+        def _get_conversation_payload(self, conversation_id):
+            self.reads += 1
+            return _completed_canonical_payload()
+
+    client = Client()
+    delivered = []
+    response = send_browser_native(
+        client,
+        "hello",
+        timeout=2,
+        poll_interval=0.01,
+        on_event=delivered.append,
+    )
+
+    assert response.text == "done"
+    assert provider.observe_calls == 1
+    assert client.reads == 1
+    assert any(
+        event.get("type") == "browser_native_passive_observer_fallback"
+        and "PASSIVE_OBSERVER_STREAM_NOT_OBSERVED" in event.get("reason", "")
+        for event in delivered
+    )

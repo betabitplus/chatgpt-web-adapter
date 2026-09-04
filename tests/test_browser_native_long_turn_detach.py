@@ -20,7 +20,7 @@ def test_long_turn_fix_preserves_manifest_identity_and_pr12_entrypoint() -> None
     manifest = json.loads(_read(MANIFEST))
     assert manifest["version"] == "0.1.13"
     assert manifest["background"]["service_worker"] == (
-        "service_worker_temporary_chat_route_reopen_probe.js"
+        "service_worker_browser_runtime_v2.js"
     )
 
 

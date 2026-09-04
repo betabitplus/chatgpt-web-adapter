@@ -27,7 +27,7 @@ GATE = TOOLS / "pr10_1_artifact_noncode_v4_live_gate.py"
 def test_noncode_v4_preserves_historical_manifest_entrypoint() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     assert manifest["background"]["service_worker"] == (
-        "service_worker_temporary_chat_route_reopen_probe.js"
+        "service_worker_browser_runtime_v2.js"
     )
     assert manifest["version"] == "0.1.13"
 

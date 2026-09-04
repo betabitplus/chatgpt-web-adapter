@@ -13,7 +13,7 @@ LEGACY_IMPL = EXT / "service_worker_runtime_legacy_impl.js"
 WRITE = EXT / "service_worker_runtime_write.js"
 READ = EXT / "service_worker_runtime_read.js"
 OBSERVATION = EXT / "service_worker_runtime_observation.js"
-BOOTSTRAP = EXT / "service_worker_temporary_chat_route_reopen_probe.js"
+BOOTSTRAP = EXT / "service_worker_browser_runtime_v2.js"
 RICH_SCHEMAS = EXT / "service_worker_rich_input_schema7_repair_pr9_2.js"
 CONNECTOR_SUPPORT = EXT / "service_worker_connector_support_pr10_0.js"
 
@@ -35,10 +35,13 @@ def test_manifest_identity_is_preserved_as_thin_pr12_bootstrap() -> None:
 
     assert manifest["version"] == "0.1.13"
     assert manifest["background"]["service_worker"] == (
-        "service_worker_temporary_chat_route_reopen_probe.js"
+        "service_worker_browser_runtime_v2.js"
     )
     bootstrap = _source(BOOTSTRAP)
-    assert _active_imports(bootstrap) == ['importScripts("service_worker_runtime.js");']
+    assert _active_imports(bootstrap) == [
+        'importScripts("service_worker_runtime.js");',
+        'importScripts("service_worker_passive_stream_observer.js");',
+    ]
 
 
 def test_runtime_entrypoint_is_assembly_only_with_explicit_domain_order() -> None:

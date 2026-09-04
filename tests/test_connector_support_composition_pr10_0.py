@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXT = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
-BOOTSTRAP = EXT / "service_worker_temporary_chat_route_reopen_probe.js"
+BOOTSTRAP = EXT / "service_worker_browser_runtime_v2.js"
 WRITE = EXT / "service_worker_runtime_write.js"
 OBSERVATION = EXT / "service_worker_runtime_observation.js"
 SUPPORT = EXT / "service_worker_connector_support_pr10_0.js"
@@ -19,7 +19,7 @@ def test_manifest_entrypoint_stays_historically_stable() -> None:
     assert manifest["version"] == "0.1.13"
     assert (
         manifest["background"]["service_worker"]
-        == "service_worker_temporary_chat_route_reopen_probe.js"
+        == "service_worker_browser_runtime_v2.js"
     )
     bootstrap = BOOTSTRAP.read_text(encoding="utf-8")
     assert 'importScripts("service_worker_runtime.js");' in bootstrap

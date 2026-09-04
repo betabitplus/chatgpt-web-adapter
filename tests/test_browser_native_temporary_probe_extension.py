@@ -11,7 +11,7 @@ def test_temporary_probe_is_layered_above_reconciled_worker() -> None:
     worker_name = manifest["background"]["service_worker"]
 
     assert manifest["version"] == "0.1.13"
-    assert worker_name == "service_worker_temporary_chat_route_reopen_probe.js"
+    assert worker_name == "service_worker_browser_runtime_v2.js"
 
     bootstrap = (root / worker_name).read_text(encoding="utf-8")
     assert 'importScripts("service_worker_runtime.js")' in bootstrap

@@ -200,7 +200,7 @@ def test_extension_timing_layer_is_below_existing_observability_chain():
     root = browser_native_extension_dir()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["version"] == "0.1.13"
-    assert manifest["background"]["service_worker"] == "service_worker_temporary_chat_route_reopen_probe.js"
+    assert manifest["background"]["service_worker"] == "service_worker_browser_runtime_v2.js"
 
     observability = (root / "service_worker_observability.js").read_text(encoding="utf-8")
     phase = (root / "service_worker_phase_timing_pr8_8.js").read_text(encoding="utf-8")

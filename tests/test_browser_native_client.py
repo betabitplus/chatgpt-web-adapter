@@ -596,7 +596,7 @@ def test_unlabeled_tool_calls_get_concise_context_and_plain_thoughts_are_suppres
     assert "private raw reasoning" not in repr(events)
 
 
-def test_current_canonical_progress_node_is_emitted_immediately() -> None:
+def test_current_canonical_progress_waits_for_revision_completion() -> None:
     payload = {
         "conversation_id": "conversation-1",
         "current_node": "progress",
@@ -620,10 +620,7 @@ def test_current_canonical_progress_node_is_emitted_immediately() -> None:
                     "id": "m-progress",
                     "author": {"role": "assistant"},
                     "recipient": "all",
-                    "content": {
-                        "content_type": "text",
-                        "parts": ["Первый файл большой, читаю его диапазонами."],
-                    },
+                    "content": {"content_type": "text", "parts": ["Первый"]},
                     "metadata": {"is_thinking_preamble_message": True},
                     "end_turn": False,
                 },
@@ -632,21 +629,50 @@ def test_current_canonical_progress_node_is_emitted_immediately() -> None:
     }
     emitted: set[str] = set()
 
-    events = _canonical_intermediate_events(
+    first = _canonical_intermediate_events(
         payload,
         baseline_message_ids=frozenset({"m-user"}),
         emitted_message_ids=emitted,
         submission_id="submission-1",
     )
+    assert first == []
 
-    assert events == [
-        {
-            "type": "canonical_intermediate_message",
-            "message_id": "m-progress",
-            "message_kind": "assistant_progress",
-            "text": "Первый файл большой, читаю его диапазонами.",
-            "label": None,
-            "tool_name": None,
-            "submission_id": "submission-1",
-        }
+    payload["mapping"]["progress"]["message"]["content"]["parts"] = [
+        "Первый нюанс уже появился на уровне инструмента: читаю файл диапазонами."
     ]
+    second = _canonical_intermediate_events(
+        payload,
+        baseline_message_ids=frozenset({"m-user"}),
+        emitted_message_ids=emitted,
+        submission_id="submission-1",
+    )
+    assert second == []
+    assert "m-progress" not in emitted
+
+    payload["mapping"]["progress"]["children"] = ["call"]
+    payload["mapping"]["call"] = {
+        "id": "call",
+        "parent": "progress",
+        "children": [],
+        "message": {
+            "id": "m-call",
+            "author": {"role": "assistant"},
+            "recipient": "api_tool.call_tool",
+            "content": {"content_type": "code", "text": "{}"},
+            "metadata": {},
+            "end_turn": False,
+        },
+    }
+    payload["current_node"] = "call"
+
+    third = _canonical_intermediate_events(
+        payload,
+        baseline_message_ids=frozenset({"m-user"}),
+        emitted_message_ids=emitted,
+        submission_id="submission-1",
+    )
+    assert third[0]["message_kind"] == "assistant_progress"
+    assert third[0]["text"] == (
+        "Первый нюанс уже появился на уровне инструмента: читаю файл диапазонами."
+    )
+    assert "m-progress" in emitted

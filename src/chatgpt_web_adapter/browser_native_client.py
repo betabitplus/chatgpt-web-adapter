@@ -236,6 +236,7 @@ def _canonical_intermediate_events(
     emitted_message_ids: set[str],
     submission_id: str | None,
 ) -> list[dict[str, Any]]:
+    current_node = payload.get("current_node")
     events: list[dict[str, Any]] = []
     for node_id, node in _current_branch_nodes(payload):
         raw_message = node.get("message")
@@ -301,6 +302,15 @@ def _canonical_intermediate_events(
 
         if kind is None:
             continue
+
+        # User-visible thinking/preamble text is revision-prone while it remains
+        # the conversation current_node. Never freeze a partial first snapshot
+        # such as "Первый". Tool calls can be shown immediately, but thinking text
+        # is emitted only after ChatGPT advances to the next canonical node.
+        revision_sensitive = kind in {"assistant_progress", "reasoning"} and bool(text)
+        if revision_sensitive and node_id == current_node:
+            continue
+
         emitted_message_ids.add(message_id)
         event = {
             "type": "canonical_intermediate_message",

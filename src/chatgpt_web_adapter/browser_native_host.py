@@ -584,11 +584,17 @@ class BrowserNativeBroker:
                         lease_id is not None
                         and (
                             operation == "canonical_read"
-                            or (operation == "turn" and message.get("ok") is True)
+                            or (
+                                operation == "turn"
+                                and message.get("ok") is True
+                                and request.get("conversationMode") != "temporary"
+                            )
                         )
                     ):
-                        # Retain the cross-request lane until Python has classified
-                        # terminal canonical readback for the matching lease.
+                        # Normal turns retain the cross-request lane until Python has
+                        # classified terminal canonical readback. Temporary Chat is
+                        # page-finalized and intentionally has no canonical readback,
+                        # so its lane is released with the completed turn.
                         self._reserve_authority_for_readback(lease_id)
                         release_lane = False
                     return message

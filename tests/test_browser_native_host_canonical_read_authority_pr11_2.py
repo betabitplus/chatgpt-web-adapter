@@ -164,6 +164,48 @@ def test_authority_lane_stays_reserved_through_terminal_canonical_readback(
         broker._server.server_close()
 
 
+def test_temporary_turn_releases_authority_lane_without_canonical_readback(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    broker = subject.BrowserNativeBroker(state_dir=tmp_path)
+    broker.extension_connected = True
+    forwarded: list[str] = []
+
+    def fake_write(stream, request):
+        del stream
+        forwarded.append(request["request_id"])
+        broker.route_native_message(
+            {
+                "protocol": subject.PROTOCOL_VERSION,
+                "type": "turn_result",
+                "request_id": request["request_id"],
+                "ok": True,
+                "browserAuthorityLeaseId": request["browserAuthorityLeaseId"],
+            }
+        )
+
+    monkeypatch.setattr(subject, "write_native_message", fake_write)
+    try:
+        for index in (1, 2):
+            request = _request(
+                broker,
+                operation="turn",
+                request_id=f"temporary-{index}",
+                lease_id=f"lease-{index}",
+            )
+            request["conversationMode"] = "temporary"
+            result = broker.handle_local_request(request)
+            assert result["ok"] is True
+            assert broker.turn_lock.locked() is False
+            assert broker._authority_reserved_lease_id is None
+
+        assert forwarded == ["temporary-1", "temporary-2"]
+    finally:
+        broker._clear_authority_reservation(release_lane=True)
+        broker._server.server_close()
+
+
 def test_retryable_canonical_reads_keep_same_lease_reserved_until_completion(
     monkeypatch,
     tmp_path,

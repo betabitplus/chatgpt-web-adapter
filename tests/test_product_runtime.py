@@ -109,6 +109,22 @@ def test_stop_generation_delegates_out_of_band_to_browser_provider() -> None:
     assert provider.stop_calls == [("conversation-1", 3.5)]
 
 
+def test_runtime_exposes_raw_canonical_conversation_payload(monkeypatch) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    payload = {"title": "Graph", "mapping": {"node": {}}}
+    monkeypatch.setattr(
+        runtime.canonical,
+        "get_conversation_payload",
+        lambda _conversation: payload,
+        raising=False,
+    )
+
+    result = runtime.get_conversation_payload("conversation-1")
+
+    assert result == payload
+    assert result is not payload
+
+
 def test_send_text_delegates_exactly_once_without_fallback() -> None:
     runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
     calls = []

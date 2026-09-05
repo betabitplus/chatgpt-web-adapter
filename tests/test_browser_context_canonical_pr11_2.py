@@ -140,6 +140,18 @@ def test_browser_context_client_keeps_python_status_interpreter(tmp_path, monkey
     assert status.message_id == "assistant-1"
 
 
+def test_browser_context_client_exposes_exact_conversation_payload(tmp_path, monkeypatch) -> None:
+    provider = BrowserNativeTurnProvider(state_dir=tmp_path)
+    client = BrowserContextCanonicalClient(object(), provider)
+    payload = _payload()
+    monkeypatch.setattr(client.transport, "read_conversation", lambda _conversation: payload)
+
+    result = client.get_conversation_payload("conversation-1")
+
+    assert result is payload
+    assert result["mapping"]["assistant-node"]["message"]["content"]["parts"] == ["done"]
+
+
 def test_browser_context_client_lists_real_catalog_payloads(tmp_path, monkeypatch) -> None:
     provider = BrowserNativeTurnProvider(state_dir=tmp_path)
     client = BrowserContextCanonicalClient(object(), provider)

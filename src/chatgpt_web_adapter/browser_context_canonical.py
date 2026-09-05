@@ -499,6 +499,14 @@ class BrowserContextCanonicalClient:
     ) -> list[ChatMessage]:
         return get_messages(self, conversation, **kwargs)
 
+    def get_conversation_payload(
+        self,
+        conversation: ConversationRef | ChatConversation | dict[str, Any] | str,
+    ) -> dict[str, Any]:
+        """Return the exact canonical conversation payload fetched in browser context."""
+        ref = ConversationRef.from_any(conversation)
+        return self._get_conversation_payload(ref.conversation_id)
+
     def attach_conversation(
         self,
         conversation: ConversationRef | ChatConversation | dict[str, Any] | str,

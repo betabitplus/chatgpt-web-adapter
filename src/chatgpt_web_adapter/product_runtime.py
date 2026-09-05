@@ -730,6 +730,14 @@ class ChatGPTProductRuntime:
     def get_messages(self, conversation: Any, **kwargs: Any) -> list[ChatMessage]:
         return self.canonical.get_messages(conversation, **kwargs)
 
+    def get_conversation_payload(self, conversation: Any) -> dict[str, Any]:
+        helper = getattr(self.canonical, "get_conversation_payload", None)
+        if not callable(helper):
+            raise RuntimeError(
+                "raw canonical conversation payload is unavailable on the selected canonical client"
+            )
+        return dict(helper(conversation))
+
     def attach_conversation(self, conversation: Any) -> Any:
         return self.canonical.attach_conversation(conversation)
 

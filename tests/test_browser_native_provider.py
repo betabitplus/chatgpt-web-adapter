@@ -195,3 +195,53 @@ def test_provider_observe_turn_streams_events_then_returns_terminal(tmp_path) ->
         }
     ]
     assert result["messageId"] == "assistant-1"
+
+
+def test_provider_stop_generation_uses_out_of_band_rpc(tmp_path) -> None:
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    token = "t" * 32
+    (tmp_path / "bridge.json").write_text(
+        json.dumps(
+            {
+                "protocol": 1,
+                "host": "127.0.0.1",
+                "port": listener.getsockname()[1],
+                "token": token,
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            request = recv_local_message(connection)
+            captured.update(request)
+            send_local_message(
+                connection,
+                {
+                    "protocol": 1,
+                    "type": "stop_generation_result",
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "stopped": True,
+                    "conversationId": "conversation-1",
+                    "tabId": 42,
+                },
+            )
+        listener.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    provider = BrowserNativeTurnProvider(state_dir=tmp_path)
+    result = provider.stop_generation("conversation-1", timeout=2)
+    thread.join(timeout=2)
+
+    assert captured["type"] == "stop_generation"
+    assert captured["conversationId"] == "conversation-1"
+    assert captured["timeoutMs"] == 2000
+    assert result["stopped"] is True
+    assert result["conversationId"] == "conversation-1"

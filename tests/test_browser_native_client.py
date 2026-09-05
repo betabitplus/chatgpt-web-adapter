@@ -9,11 +9,12 @@ import pytest
 from chatgpt_web_adapter.browser_native_client import (
     _canonical_intermediate_events,
     _wait_for_new_final_assistant,
+    await_browser_native_final,
     send_browser_native,
     submit_browser_native,
 )
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeTurnResult
-from chatgpt_web_adapter.exceptions import RequestError
+from chatgpt_web_adapter.exceptions import ConversationTimeoutError, RequestError
 from chatgpt_web_adapter.types import ChatConversation
 
 
@@ -917,6 +918,142 @@ def test_passive_observer_waits_without_canonical_polling_then_reconciles_once()
         and event.get("text") == "Working passively"
         for event in delivered
     )
+
+
+def test_stopped_passive_observer_accepts_unfinished_canonical_partial(monkeypatch) -> None:
+    class Provider(FakeProvider):
+        def send_text(self, text, *, conversation=None, timeout=None):
+            self.normal_calls.append((text, conversation, timeout))
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id=None,
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=17,
+                tab_was_active=False,
+                elapsed_ms=50,
+                browser_authority_lease_id="lease-1",
+                passive_observer_armed=True,
+            )
+
+        def observe_turn(self, **kwargs):
+            return {
+                "ok": True,
+                "conversationId": kwargs["conversation_id"],
+                "turnExchangeId": "turn-stopped",
+                "messageId": "assistant-partial",
+                "finishReason": "stopped",
+            }
+
+    partial_payload = {
+        "conversation_id": "conversation-1",
+        "title": "Stopped chat",
+        "current_node": "assistant-node",
+        "mapping": {
+            "assistant-node": {
+                "id": "assistant-node",
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": "assistant-partial",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["saved partial"]},
+                    "metadata": {},
+                    "end_turn": False,
+                },
+            }
+        },
+    }
+    provider = Provider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def __init__(self) -> None:
+            self.reads = 0
+            self.events = []
+
+        def _emit_event(self, callback, event_type, **payload):
+            event = {"type": event_type, **payload}
+            self.events.append(event)
+            if callback is not None:
+                callback(event)
+
+        def _get_conversation_payload(self, conversation_id):
+            self.reads += 1
+            return partial_payload
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client.time.sleep",
+        lambda _seconds: None,
+    )
+    client = Client()
+    response = send_browser_native(client, "hello", timeout=2, poll_interval=0.01)
+
+    assert response.text == "saved partial"
+    assert response.title == "Stopped chat"
+    assert response.conversation.finish_reason == "stopped"
+    assert response.request.turn_exchange_id == "turn-stopped"
+    assert client.reads == 1
+    readback = [event for event in client.events if event["type"] == "browser_native_readback_completed"][-1]
+    assert readback["stopped_by_user"] is True
+    assert readback["canonical_finality_proven"] is False
+
+
+def test_stopped_passive_observer_returns_empty_when_partial_is_not_materialized(monkeypatch) -> None:
+    class Provider(FakeProvider):
+        def send_text(self, text, *, conversation=None, timeout=None):
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id=None,
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=17,
+                tab_was_active=False,
+                elapsed_ms=50,
+                browser_authority_lease_id="lease-1",
+                passive_observer_armed=True,
+            )
+
+        def observe_turn(self, **kwargs):
+            return {
+                "ok": True,
+                "conversationId": kwargs["conversation_id"],
+                "turnExchangeId": "turn-stopped",
+                "messageId": None,
+                "finishReason": "stopped",
+            }
+
+    provider = Provider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def _emit_event(self, callback, event_type, **payload):
+            if callback is not None:
+                callback({"type": event_type, **payload})
+
+    submission = submit_browser_native(Client(), "hello", timeout=2, poll_interval=0.01)
+
+    def timeout_wait(*_args, **_kwargs):
+        raise ConversationTimeoutError("no stopped partial yet", timeout=1.0)
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._wait_for_new_final_assistant",
+        timeout_wait,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client.time.sleep",
+        lambda _seconds: None,
+    )
+    response = await_browser_native_final(Client(), submission)
+
+    assert response.text == ""
+    assert response.conversation.conversation_id == "conversation-1"
+    assert response.conversation.finish_reason == "stopped"
 
 
 def test_passive_observer_stream_start_failure_falls_back_to_bounded_canonical_read() -> None:

@@ -19,6 +19,7 @@ from .status import _status_from_payload
 from .types import (
     AttachedConversation,
     ChatConversation,
+    ChatMessage,
     ChatMetrics,
     ChatRequestDiagnostics,
     ChatResponse,
@@ -391,6 +392,7 @@ def _assistant_candidates_from_payload(
     *,
     baseline_assistant_ids: set[str] | frozenset[str],
     turn_exchange_id: str | None = None,
+    allow_unfinished: bool = False,
 ) -> list[Any]:
     branch = _current_branch_nodes(payload)
     normalized_turn_exchange_id = (
@@ -431,7 +433,11 @@ def _assistant_candidates_from_payload(
             continue
         finish_reason = getattr(message, "finish_reason", None)
         has_finish_reason = isinstance(finish_reason, str) and bool(finish_reason.strip())
-        if raw_message.get("end_turn") is not True and not has_finish_reason:
+        if (
+            not allow_unfinished
+            and raw_message.get("end_turn") is not True
+            and not has_finish_reason
+        ):
             continue
         message_id = getattr(message, "message_id", None)
         if not isinstance(message_id, str) or message_id in baseline_assistant_ids:
@@ -456,6 +462,7 @@ def _wait_for_new_final_assistant(
     on_event: Callable[[dict[str, Any]], None] | None = None,
     submission_id: str | None = None,
     minimum_poll_interval: float | None = None,
+    allow_unfinished: bool = False,
 ) -> Any | tuple[Any, dict[str, Any] | None, int | None]:
     """Wait for canonical finality, optionally returning the reused payload.
 
@@ -510,8 +517,13 @@ def _wait_for_new_final_assistant(
                     payload,
                     baseline_assistant_ids=baseline_assistant_ids,
                     turn_exchange_id=turn_exchange_id,
+                    allow_unfinished=allow_unfinished,
                 )
                 for candidate in reversed(candidates):
+                    if allow_unfinished:
+                        if include_readback:
+                            return candidate, payload, canonical_payload_read_count
+                        return candidate
                     finish_reason = getattr(candidate, "finish_reason", None)
                     if isinstance(finish_reason, str) and bool(finish_reason.strip()):
                         if include_readback:
@@ -544,6 +556,10 @@ def _wait_for_new_final_assistant(
                 and bool(getattr(message, "text", "").strip())
             ]
             for candidate in reversed(candidates):
+                if allow_unfinished:
+                    if include_readback:
+                        return candidate, None, None
+                    return candidate
                 finish_reason = getattr(candidate, "finish_reason", None)
                 if isinstance(finish_reason, str) and bool(finish_reason.strip()):
                     if include_readback:
@@ -930,6 +946,8 @@ def await_browser_native_final(
     authority_lease_id = getattr(turn, "browser_authority_lease_id", None)
     observed_turn_exchange_id = getattr(turn, "turn_exchange_id", None)
     passive_observer_used = False
+    passive_finish_reason: str | None = None
+    passive_message_id: str | None = None
 
     if (
         bool(getattr(turn, "passive_observer_armed", False))
@@ -960,6 +978,20 @@ def await_browser_native_final(
             )
             if isinstance(learned_turn_exchange_id, str) and learned_turn_exchange_id.strip():
                 observed_turn_exchange_id = learned_turn_exchange_id.strip()
+            learned_finish_reason = (
+                observe_result.get("finishReason")
+                if isinstance(observe_result, dict)
+                else None
+            )
+            if isinstance(learned_finish_reason, str) and learned_finish_reason.strip():
+                passive_finish_reason = learned_finish_reason.strip()
+            learned_message_id = (
+                observe_result.get("messageId")
+                if isinstance(observe_result, dict)
+                else None
+            )
+            if isinstance(learned_message_id, str) and learned_message_id.strip():
+                passive_message_id = learned_message_id.strip()
             passive_observer_used = True
             remaining = max(
                 1.0,
@@ -983,33 +1015,59 @@ def await_browser_native_final(
                 reason=str(error),
             )
 
-    final_message, canonical_payload, canonical_payload_read_count = _wait_for_new_final_assistant(
-        self,
-        turn.conversation_id,
-        baseline_assistant_ids=submission.baseline_assistant_ids,
-        baseline_message_ids=submission.baseline_message_ids,
-        timeout=remaining,
-        interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS if passive_observer_used else submission.poll_interval,
-        include_readback=True,
-        turn_exchange_id=observed_turn_exchange_id,
-        retry_400_until_timeout=retry_400_until_timeout,
-        on_event=None if passive_observer_used else submission.on_event,
-        submission_id=submission.submission_id,
-        minimum_poll_interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS if passive_observer_used else None,
-    )
+    stopped_by_user = passive_finish_reason == "stopped"
+    readback_timeout = min(remaining, 1.0) if stopped_by_user else remaining
+    try:
+        final_message, canonical_payload, canonical_payload_read_count = _wait_for_new_final_assistant(
+            self,
+            turn.conversation_id,
+            baseline_assistant_ids=submission.baseline_assistant_ids,
+            baseline_message_ids=submission.baseline_message_ids,
+            timeout=readback_timeout,
+            interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS if passive_observer_used else submission.poll_interval,
+            include_readback=True,
+            turn_exchange_id=observed_turn_exchange_id,
+            retry_400_until_timeout=retry_400_until_timeout,
+            on_event=None if passive_observer_used else submission.on_event,
+            submission_id=submission.submission_id,
+            minimum_poll_interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS if passive_observer_used else None,
+            allow_unfinished=stopped_by_user,
+        )
+    except ConversationTimeoutError:
+        if not stopped_by_user:
+            raise
+        final_message = ChatMessage(
+            message_id=passive_message_id,
+            role="assistant",
+            text="",
+            finish_reason="stopped",
+        )
+        canonical_payload = None
+        canonical_payload_read_count = None
+
+    result_finish_reason = "stopped" if stopped_by_user else final_message.finish_reason
 
     if canonical_payload is not None:
         result_conversation = ChatConversation(
             conversation_id=turn.conversation_id,
             message_id=final_message.message_id,
             parent_message_id=final_message.message_id,
-            finish_reason=final_message.finish_reason,
+            finish_reason=result_finish_reason,
             is_thinking=False,
         )
         attached = AttachedConversation.from_payload(
             canonical_payload,
             conversation=result_conversation,
         )
+    elif stopped_by_user:
+        result_conversation = ChatConversation(
+            conversation_id=turn.conversation_id,
+            message_id=final_message.message_id,
+            parent_message_id=final_message.message_id,
+            finish_reason=result_finish_reason,
+            is_thinking=False,
+        )
+        attached = AttachedConversation(conversation=result_conversation)
     else:
         attached = self.attach_conversation(turn.conversation_id)
         conversation_data = attached.conversation.to_dict()
@@ -1017,7 +1075,7 @@ def await_browser_native_final(
             {
                 "conversation_id": turn.conversation_id,
                 "message_id": final_message.message_id,
-                "finish_reason": final_message.finish_reason,
+                "finish_reason": result_finish_reason,
                 "is_thinking": False,
             }
         )
@@ -1042,7 +1100,7 @@ def await_browser_native_final(
         conversation_id=turn.conversation_id,
         message_id=final_message.message_id,
         model=final_message.model,
-        finish_reason=final_message.finish_reason,
+        finish_reason=result_finish_reason,
     )
     finalization = {**finalization, "submission_id": submission.submission_id}
     _emit_revision_safe_event(self, submission.on_event, finalization)
@@ -1064,7 +1122,8 @@ def await_browser_native_final(
         revision_safe_stream_observation_count=submission.stream_state.observation_count,
         revision_safe_stream_revision_count=submission.stream_state.revision_count,
         revision_safe_stream_delivery_incomplete=submission.stream_state.delivery_incomplete,
-        canonical_finality_proven=True,
+        canonical_finality_proven=not stopped_by_user,
+        stopped_by_user=stopped_by_user,
     )
     submission.final_response = response
     return response

@@ -441,6 +441,17 @@ class ChatGPTProductRuntime:
 
     readiness = health
 
+    def stop_generation(
+        self,
+        conversation: ConversationInput = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        helper = getattr(self.write_transport, "stop_generation", None)
+        if not callable(helper):
+            raise RuntimeError("stop generation is unavailable for the selected product transport")
+        return helper(conversation, timeout=timeout)
+
     def capabilities(self) -> ProductCapabilities:
         capabilities = self.write_transport.capabilities()
         if not isinstance(capabilities, ProductCapabilities):

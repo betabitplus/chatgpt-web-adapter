@@ -21,6 +21,7 @@ class _Provider:
     def __init__(self, *, tab_id: int | None = 41, connected: bool = True) -> None:
         self.tab_id = tab_id
         self.connected = connected
+        self.stop_calls: list[tuple[str | None, float]] = []
 
     def status(self) -> BrowserNativeBridgeStatus:
         return BrowserNativeBridgeStatus(
@@ -31,6 +32,10 @@ class _Provider:
 
     def send_text(self, *args, **kwargs):
         raise AssertionError("test provider write should not be called")
+
+    def stop_generation(self, conversation_id=None, *, timeout=10.0):
+        self.stop_calls.append((conversation_id, timeout))
+        return {"ok": True, "stopped": True, "conversationId": conversation_id}
 
 
 class _Client:
@@ -92,6 +97,16 @@ def test_reassembled_runtime_observes_same_external_runtime_tab() -> None:
     assert second_health.runtime_tab_id == 77
     assert first_health.runtime_tab_preexisting is True
     assert second_health.runtime_tab_preexisting is True
+
+
+def test_stop_generation_delegates_out_of_band_to_browser_provider() -> None:
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+
+    result = runtime.stop_generation("conversation-1", timeout=3.5)
+
+    assert result["stopped"] is True
+    assert provider.stop_calls == [("conversation-1", 3.5)]
 
 
 def test_send_text_delegates_exactly_once_without_fallback() -> None:

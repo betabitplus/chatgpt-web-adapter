@@ -6,4 +6,5 @@
 // terminal layer while forcing deterministic activation of this runtime revision.
 
 importScripts("service_worker_runtime.js");
+importScripts("service_worker_stop_generation.js");
 importScripts("service_worker_passive_stream_observer.js");

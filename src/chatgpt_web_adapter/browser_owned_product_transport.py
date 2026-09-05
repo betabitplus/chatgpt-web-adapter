@@ -68,7 +68,7 @@ from .temporary_product_runtime_pr8_13 import (
     TemporaryProductWriteRuntime,
     TemporaryProductWriteRuntimeError,
 )
-from .types import ChatResponse
+from .types import ChatResponse, ConversationRef
 
 _NORMAL_CONVERSATION_MODE = "normal"
 _TEMPORARY_CONVERSATION_MODE = "temporary"
@@ -358,6 +358,17 @@ class BrowserOwnedProductTransport:
         if self._model_profile_selection_supported:
             return _BROWSER_OWNED_CAPABILITIES
         return _build_browser_owned_capabilities(profile_selection_supported=False)
+
+    def stop_generation(
+        self,
+        conversation: ConversationInput = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        conversation_id = None
+        if conversation is not None:
+            conversation_id = ConversationRef.from_any(conversation).conversation_id
+        return self.provider.stop_generation(conversation_id, timeout=timeout)
 
     @_serialize_submission_operation
     def send_text(

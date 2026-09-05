@@ -11,6 +11,26 @@
     }, location.origin);
   }
 
+  function visibleElement(selector) {
+    const element = document.querySelector(selector);
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 ? element : null;
+  }
+
+  function stopGeneration() {
+    const selectors = [
+      '[data-testid="stop-button"]',
+      '[data-testid="stop-generating-button"]',
+      'button[aria-label*="Stop generating"]',
+      'button[aria-label*="Остановить"]',
+    ];
+    const control = selectors.map(visibleElement).find(Boolean);
+    if (!control) return { ok: true, stopped: false, reason: "stop_control_not_visible" };
+    control.click();
+    return { ok: true, stopped: true };
+  }
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "cwa_passive_arm") {
       postControl("arm", message.observerId);
@@ -20,6 +40,10 @@
     if (message?.type === "cwa_passive_disarm") {
       postControl("disarm", message.observerId);
       sendResponse?.({ ok: true });
+      return false;
+    }
+    if (message?.type === "cwa_stop_generation") {
+      sendResponse?.(stopGeneration());
       return false;
     }
     return false;

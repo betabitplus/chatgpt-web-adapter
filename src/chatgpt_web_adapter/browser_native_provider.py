@@ -211,6 +211,42 @@ class BrowserNativeTurnProvider:
             runtime_tab_id=response.get("runtimeTabId") if isinstance(response.get("runtimeTabId"), int) else None,
         )
 
+    def stop_generation(
+        self,
+        conversation_id: str | None = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        normalized_conversation_id = None
+        if conversation_id is not None:
+            if not isinstance(conversation_id, str) or not conversation_id.strip():
+                raise ValueError("conversation_id must be a non-empty string or None")
+            normalized_conversation_id = conversation_id.strip()
+        total_timeout = float(timeout)
+        if total_timeout <= 0:
+            raise ValueError("timeout must be positive")
+        request_id = str(uuid.uuid4())
+        response = self._rpc(
+            {
+                "type": "stop_generation",
+                "request_id": request_id,
+                "conversationId": normalized_conversation_id,
+                "timeoutMs": int(total_timeout * 1000),
+            },
+            timeout=total_timeout + self.connect_timeout,
+        )
+        if response.get("request_id") != request_id:
+            raise RequestError(
+                "BROWSER_NATIVE_RESPONSE_MISMATCH",
+                request_stage="browser_native_stop_generation",
+            )
+        if not response.get("ok"):
+            raise RequestError(
+                str(response.get("error") or "BROWSER_NATIVE_STOP_GENERATION_FAILED"),
+                request_stage="browser_native_stop_generation",
+            )
+        return response
+
     @staticmethod
     def _optional_bool(response: dict[str, Any], key: str) -> bool | None:
         value = response.get(key)

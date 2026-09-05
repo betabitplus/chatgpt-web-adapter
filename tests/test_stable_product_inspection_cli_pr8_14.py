@@ -82,6 +82,7 @@ class _Runtime:
     def __init__(self, *, ready: bool = True) -> None:
         self.ready = ready
         self.message_call = None
+        self.payload_call = None
         self.write_called = False
 
     def health(self, conversation=None):
@@ -93,6 +94,23 @@ class _Runtime:
     def get_messages(self, conversation, **kwargs):
         self.message_call = (conversation, kwargs)
         return [_Message("user", "hello"), _Message("assistant", "world")]
+
+    def list_conversations(self):
+        return [
+            {
+                "id": "conversation-1",
+                "title": "Demo",
+                "update_time": "2026-09-05T17:00:00Z",
+            }
+        ]
+
+    def get_conversation_payload(self, conversation):
+        self.payload_call = conversation
+        return {
+            "title": "Demo",
+            "current_node": "assistant-node",
+            "mapping": {"assistant-node": {"message": {"author": {"role": "assistant"}}}},
+        }
 
     def send_text_observed(self, *args, **kwargs):
         self.write_called = True
@@ -215,6 +233,38 @@ def test_messages_reads_canonical_current_branch_without_creating_artifacts(
         "roles": ["user", "assistant"],
         "include_empty": False,
     }
+    assert runtime.write_called is False
+
+
+def test_catalog_reads_canonical_conversation_list_without_writing(monkeypatch, capsys) -> None:
+    runtime = _Runtime()
+    monkeypatch.setattr(cli, "assemble_product_runtime", lambda **kwargs: runtime)
+
+    code = cli.main(["catalog", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == cli.EXIT_OK
+    assert payload["schema"] == 1
+    assert payload["command"] == "catalog"
+    assert payload["count"] == 1
+    assert payload["items"][0]["id"] == "conversation-1"
+    assert runtime.write_called is False
+
+
+def test_conversation_reads_exact_canonical_payload_without_writing(monkeypatch, capsys) -> None:
+    runtime = _Runtime()
+    monkeypatch.setattr(cli, "assemble_product_runtime", lambda **kwargs: runtime)
+
+    code = cli.main(["conversation", "https://chatgpt.com/c/conversation-1", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == cli.EXIT_OK
+    assert payload["schema"] == 1
+    assert payload["command"] == "conversation"
+    assert payload["conversation_id"] == "conversation-1"
+    assert payload["conversation"]["title"] == "Demo"
+    assert payload["conversation"]["mapping"]["assistant-node"]["message"]["author"]["role"] == "assistant"
+    assert runtime.payload_call.conversation_id == "conversation-1"
     assert runtime.write_called is False
 
 

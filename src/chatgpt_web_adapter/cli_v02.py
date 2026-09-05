@@ -175,6 +175,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="include messages whose normalized text is empty",
     )
 
+    catalog = root.add_parser(
+        "catalog",
+        help="read the canonical ChatGPT conversation catalog without performing a write",
+    )
+    _add_inspection_common(catalog)
+
+    conversation = root.add_parser(
+        "conversation",
+        help="read one exact canonical ChatGPT conversation payload without performing a write",
+    )
+    _add_inspection_common(conversation)
+    conversation.add_argument(
+        "conversation",
+        help="raw conversation id or ChatGPT conversation URL",
+    )
+
     export = root.add_parser(
         "export",
         help="write a normalized current-branch export plus stable artifact manifest",
@@ -344,6 +360,44 @@ def _run_messages(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _run_catalog(args: argparse.Namespace) -> int:
+    runtime = _runtime_for(args)
+    items = [dict(item) for item in runtime.list_conversations()]
+    payload = {
+        "schema": CLI_CONTRACT_SCHEMA,
+        "command": "catalog",
+        "ok": True,
+        "count": len(items),
+        "items": items,
+    }
+    if args.json:
+        _json_print(payload)
+    else:
+        for item in items:
+            conversation_id = item.get("id", "")
+            title = item.get("title") or "Untitled chat"
+            print(f"{conversation_id}\t{title}")
+    return EXIT_OK
+
+
+def _run_conversation(args: argparse.Namespace) -> int:
+    runtime = _runtime_for(args)
+    ref = ConversationRef.from_any(args.conversation)
+    conversation_payload = runtime.get_conversation_payload(ref)
+    payload = {
+        "schema": CLI_CONTRACT_SCHEMA,
+        "command": "conversation",
+        "ok": True,
+        "conversation_id": ref.conversation_id,
+        "conversation": conversation_payload,
+    }
+    if args.json:
+        _json_print(payload)
+    else:
+        _json_print(conversation_payload)
+    return EXIT_OK
+
+
 def _run_snapshot_artifact(args: argparse.Namespace) -> int:
     client = legacy_cli.ChatGPTWebClient(auth_file=args.auth_file, timeout=args.timeout)
     result = snapshot_conversation(
@@ -492,6 +546,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_capabilities(args)
         if args.command == "messages":
             return _run_messages(args)
+        if args.command == "catalog":
+            return _run_catalog(args)
+        if args.command == "conversation":
+            return _run_conversation(args)
         if args.command == "snapshot":
             return _run_snapshot_artifact(args)
         if args.command == "export":

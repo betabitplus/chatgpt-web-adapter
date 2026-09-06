@@ -82,6 +82,8 @@ class BrowserNativeTurnProvider:
         self.connect_timeout = float(connect_timeout)
         self.turn_timeout = float(turn_timeout)
         self._authority_context = threading.local()
+        self._stopped_conversations_lock = threading.Lock()
+        self._stopped_conversations: set[str] = set()
 
     @property
     def descriptor_path(self) -> Path:
@@ -245,7 +247,34 @@ class BrowserNativeTurnProvider:
                 str(response.get("error") or "BROWSER_NATIVE_STOP_GENERATION_FAILED"),
                 request_stage="browser_native_stop_generation",
             )
+        if response.get("stopped") is True:
+            stopped_conversation_id = response.get("conversationId")
+            if not isinstance(stopped_conversation_id, str) or not stopped_conversation_id.strip():
+                stopped_conversation_id = normalized_conversation_id
+            if isinstance(stopped_conversation_id, str) and stopped_conversation_id.strip():
+                self._mark_conversation_stopped(stopped_conversation_id)
         return response
+
+    def _mark_conversation_stopped(self, conversation_id: str) -> None:
+        normalized = conversation_id.strip()
+        if not normalized:
+            return
+        with self._stopped_conversations_lock:
+            self._stopped_conversations.add(normalized)
+
+    def stop_requested_for(self, conversation_id: str) -> bool:
+        normalized = conversation_id.strip() if isinstance(conversation_id, str) else ""
+        if not normalized:
+            return False
+        with self._stopped_conversations_lock:
+            return normalized in self._stopped_conversations
+
+    def clear_stop_requested_for(self, conversation_id: str) -> None:
+        normalized = conversation_id.strip() if isinstance(conversation_id, str) else ""
+        if not normalized:
+            return
+        with self._stopped_conversations_lock:
+            self._stopped_conversations.discard(normalized)
 
     @staticmethod
     def _optional_bool(response: dict[str, Any], key: str) -> bool | None:
@@ -312,6 +341,7 @@ class BrowserNativeTurnProvider:
         conversation_id = None
         if conversation is not None:
             conversation_id = ConversationRef.from_any(conversation).conversation_id
+            self.clear_stop_requested_for(conversation_id)
         if canonical_completed_at_ms is not None and conversation_id is None:
             raise ValueError("stale UI recovery requires an existing conversation")
         if canonical_completed_at_ms is not None:

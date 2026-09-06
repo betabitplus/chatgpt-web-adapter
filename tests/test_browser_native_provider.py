@@ -245,3 +245,6 @@ def test_provider_stop_generation_uses_out_of_band_rpc(tmp_path) -> None:
     assert captured["timeoutMs"] == 2000
     assert result["stopped"] is True
     assert result["conversationId"] == "conversation-1"
+    assert provider.stop_requested_for("conversation-1") is True
+    provider.clear_stop_requested_for("conversation-1")
+    assert provider.stop_requested_for("conversation-1") is False

@@ -463,6 +463,7 @@ def _wait_for_new_final_assistant(
     submission_id: str | None = None,
     minimum_poll_interval: float | None = None,
     allow_unfinished: bool = False,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> Any | tuple[Any, dict[str, Any] | None, int | None]:
     """Wait for canonical finality, optionally returning the reused payload.
 
@@ -483,6 +484,12 @@ def _wait_for_new_final_assistant(
     emitted_message_ids = set(baseline_message_ids)
 
     while True:
+        if stop_requested is not None and stop_requested():
+            raise ConversationTimeoutError(
+                "browser-native turn stopped by user",
+                timeout=0.0,
+                last_status="stopped",
+            )
         rate_limited_read_failure = False
         if use_single_payload:
             payload = None
@@ -943,6 +950,11 @@ def await_browser_native_final(
     retry_400_until_timeout = not submission.is_continuation
     provider = getattr(self, "_browser_native_turn_provider", None)
     observe_turn = getattr(provider, "observe_turn", None)
+    stop_requested_for = getattr(provider, "stop_requested_for", None)
+
+    def provider_stop_requested() -> bool:
+        return bool(callable(stop_requested_for) and stop_requested_for(turn.conversation_id))
+
     authority_lease_id = getattr(turn, "browser_authority_lease_id", None)
     observed_turn_exchange_id = getattr(turn, "turn_exchange_id", None)
     passive_observer_used = False
@@ -1015,7 +1027,8 @@ def await_browser_native_final(
                 reason=str(error),
             )
 
-    stopped_by_user = passive_finish_reason == "stopped"
+    passive_stopped = passive_finish_reason == "stopped"
+    stopped_by_user = passive_stopped or provider_stop_requested()
     readback_timeout = min(remaining, 1.0) if stopped_by_user else remaining
     try:
         final_message, canonical_payload, canonical_payload_read_count = _wait_for_new_final_assistant(
@@ -1032,8 +1045,10 @@ def await_browser_native_final(
             submission_id=submission.submission_id,
             minimum_poll_interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS if passive_observer_used else None,
             allow_unfinished=stopped_by_user,
+            stop_requested=None if passive_stopped else provider_stop_requested,
         )
     except ConversationTimeoutError:
+        stopped_by_user = stopped_by_user or provider_stop_requested()
         if not stopped_by_user:
             raise
         final_message = ChatMessage(
@@ -1045,6 +1060,7 @@ def await_browser_native_final(
         canonical_payload = None
         canonical_payload_read_count = None
 
+    stopped_by_user = stopped_by_user or provider_stop_requested()
     result_finish_reason = "stopped" if stopped_by_user else final_message.finish_reason
 
     if canonical_payload is not None:
@@ -1125,6 +1141,10 @@ def await_browser_native_final(
         canonical_finality_proven=not stopped_by_user,
         stopped_by_user=stopped_by_user,
     )
+    if stopped_by_user:
+        clear_stop_requested_for = getattr(provider, "clear_stop_requested_for", None)
+        if callable(clear_stop_requested_for):
+            clear_stop_requested_for(turn.conversation_id)
     submission.final_response = response
     return response
 

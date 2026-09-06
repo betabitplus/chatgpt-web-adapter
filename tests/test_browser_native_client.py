@@ -920,8 +920,57 @@ def test_passive_observer_waits_without_canonical_polling_then_reconciles_once()
     )
 
 
+def test_explicit_stop_signal_short_circuits_non_passive_canonical_wait() -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.stopped = True
+
+        def send_text(self, text, *, conversation=None, timeout=None):
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-1",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=17,
+                tab_was_active=False,
+                elapsed_ms=50,
+                passive_observer_armed=False,
+            )
+
+        def stop_requested_for(self, conversation_id):
+            assert conversation_id == "conversation-1"
+            return self.stopped
+
+        def clear_stop_requested_for(self, conversation_id):
+            assert conversation_id == "conversation-1"
+            self.stopped = False
+
+    provider = Provider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def _emit_event(self, callback, event_type, **payload):
+            if callback is not None:
+                callback({"type": event_type, **payload})
+
+        def _get_conversation_payload(self, _conversation_id):
+            raise AssertionError("explicit Stop must skip canonical polling")
+
+    response = send_browser_native(Client(), "hello", timeout=30, poll_interval=5)
+
+    assert response.text == ""
+    assert response.conversation.finish_reason == "stopped"
+    assert provider.stopped is False
+
+
 def test_stopped_passive_observer_accepts_unfinished_canonical_partial(monkeypatch) -> None:
     class Provider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stopped = True
+
         def send_text(self, text, *, conversation=None, timeout=None):
             self.normal_calls.append((text, conversation, timeout))
             return BrowserNativeTurnResult(
@@ -945,6 +994,14 @@ def test_stopped_passive_observer_accepts_unfinished_canonical_partial(monkeypat
                 "messageId": "assistant-partial",
                 "finishReason": "stopped",
             }
+
+        def stop_requested_for(self, conversation_id):
+            assert conversation_id == "conversation-1"
+            return self.stopped
+
+        def clear_stop_requested_for(self, conversation_id):
+            assert conversation_id == "conversation-1"
+            self.stopped = False
 
     partial_payload = {
         "conversation_id": "conversation-1",
@@ -997,6 +1054,7 @@ def test_stopped_passive_observer_accepts_unfinished_canonical_partial(monkeypat
     assert response.conversation.finish_reason == "stopped"
     assert response.request.turn_exchange_id == "turn-stopped"
     assert client.reads == 1
+    assert provider.stopped is False
     readback = [event for event in client.events if event["type"] == "browser_native_readback_completed"][-1]
     assert readback["stopped_by_user"] is True
     assert readback["canonical_finality_proven"] is False

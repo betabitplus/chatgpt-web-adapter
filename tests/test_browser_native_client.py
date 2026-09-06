@@ -1114,6 +1114,118 @@ def test_stopped_passive_observer_returns_empty_when_partial_is_not_materialized
     assert response.conversation.finish_reason == "stopped"
 
 
+def test_passive_observer_stream_end_without_terminal_returns_incomplete_after_bounded_reconcile(
+    monkeypatch,
+) -> None:
+    class Provider(FakeProvider):
+        def send_text(self, text, *, conversation=None, timeout=None):
+            self.normal_calls.append((text, conversation, timeout))
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-1",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=17,
+                tab_was_active=False,
+                elapsed_ms=50,
+                browser_authority_lease_id="lease-1",
+                passive_observer_armed=True,
+            )
+
+        def observe_turn(self, **_kwargs):
+            raise RequestError(
+                "PASSIVE_OBSERVER_STREAM_ENDED_WITHOUT_TERMINAL",
+                request_stage="browser_native_observe_turn",
+            )
+
+    provider = Provider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def __init__(self) -> None:
+            self.events = []
+
+        def _emit_event(self, callback, event_type, **payload):
+            event = {"type": event_type, **payload}
+            self.events.append(event)
+            if callback is not None:
+                callback(event)
+
+    submission = submit_browser_native(Client(), "hello", timeout=120, poll_interval=15)
+    observed_timeouts = []
+
+    def timeout_wait(*_args, **kwargs):
+        observed_timeouts.append(kwargs["timeout"])
+        raise ConversationTimeoutError("no final assistant", timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._wait_for_new_final_assistant",
+        timeout_wait,
+    )
+    client = Client()
+    response = await_browser_native_final(client, submission)
+
+    assert response.text == ""
+    assert response.conversation.conversation_id == "conversation-1"
+    assert response.conversation.finish_reason == "incomplete"
+    assert observed_timeouts and observed_timeouts[0] <= 5.0
+    readback = [event for event in client.events if event["type"] == "browser_native_readback_completed"][-1]
+    assert readback["canonical_finality_proven"] is False
+    assert readback["incomplete_without_terminal"] is True
+
+
+def test_passive_stream_end_without_terminal_accepts_late_canonical_final() -> None:
+    class Provider(FakeProvider):
+        def send_text(self, text, *, conversation=None, timeout=None):
+            self.normal_calls.append((text, conversation, timeout))
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-1",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=17,
+                tab_was_active=False,
+                elapsed_ms=50,
+                browser_authority_lease_id="lease-1",
+                passive_observer_armed=True,
+            )
+
+        def observe_turn(self, **_kwargs):
+            raise RequestError(
+                "PASSIVE_OBSERVER_STREAM_ENDED_WITHOUT_TERMINAL",
+                request_stage="browser_native_observe_turn",
+            )
+
+    provider = Provider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def __init__(self) -> None:
+            self.events = []
+
+        def _emit_event(self, callback, event_type, **payload):
+            event = {"type": event_type, **payload}
+            self.events.append(event)
+            if callback is not None:
+                callback(event)
+
+        def _get_conversation_payload(self, _conversation_id):
+            return _completed_canonical_payload()
+
+    client = Client()
+    response = send_browser_native(client, "hello", timeout=120, poll_interval=15)
+
+    assert response.text == "done"
+    assert response.conversation.finish_reason != "incomplete"
+    readback = [event for event in client.events if event["type"] == "browser_native_readback_completed"][-1]
+    assert readback["canonical_finality_proven"] is True
+    assert readback["incomplete_without_terminal"] is False
+
+
 def test_passive_observer_stream_start_failure_falls_back_to_bounded_canonical_read() -> None:
     class Provider(FakeProvider):
         def __init__(self) -> None:

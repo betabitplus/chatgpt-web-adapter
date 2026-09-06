@@ -51,6 +51,7 @@ _CANONICAL_LIVE_POLL_INTERVAL_SECONDS = 15.0
 _CANONICAL_RATE_LIMIT_BACKOFF_SECONDS = 15.0
 _PASSIVE_FINAL_RECONCILE_RETRY_SECONDS = 5.0
 _PASSIVE_FINAL_RECONCILE_SETTLE_SECONDS = 4.0
+_PASSIVE_STREAM_ENDED_RECONCILE_SECONDS = 5.0
 _PREWRITE_CANONICAL_COMPLETION_MAX_AGE_MS = 5_000
 _CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS = 6_000
 _SENSITIVE_KEY_RE = re.compile(
@@ -960,6 +961,8 @@ def await_browser_native_final(
     passive_observer_used = False
     passive_finish_reason: str | None = None
     passive_message_id: str | None = None
+    passive_stream_ended_without_terminal = False
+    incomplete_without_terminal = False
 
     if (
         bool(getattr(turn, "passive_observer_armed", False))
@@ -1020,11 +1023,19 @@ def await_browser_native_final(
                     submission.timeout - (time.monotonic() - submission.started_monotonic),
                 )
         except (RequestError, OSError, EOFError, ValueError) as error:
+            reason = str(error)
+            if (
+                isinstance(error, RequestError)
+                and "PASSIVE_OBSERVER_STREAM_ENDED_WITHOUT_TERMINAL" in reason
+            ):
+                passive_stream_ended_without_terminal = True
+                passive_observer_used = True
+                remaining = min(remaining, _PASSIVE_STREAM_ENDED_RECONCILE_SECONDS)
             self._emit_event(
                 submission.on_event,
                 "browser_native_passive_observer_fallback",
                 submission_id=submission.submission_id,
-                reason=str(error),
+                reason=reason,
             )
 
     passive_stopped = passive_finish_reason == "stopped"
@@ -1049,13 +1060,14 @@ def await_browser_native_final(
         )
     except ConversationTimeoutError:
         stopped_by_user = stopped_by_user or provider_stop_requested()
-        if not stopped_by_user:
+        if not stopped_by_user and not passive_stream_ended_without_terminal:
             raise
+        incomplete_without_terminal = passive_stream_ended_without_terminal and not stopped_by_user
         final_message = ChatMessage(
             message_id=passive_message_id,
             role="assistant",
             text="",
-            finish_reason="stopped",
+            finish_reason="stopped" if stopped_by_user else "incomplete",
         )
         canonical_payload = None
         canonical_payload_read_count = None
@@ -1075,7 +1087,7 @@ def await_browser_native_final(
             canonical_payload,
             conversation=result_conversation,
         )
-    elif stopped_by_user:
+    elif stopped_by_user or incomplete_without_terminal:
         result_conversation = ChatConversation(
             conversation_id=turn.conversation_id,
             message_id=final_message.message_id,
@@ -1138,8 +1150,9 @@ def await_browser_native_final(
         revision_safe_stream_observation_count=submission.stream_state.observation_count,
         revision_safe_stream_revision_count=submission.stream_state.revision_count,
         revision_safe_stream_delivery_incomplete=submission.stream_state.delivery_incomplete,
-        canonical_finality_proven=not stopped_by_user,
+        canonical_finality_proven=not stopped_by_user and not incomplete_without_terminal,
         stopped_by_user=stopped_by_user,
+        incomplete_without_terminal=incomplete_without_terminal,
     )
     if stopped_by_user:
         clear_stop_requested_for = getattr(provider, "clear_stop_requested_for", None)

@@ -76,7 +76,7 @@ Primary areas:
 - canonical conversation/message identity;
 - final assistant readback.
 
-The canonical plane answers what durable conversation state exists and whether the exact submitted turn reached a canonical completed assistant message.
+The canonical plane answers what durable conversation state exists and whether the exact submitted turn reached a canonical completed assistant message. A non-completed canonical status is not, by itself, proof that the browser is still generating: interrupted historical turns can remain `running`/`tool_running` after the product UI is ready again. Browser-owned continuation writes therefore keep canonical reads as a fail-closed durability check, but defer live-generation exclusion to the browser-native composer-readiness fence immediately before submit; explicit user-action states such as `awaiting_tool_approval` remain hard prewrite blocks.
 
 Core rule:
 

@@ -2,6 +2,8 @@
 
 PR8.3 promotes the proven PR8.2.4–PR8.2.5 browser-owned ordinary-ChatGPT write path from an experimental side API into a production runtime contract suitable for HDE, Python SDK callers, and terminal use.
 
+> **Current implementation note:** acceptance gate P5 below records the historical PR8.3 rule. Current browser-owned continuation writes no longer treat stale non-completed canonical status as proof of live generation; they keep canonical reads fail-closed, block explicit pending user-action states, and rely on the browser-native composer-readiness fence immediately before submit for live-turn exclusion.
+
 ## Outcome
 
 The new public assembly path is:

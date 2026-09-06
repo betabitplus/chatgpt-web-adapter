@@ -108,6 +108,46 @@ def test_continuation_uses_one_commit_point_status_read_before_delegation(monkey
     assert rt.client.status_values == ["running"]
 
 
+@pytest.mark.parametrize("status", ["running", "streaming", "tool_running", "tool_calling"])
+def test_unfinished_canonical_status_delegates_to_browser_liveness_fence(monkeypatch, status) -> None:
+    calls = []
+    monkeypatch.setattr(subject, "send_browser_native", lambda *a, **k: calls.append((a, k)))
+    rt = runtime(status=status)
+
+    result = rt.send_text("continue", conversation="conversation-1")
+
+    assert result is None
+    assert len(calls) == 1
+    assert calls[0][0][1] == "continue"
+    assert calls[0][1]["conversation"] == "conversation-1"
+
+
+def test_awaiting_tool_approval_blocks_before_browser_delegation(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(subject, "send_browser_native", lambda *a, **k: calls.append((a, k)))
+    rt = runtime(status="awaiting_tool_approval")
+
+    with pytest.raises(subject.BrowserOwnedWriteRuntimeError) as caught:
+        rt.send_text("continue", conversation="conversation-1")
+
+    assert calls == []
+    assert caught.value.failure_kind == subject.CONVERSATION_NOT_COMPLETED
+    assert "awaiting_tool_approval" in str(caught.value)
+
+
+def test_unreadable_commit_snapshot_fails_closed_before_browser_delegation(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(subject, "send_browser_native", lambda *a, **k: calls.append((a, k)))
+    rt = runtime(status=RuntimeError("canonical busy"))
+
+    with pytest.raises(subject.BrowserOwnedWriteRuntimeError) as caught:
+        rt.send_text("continue", conversation="conversation-1")
+
+    assert calls == []
+    assert caught.value.failure_kind == subject.CANONICAL_READ_UNAVAILABLE
+    assert caught.value.write_may_have_been_submitted is False
+
+
 def test_success_delegates_exactly_once(monkeypatch) -> None:
     expected = SimpleNamespace(text="ok")
     calls = []

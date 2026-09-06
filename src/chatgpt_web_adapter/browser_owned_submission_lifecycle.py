@@ -24,6 +24,7 @@ from .browser_owned_write_runtime import (
     WRITE_OUTCOME_UNKNOWN,
     BrowserOwnedWriteObservation,
     BrowserOwnedWriteRuntimeError,
+    _canonical_status_blocks_browser_owned_write,
     _canonical_status_value,
     _conversation_id,
     _optional_int,
@@ -166,7 +167,11 @@ class BrowserOwnedSubmissionLifecycle:
                 request_stage="browser_authority_policy",
             )
 
-        preflight = self.runtime.health(conversation)
+        # Browser/extension availability is the only generic preflight here.
+        # Canonical status is durable conversation state, not current UI
+        # liveness; the browser-native write path performs the authoritative
+        # composer-readiness fence immediately before submit.
+        preflight = self.runtime.health()
         if not preflight.ready:
             raise BrowserOwnedWriteRuntimeError(
                 f"browser-owned write preflight failed: {preflight.reason}",
@@ -192,7 +197,7 @@ class BrowserOwnedSubmissionLifecycle:
                     cause=error,
                     request_stage="browser_owned_write_preflight",
                 ) from error
-            if commit_status != "completed":
+            if _canonical_status_blocks_browser_owned_write(commit_status):
                 raise BrowserOwnedWriteRuntimeError(
                     f"browser-owned write commit check failed: canonical status={commit_status}",
                     failure_kind=CONVERSATION_NOT_COMPLETED,

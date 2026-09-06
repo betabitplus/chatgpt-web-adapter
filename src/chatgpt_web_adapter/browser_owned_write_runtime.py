@@ -237,6 +237,19 @@ def _canonical_status_value(client: Any, conversation: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _canonical_status_blocks_browser_owned_write(status: str | None) -> bool:
+    """Return whether durable canonical state itself requires user action.
+
+    Canonical status is not a reliable liveness signal for browser-owned writes:
+    an interrupted historical turn can remain ``running``/``tool_running`` long
+    after the browser UI is ready for a new prompt. Actual live generation is
+    fenced by the browser-native composer-readiness probe immediately before
+    submission. Keep only explicit user-action states as canonical hard blocks.
+    """
+
+    return status == "awaiting_tool_approval"
+
+
 def _canonical_commit_snapshot(
     client: Any,
     conversation: Any,
@@ -787,7 +800,7 @@ class BrowserOwnedProductWriteRuntime:
                     cause=error,
                     request_stage="browser_owned_write_preflight",
                 ) from error
-            if commit_status != "completed":
+            if _canonical_status_blocks_browser_owned_write(commit_status):
                 raise BrowserOwnedWriteRuntimeError(
                     f"browser-owned write commit check failed: canonical status={commit_status}",
                     failure_kind=CONVERSATION_NOT_COMPLETED,

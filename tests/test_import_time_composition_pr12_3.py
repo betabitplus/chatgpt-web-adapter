@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import ast
 import importlib
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
-
-import chatgpt_web_adapter
-import chatgpt_web_adapter.product_observations as product_observations
-import chatgpt_web_adapter.product_runtime_observation_gate as observation_gate
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "src" / "chatgpt_web_adapter"
@@ -25,6 +24,14 @@ def _assert_no_top_level_runtime_mutation(path: Path) -> None:
                 assert not function.id.startswith("install_")
 
 
+def _run_isolated_python(source: str) -> None:
+    subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(source)],
+        check=True,
+        cwd=ROOT,
+    )
+
+
 def test_package_root_is_export_only_without_class_mutation() -> None:
     _assert_no_top_level_runtime_mutation(PACKAGE / "__init__.py")
     source = (PACKAGE / "__init__.py").read_text(encoding="utf-8")
@@ -38,86 +45,103 @@ def test_package_root_is_export_only_without_class_mutation() -> None:
 
 
 def test_observation_gate_import_is_side_effect_free() -> None:
-    current_runtime = importlib.import_module("chatgpt_web_adapter.product_runtime")
-    current_browser_owned = importlib.import_module(
-        "chatgpt_web_adapter.browser_owned_product_transport"
-    )
+    _run_isolated_python(
+        """
+        import importlib
 
-    before = (
-        current_runtime.ChatGPTProductRuntime.send_text_observed,
-        current_browser_owned.BrowserOwnedProductTransport.capabilities,
-        product_observations._activity_observation_kind,
-    )
+        import chatgpt_web_adapter.product_observations as product_observations
+        import chatgpt_web_adapter.product_runtime_observation_gate as observation_gate
 
-    importlib.reload(observation_gate)
+        current_runtime = importlib.import_module("chatgpt_web_adapter.product_runtime")
+        current_browser_owned = importlib.import_module(
+            "chatgpt_web_adapter.browser_owned_product_transport"
+        )
 
-    after = (
-        current_runtime.ChatGPTProductRuntime.send_text_observed,
-        current_browser_owned.BrowserOwnedProductTransport.capabilities,
-        product_observations._activity_observation_kind,
+        before = (
+            current_runtime.ChatGPTProductRuntime.send_text_observed,
+            current_browser_owned.BrowserOwnedProductTransport.capabilities,
+            product_observations._activity_observation_kind,
+        )
+
+        importlib.reload(observation_gate)
+
+        after = (
+            current_runtime.ChatGPTProductRuntime.send_text_observed,
+            current_browser_owned.BrowserOwnedProductTransport.capabilities,
+            product_observations._activity_observation_kind,
+        )
+        assert after == before
+        """
     )
-    assert after == before
     _assert_no_top_level_runtime_mutation(
         PACKAGE / "product_runtime_observation_gate.py"
     )
 
 
 def test_package_reload_preserves_composed_class_and_method_identity() -> None:
-    current_client = importlib.import_module(
-        "chatgpt_web_adapter.client"
-    ).ChatGPTWebClient
-    current_browserless = importlib.import_module(
-        "chatgpt_web_adapter.browserless_request_transport"
-    ).BrowserlessRequestTransport
-    current_browser_owned = importlib.import_module(
-        "chatgpt_web_adapter.browser_owned_product_transport"
-    ).BrowserOwnedProductTransport
-    current_runtime = importlib.import_module(
-        "chatgpt_web_adapter.product_runtime"
-    ).ChatGPTProductRuntime
+    _run_isolated_python(
+        """
+        import importlib
 
-    classes_before = (
-        current_client,
-        current_browserless,
-        current_browser_owned,
-        current_runtime,
-    )
-    methods_before = (
-        current_client.send,
-        current_browserless._execute,
-        current_browser_owned.capabilities,
-        current_runtime.send_text_observed,
-        current_runtime.submit,
-        current_runtime.await_final,
-        current_runtime.observe_ui_liveness,
-    )
+        import chatgpt_web_adapter
 
-    reloaded = importlib.reload(chatgpt_web_adapter)
-
-    assert reloaded.ChatGPTWebClient is current_client
-    assert reloaded.WebChatClient is current_client
-    assert reloaded.ChatGPTProductRuntime is current_runtime
-    assert (
-        importlib.import_module("chatgpt_web_adapter.client").ChatGPTWebClient,
-        importlib.import_module(
+        current_client = importlib.import_module(
+            "chatgpt_web_adapter.client"
+        ).ChatGPTWebClient
+        current_browserless = importlib.import_module(
             "chatgpt_web_adapter.browserless_request_transport"
-        ).BrowserlessRequestTransport,
-        importlib.import_module(
+        ).BrowserlessRequestTransport
+        current_browser_owned = importlib.import_module(
             "chatgpt_web_adapter.browser_owned_product_transport"
-        ).BrowserOwnedProductTransport,
-        importlib.import_module(
+        ).BrowserOwnedProductTransport
+        current_runtime = importlib.import_module(
             "chatgpt_web_adapter.product_runtime"
-        ).ChatGPTProductRuntime,
-    ) == classes_before
-    assert (
-        current_client.send,
-        current_browserless._execute,
-        current_browser_owned.capabilities,
-        current_runtime.send_text_observed,
-        current_runtime.submit,
-        current_runtime.await_final,
-        current_runtime.observe_ui_liveness,
-    ) == methods_before
+        ).ChatGPTProductRuntime
+
+        classes_before = (
+            current_client,
+            current_browserless,
+            current_browser_owned,
+            current_runtime,
+        )
+        methods_before = (
+            current_client.send,
+            current_browserless._execute,
+            current_browser_owned.capabilities,
+            current_runtime.send_text_observed,
+            current_runtime.submit,
+            current_runtime.await_final,
+            current_runtime.observe_ui_liveness,
+        )
+
+        reloaded = importlib.reload(chatgpt_web_adapter)
+
+        assert reloaded.ChatGPTWebClient is current_client
+        assert reloaded.WebChatClient is current_client
+        assert reloaded.ChatGPTProductRuntime is current_runtime
+        assert (
+            importlib.import_module("chatgpt_web_adapter.client").ChatGPTWebClient,
+            importlib.import_module(
+                "chatgpt_web_adapter.browserless_request_transport"
+            ).BrowserlessRequestTransport,
+            importlib.import_module(
+                "chatgpt_web_adapter.browser_owned_product_transport"
+            ).BrowserOwnedProductTransport,
+            importlib.import_module(
+                "chatgpt_web_adapter.product_runtime"
+            ).ChatGPTProductRuntime,
+        ) == classes_before
+        assert (
+            current_client.send,
+            current_browserless._execute,
+            current_browser_owned.capabilities,
+            current_runtime.send_text_observed,
+            current_runtime.submit,
+            current_runtime.await_final,
+            current_runtime.observe_ui_liveness,
+        ) == methods_before
+        """
+    )
 
 
 def test_public_runtime_and_transports_own_static_composition_points() -> None:

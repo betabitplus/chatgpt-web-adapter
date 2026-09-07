@@ -7,14 +7,6 @@ from pathlib import Path
 import chatgpt_web_adapter
 import chatgpt_web_adapter.product_observations as product_observations
 import chatgpt_web_adapter.product_runtime_observation_gate as observation_gate
-from chatgpt_web_adapter.browser_owned_product_transport import (
-    BrowserOwnedProductTransport,
-)
-from chatgpt_web_adapter.browserless_request_transport import (
-    BrowserlessRequestTransport,
-)
-from chatgpt_web_adapter.client import ChatGPTWebClient
-from chatgpt_web_adapter.product_runtime import ChatGPTProductRuntime
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "src" / "chatgpt_web_adapter"
@@ -46,17 +38,22 @@ def test_package_root_is_export_only_without_class_mutation() -> None:
 
 
 def test_observation_gate_import_is_side_effect_free() -> None:
+    current_runtime = importlib.import_module("chatgpt_web_adapter.product_runtime")
+    current_browser_owned = importlib.import_module(
+        "chatgpt_web_adapter.browser_owned_product_transport"
+    )
+
     before = (
-        ChatGPTProductRuntime.send_text_observed,
-        BrowserOwnedProductTransport.capabilities,
+        current_runtime.ChatGPTProductRuntime.send_text_observed,
+        current_browser_owned.BrowserOwnedProductTransport.capabilities,
         product_observations._activity_observation_kind,
     )
 
     importlib.reload(observation_gate)
 
     after = (
-        ChatGPTProductRuntime.send_text_observed,
-        BrowserOwnedProductTransport.capabilities,
+        current_runtime.ChatGPTProductRuntime.send_text_observed,
+        current_browser_owned.BrowserOwnedProductTransport.capabilities,
         product_observations._activity_observation_kind,
     )
     assert after == before
@@ -124,11 +121,20 @@ def test_package_reload_preserves_composed_class_and_method_identity() -> None:
 
 
 def test_public_runtime_and_transports_own_static_composition_points() -> None:
-    assert "send" in ChatGPTWebClient.__dict__
-    assert "_poll_conversation_after_prepare" in ChatGPTWebClient.__dict__
-    assert "__init__" in BrowserlessRequestTransport.__dict__
-    assert "_execute" in BrowserlessRequestTransport.__dict__
-    assert "capabilities" in BrowserOwnedProductTransport.__dict__
+    current_client = importlib.import_module("chatgpt_web_adapter.client")
+    current_browserless = importlib.import_module(
+        "chatgpt_web_adapter.browserless_request_transport"
+    )
+    current_browser_owned = importlib.import_module(
+        "chatgpt_web_adapter.browser_owned_product_transport"
+    )
+    current_runtime = importlib.import_module("chatgpt_web_adapter.product_runtime")
+
+    assert "send" in current_client.ChatGPTWebClient.__dict__
+    assert "_poll_conversation_after_prepare" in current_client.ChatGPTWebClient.__dict__
+    assert "__init__" in current_browserless.BrowserlessRequestTransport.__dict__
+    assert "_execute" in current_browserless.BrowserlessRequestTransport.__dict__
+    assert "capabilities" in current_browser_owned.BrowserOwnedProductTransport.__dict__
 
     for name in (
         "__init__",
@@ -139,6 +145,6 @@ def test_public_runtime_and_transports_own_static_composition_points() -> None:
         "observe_ui_liveness",
         "governance",
     ):
-        method = ChatGPTProductRuntime.__dict__.get(name)
+        method = current_runtime.ChatGPTProductRuntime.__dict__.get(name)
         assert callable(method)
         assert method.__module__ == "chatgpt_web_adapter.product_runtime"

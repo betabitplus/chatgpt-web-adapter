@@ -5,9 +5,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import client as client_mod
 from .auth import CHAT_URL
 from .exceptions import RequestError
+from .legacy_client_core import _get_requirements_token
 from .sentinel_requirements import (
     OBSERVED_PREPARE_RESPONSE_KEYS,
     OBSERVED_PROOFOFWORK_KEYS,
@@ -196,7 +196,7 @@ def _derive_prepare_input(client: Any) -> str | None:
     if not isinstance(proof_token, list):
         return None
     try:
-        return client_mod._get_requirements_token(proof_token)
+        return _get_requirements_token(proof_token)
     except Exception as error:
         raise RequestError(
             "SENTINEL_PREPARE_INPUT_DERIVATION_FAILED: could not derive current "

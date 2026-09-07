@@ -33,6 +33,13 @@ BROWSER_CONTEXT_CANONICAL_READ_PLANE = "BROWSER_CONTEXT_CANONICAL_HTTP"
 _CANONICAL_READ_STAGE = "browser_context_canonical_read"
 _REASON_RE = re.compile(r"^[A-Z0-9_]+$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_RETRYABLE_CANONICAL_READ_REASONS = frozenset(
+    {
+        "CANONICAL_READ_TIMEOUT",
+        "CANONICAL_READ_NETWORK_ERROR",
+        "CANONICAL_READ_BRIDGE_FAILURE",
+    }
+)
 
 
 class BrowserContextCanonicalReadError(RequestError):
@@ -59,7 +66,7 @@ class BrowserContextCanonicalReadError(RequestError):
             if isinstance(content_type, str) and content_type
             else None
         )
-        self.retryable = bool(retryable)
+        self.retryable = bool(retryable) or normalized_reason in _RETRYABLE_CANONICAL_READ_REASONS
         details = [f"reason={self.reason_code}"]
         if status_code is not None:
             details.append(f"status={status_code}")

@@ -118,6 +118,28 @@ def test_canonical_error_exports_only_sanitized_metadata() -> None:
     assert payload["body_preview"] is None
 
 
+def test_transient_canonical_transport_errors_are_retryable_even_with_legacy_false_flag() -> None:
+    for reason in (
+        "CANONICAL_READ_TIMEOUT",
+        "CANONICAL_READ_NETWORK_ERROR",
+        "CANONICAL_READ_BRIDGE_FAILURE",
+    ):
+        error = BrowserContextCanonicalReadError(
+            reason,
+            conversation_id="conversation-1",
+            retryable=False,
+        )
+        assert error.retryable is True
+        assert error.to_dict()["retryable"] is True
+
+    permanent = BrowserContextCanonicalReadError(
+        "CANONICAL_READ_AUTHENTICATION_REQUIRED",
+        conversation_id="conversation-1",
+        retryable=False,
+    )
+    assert permanent.retryable is False
+
+
 def test_browser_context_client_owns_terminal_ack_contract(tmp_path) -> None:
     provider = BrowserNativeTurnProvider(state_dir=tmp_path)
     client = BrowserContextCanonicalClient(object(), provider)
@@ -298,6 +320,9 @@ def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -
     assert 'response.status === 429' in source
     assert '"CANONICAL_READ_RATE_LIMITED"' in source
     assert 'response.status === 404 || response.status === 429' in source
+    assert '"CANONICAL_READ_TIMEOUT"' in source
+    assert '"CANONICAL_READ_NETWORK_ERROR"' in source
+    assert 'retryable: true' in source
     assert '"CANONICAL_READ_AUTHENTICATION_REQUIRED"' in source
     assert '"CANONICAL_READ_ACCESS_CHALLENGED"' in source
     assert "document.cookie" not in source

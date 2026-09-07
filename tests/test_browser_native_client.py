@@ -6,6 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from chatgpt_web_adapter.browser_context_canonical import (
+    BrowserContextCanonicalReadError,
+)
 from chatgpt_web_adapter.browser_native_client import (
     _canonical_intermediate_events,
     _wait_for_new_final_assistant,
@@ -520,6 +523,44 @@ def test_retryable_canonical_429_backs_off_and_recovers(monkeypatch) -> None:
 
     assert client.calls == 2
     assert sleeps == [15.0]
+    assert reads == 2
+    assert payload is not None
+    assert message.text == "done"
+
+
+def test_retryable_browser_context_timeout_recovers_without_replaying_write(monkeypatch) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _get_conversation_payload(self, conversation_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise BrowserContextCanonicalReadError(
+                    "CANONICAL_READ_TIMEOUT",
+                    conversation_id=conversation_id,
+                    retryable=False,
+                )
+            return _completed_canonical_payload()
+
+    sleeps = []
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client.time.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+    client = Client()
+    message, payload, reads = _wait_for_new_final_assistant(
+        client,
+        "conversation-1",
+        baseline_assistant_ids=frozenset(),
+        timeout=5.0,
+        interval=0.01,
+        include_readback=True,
+        minimum_poll_interval=0.01,
+    )
+
+    assert client.calls == 2
+    assert sleeps == [0.01]
     assert reads == 2
     assert payload is not None
     assert message.text == "done"

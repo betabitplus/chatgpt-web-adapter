@@ -219,7 +219,7 @@ async function _cwaCanonicalFetch(tabId, endpoint, timeoutMs) {
         reasonCode: error?.name === "AbortError"
           ? "CANONICAL_READ_TIMEOUT"
           : "CANONICAL_READ_NETWORK_ERROR",
-        retryable: false
+        retryable: true
       };
     } finally {
       clearTimeout(timer);

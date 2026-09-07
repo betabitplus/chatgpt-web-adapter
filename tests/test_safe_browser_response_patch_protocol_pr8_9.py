@@ -25,9 +25,9 @@ def test_patch_protocol_matches_existing_product_stream_parser_contract() -> Non
     client = (root.parent / "legacy_client_core.py").read_text(encoding="utf-8")
 
     for token in (
-        'payload.v',
-        'payload.p',
-        'value.message',
+        "payload.v",
+        "payload.p",
+        "value.message",
         '"/message/content/parts/0"',
         '"/message/metadata"',
         "_pr89PatchAppendText",

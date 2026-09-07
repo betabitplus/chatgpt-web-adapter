@@ -10,7 +10,9 @@ import chatgpt_web_adapter.product_runtime_observation_gate as observation_gate
 from chatgpt_web_adapter.browser_owned_product_transport import (
     BrowserOwnedProductTransport,
 )
-from chatgpt_web_adapter.browserless_request_transport import BrowserlessRequestTransport
+from chatgpt_web_adapter.browserless_request_transport import (
+    BrowserlessRequestTransport,
+)
 from chatgpt_web_adapter.client import ChatGPTWebClient
 from chatgpt_web_adapter.product_runtime import ChatGPTProductRuntime
 
@@ -64,7 +66,9 @@ def test_observation_gate_import_is_side_effect_free() -> None:
 
 
 def test_package_reload_preserves_composed_class_and_method_identity() -> None:
-    current_client = importlib.import_module("chatgpt_web_adapter.client").ChatGPTWebClient
+    current_client = importlib.import_module(
+        "chatgpt_web_adapter.client"
+    ).ChatGPTWebClient
     current_browserless = importlib.import_module(
         "chatgpt_web_adapter.browserless_request_transport"
     ).BrowserlessRequestTransport
@@ -104,7 +108,9 @@ def test_package_reload_preserves_composed_class_and_method_identity() -> None:
         importlib.import_module(
             "chatgpt_web_adapter.browser_owned_product_transport"
         ).BrowserOwnedProductTransport,
-        importlib.import_module("chatgpt_web_adapter.product_runtime").ChatGPTProductRuntime,
+        importlib.import_module(
+            "chatgpt_web_adapter.product_runtime"
+        ).ChatGPTProductRuntime,
     ) == classes_before
     assert (
         current_client.send,

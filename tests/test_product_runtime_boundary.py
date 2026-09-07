@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "chatgpt_web_adapter"
 
@@ -12,8 +11,14 @@ def test_product_runtime_has_no_legacy_direct_write_fallback() -> None:
     runtime_core = (SRC / "product_runtime_core.py").read_text(encoding="utf-8")
     transport_source = (SRC / "product_transport.py").read_text(encoding="utf-8")
 
-    assert 'DEFAULT_PRODUCT_TRANSPORT = BROWSER_OWNED_PRODUCT_TRANSPORT' in transport_source
-    assert 'BROWSERLESS_REQUEST_PRODUCT_TRANSPORT = "browserless-request"' in transport_source
+    assert (
+        "DEFAULT_PRODUCT_TRANSPORT = BROWSER_OWNED_PRODUCT_TRANSPORT"
+        in transport_source
+    )
+    assert (
+        'BROWSERLESS_REQUEST_PRODUCT_TRANSPORT = "browserless-request"'
+        in transport_source
+    )
     assert "BROWSER_OWNED_PRODUCT_TRANSPORT," in transport_source
     assert "BROWSERLESS_REQUEST_PRODUCT_TRANSPORT," in transport_source
     assert '"fallback_transport": None' in runtime_core
@@ -27,7 +32,9 @@ def test_product_runtime_has_no_legacy_direct_write_fallback() -> None:
         assert "turnstile" not in source.lower()
 
 
-def test_product_runtime_assembly_is_noninteractive_non_sentinel_and_interface_based() -> None:
+def test_product_runtime_assembly_is_noninteractive_non_sentinel_and_interface_based() -> (
+    None
+):
     runtime_source = (SRC / "product_runtime.py").read_text(encoding="utf-8")
     adapter_shell = (SRC / "browser_owned_product_transport.py").read_text(
         encoding="utf-8"

@@ -8,8 +8,10 @@ from .auth_browser import BrowserLoginResult, browser_login, default_browser_pro
 from .auth_refresh import AuthRefreshResult
 from .auth_status import AuthStatus, get_auth_status
 from .browser_native_install import (
-    BrowserNativeInstallResult,
     EXTENSION_ID as BROWSER_NATIVE_EXTENSION_ID,
+)
+from .browser_native_install import (
+    BrowserNativeInstallResult,
     browser_native_extension_dir,
     install_native_messaging_host,
 )
@@ -19,7 +21,8 @@ from .browser_native_provider import (
     BrowserNativeTurnResult,
 )
 from .browser_sentinel import ZendriverSentinelBundleProvider
-from .client import ChatGPTWebClient, _original_send as _original_send
+from .client import ChatGPTWebClient
+from .client import _original_send as _original_send
 from .conversation_prepare import PrepareResult, prepare_text_turn
 from .exceptions import (
     AuthError,
@@ -31,7 +34,11 @@ from .exceptions import (
 )
 from .model_registry import (
     DEFAULT_MODEL,
+)
+from .model_registry import (
     DEFAULT_THINKING_MODEL as DEFAULT_THINKING_MODEL,
+)
+from .model_registry import (
     MODEL_ALIASES as MODEL_ALIASES,
 )
 from .payload_builder import PayloadBuilder

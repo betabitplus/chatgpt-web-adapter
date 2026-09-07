@@ -7,18 +7,30 @@ from .attach import attach_conversation as _attach_conversation
 from .auth_refresh import refresh_auth_session as _refresh_auth_session
 from .browser_native_client import (
     send_browser_native as _send_browser_native,
+)
+from .browser_native_client import (
     set_browser_native_turn_provider as _set_browser_native_turn_provider,
 )
 from .browserless_request_guards import gate_browserless_poll_deadline
 from .conversation_send import send_to_conversation as _send_to_conversation
-from .diagnostic_metrics import send_with_expanded_metrics as _send_with_expanded_metrics
+from .diagnostic_metrics import (
+    send_with_expanded_metrics as _send_with_expanded_metrics,
+)
 from .export import export_conversation as _export_conversation
 from .messages import get_messages as _get_messages
 from .model_registry import (
     DEFAULT_MODEL as DEFAULT_MODEL,
+)
+from .model_registry import (
     DEFAULT_THINKING_MODEL as DEFAULT_THINKING_MODEL,
+)
+from .model_registry import (
     MODEL_ALIASES as MODEL_ALIASES,
+)
+from .model_registry import (
     normalize_reasoning_effort as _normalize_reasoning_effort,
+)
+from .model_registry import (
     resolve_model as _resolve_model,
 )
 from .payload_validation import validate_payload as _validate_payload
@@ -27,20 +39,36 @@ from .policy_approval import send_and_auto_approve as _policy_send_and_auto_appr
 from .policy_approval import (
     wait_and_approve_pending_actions as _policy_wait_and_approve_pending_actions,
 )
-from .prepared_text_send import send_existing_text_prepared as _send_existing_text_prepared
+from .prepared_text_send import (
+    send_existing_text_prepared as _send_existing_text_prepared,
+)
 from .raw_payload import send_payload as _send_payload
 from .required_action import get_required_action as _get_required_action
 from .sentinel_bundle import (
     gate_prepared_build_headers as _gate_prepared_build_headers,
+)
+from .sentinel_bundle import (
     gate_prepared_get_ready_requirements as _gate_prepared_get_ready_requirements,
+)
+from .sentinel_bundle import (
     gate_prepared_text_send as _gate_prepared_text_send,
+)
+from .sentinel_bundle import (
     get_prepared_sentinel_bundle as _get_prepared_sentinel_bundle,
+)
+from .sentinel_bundle import (
     prefetch_finalized_sentinel_bundle as _prefetch_finalized_sentinel_bundle,
+)
+from .sentinel_bundle import (
     redact_ephemeral_write_headers as _redact_ephemeral_write_headers,
+)
+from .sentinel_bundle import (
     start_finalized_sentinel_bundle_refill as _start_finalized_sentinel_bundle_refill,
 )
 from .sentinel_transaction import (
     set_sentinel_bundle_provider as _set_sentinel_bundle_provider,
+)
+from .sentinel_transaction import (
     set_sentinel_challenge_provider as _set_sentinel_challenge_provider,
 )
 from .status import get_pending_approval as _get_pending_approval
@@ -48,7 +76,11 @@ from .status import get_status as _get_status
 from .wait import wait_until_completed as _wait_until_completed
 from .web_session import (
     gate_debug_trace_writer as _gate_debug_trace_writer,
+)
+from .web_session import (
     gate_get_ready_requirements as _gate_get_ready_requirements,
+)
+from .web_session import (
     redact_web_session_headers as _redact_web_session_headers,
 )
 

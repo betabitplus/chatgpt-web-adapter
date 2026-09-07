@@ -81,6 +81,6 @@ def install_browser_owned_web_search_capability_gate() -> None:
     from .browser_owned_product_transport import BrowserOwnedProductTransport
 
     current = BrowserOwnedProductTransport.capabilities
-    BrowserOwnedProductTransport.capabilities = gate_browser_owned_web_search_capability(
-        current
+    BrowserOwnedProductTransport.capabilities = (
+        gate_browser_owned_web_search_capability(current)
     )

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "chatgpt_web_adapter"
 
@@ -37,9 +36,7 @@ def test_product_runtime_does_not_import_concrete_browser_writer_contract() -> N
 
 def test_browser_owned_transport_is_adapter_not_transport_reimplementation() -> None:
     shell = (SRC / "browser_owned_product_transport.py").read_text(encoding="utf-8")
-    core = (SRC / "browser_owned_product_transport_core.py").read_text(
-        encoding="utf-8"
-    )
+    core = (SRC / "browser_owned_product_transport_core.py").read_text(encoding="utf-8")
 
     assert "class BrowserOwnedProductTransport" in shell
     assert "BrowserOwnedProductWriteRuntime" in core

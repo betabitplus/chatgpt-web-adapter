@@ -141,7 +141,9 @@ def _safe_source_url(value: Any) -> str | None:
     if parsed.username is not None or parsed.password is not None:
         return None
     try:
-        query_items = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
+        query_items = parse_qsl(
+            parsed.query, keep_blank_values=True, strict_parsing=False
+        )
     except ValueError:
         return None
     if any(_sensitive_query_key(key) for key, _ in query_items):
@@ -409,9 +411,7 @@ class ProductObservationCollector:
             source_content_type=content_type or current.source_content_type,
             sequence=sequence if sequence is not None else current.sequence,
             observed_at_ms=(
-                observed_at_ms
-                if observed_at_ms is not None
-                else current.observed_at_ms
+                observed_at_ms if observed_at_ms is not None else current.observed_at_ms
             ),
         )
         return True

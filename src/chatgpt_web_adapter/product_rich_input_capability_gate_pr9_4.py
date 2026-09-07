@@ -17,9 +17,7 @@ if TYPE_CHECKING:
     from .browser_owned_product_transport import BrowserOwnedProductTransport
 
 _PR94_RICH_INPUT_CAPABILITY_GATE_MARKER = "__pr94_rich_input_capability_gate__"
-_PR94_RICH_INPUT_CAPABILITY_NAMES = frozenset(
-    {IMAGES, FILES, MULTIMODAL_CONTINUATION}
-)
+_PR94_RICH_INPUT_CAPABILITY_NAMES = frozenset({IMAGES, FILES, MULTIMODAL_CONTINUATION})
 _PR94_RICH_INPUT_LIVE_EVIDENCE = (
     "PR9.2 schema-29 authenticated live closure: image new chat, general file new chat, "
     "and multimodal continuation each produced attachment-dependent answers with exact "
@@ -46,17 +44,14 @@ def _provider_uses_proven_pr92_rich_input_path(provider: Any) -> bool:
 
     if not isinstance(provider, ProductModelProfileProvider):
         return False
-    return (
-        _uses_frozen_bound_implementation(
-            provider,
-            "send_text",
-            _PR94_PROVEN_SEND_TEXT_IMPLEMENTATION,
-        )
-        and _uses_frozen_bound_implementation(
-            provider,
-            "_rpc",
-            _PR94_PROVEN_RPC_IMPLEMENTATION,
-        )
+    return _uses_frozen_bound_implementation(
+        provider,
+        "send_text",
+        _PR94_PROVEN_SEND_TEXT_IMPLEMENTATION,
+    ) and _uses_frozen_bound_implementation(
+        provider,
+        "_rpc",
+        _PR94_PROVEN_RPC_IMPLEMENTATION,
     )
 
 
@@ -122,6 +117,6 @@ def install_browser_owned_rich_input_capability_gate() -> None:
     from .browser_owned_product_transport import BrowserOwnedProductTransport
 
     current = BrowserOwnedProductTransport.capabilities
-    BrowserOwnedProductTransport.capabilities = gate_browser_owned_rich_input_capabilities(
-        current
+    BrowserOwnedProductTransport.capabilities = (
+        gate_browser_owned_rich_input_capabilities(current)
     )

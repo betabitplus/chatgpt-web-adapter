@@ -8,10 +8,9 @@ from .auth import DEFAULT_AUTH_FILE
 from .client import DEFAULT_TIMEOUT_SECONDS, ChatGPTWebClient
 from .product_runtime_observation_gate import gate_product_runtime_send_text_observed
 from .product_submission import ProductSubmissionAck
-from .product_transport import BROWSER_OWNED_PRODUCT_TRANSPORT as BROWSER_OWNED_PRODUCT_TRANSPORT
-from .product_transport import SUPPORTED_PRODUCT_TRANSPORTS as SUPPORTED_PRODUCT_TRANSPORTS
-from .product_transport import CanonicalConversationClient as CanonicalConversationClient
-from .product_transport import ProductRuntimeHealth as ProductRuntimeHealth
+from .product_transport import (
+    BROWSER_OWNED_PRODUCT_TRANSPORT as BROWSER_OWNED_PRODUCT_TRANSPORT,
+)
 from .product_transport import (
     DEFAULT_PRODUCT_TRANSPORT,
     ConversationInput,
@@ -23,6 +22,13 @@ from .product_transport import (
     require_canonical_conversation_client,
     require_product_write_transport,
 )
+from .product_transport import (
+    SUPPORTED_PRODUCT_TRANSPORTS as SUPPORTED_PRODUCT_TRANSPORTS,
+)
+from .product_transport import (
+    CanonicalConversationClient as CanonicalConversationClient,
+)
+from .product_transport import ProductRuntimeHealth as ProductRuntimeHealth
 from .product_ui_liveness import BrowserUILivenessObservation
 from .types import ChatResponse, MediaItem
 

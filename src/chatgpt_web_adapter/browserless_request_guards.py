@@ -8,7 +8,6 @@ from typing import Any, Callable
 
 from .browserless_request_scope import _BROWSERLESS_REQUEST_SCOPE_OWNER
 
-
 _POLL_SLEEP_DEADLINE: ContextVar[float | None] = ContextVar(
     "browserless_poll_sleep_deadline",
     default=None,
@@ -183,9 +182,7 @@ class _SubmittedTurnCanonicalClientView:
         status = self._delegate.get_status(conversation)
         if getattr(status, "status", None) != "completed":
             return status
-        status_message_id = _normalized_message_id(
-            getattr(status, "message_id", None)
-        )
+        status_message_id = _normalized_message_id(getattr(status, "message_id", None))
         if status_message_id == self._submitted_message_id:
             return status
         return _StaleCompletedStatusView(status)
@@ -245,9 +242,7 @@ def gate_browserless_canonical_finalize(
             poll_interval=poll_interval,
         )
         status, canonical_assistant, _text = result
-        status_message_id = _normalized_message_id(
-            getattr(status, "message_id", None)
-        )
+        status_message_id = _normalized_message_id(getattr(status, "message_id", None))
         canonical_message_id = _normalized_message_id(
             getattr(canonical_assistant, "message_id", None)
         )

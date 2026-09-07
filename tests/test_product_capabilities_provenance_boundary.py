@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "chatgpt_web_adapter"
 
@@ -28,7 +27,7 @@ def test_provenance_model_preserves_nullable_finish_reason() -> None:
     source = (SRC / "product_provenance.py").read_text(encoding="utf-8")
 
     assert "finish_reason_observed" in source
-    assert "finish_reason=\"stop\"" not in source
+    assert 'finish_reason="stop"' not in source
     assert "finality_detail=None" in source
     assert "CompletionSource.CANONICAL_READBACK" in source
 
@@ -41,7 +40,9 @@ def test_capability_model_does_not_collapse_four_states_to_boolean() -> None:
     assert "bool(state)" not in source
 
 
-def test_pr85_does_not_modify_proven_browser_write_runtime_or_extension_contract() -> None:
+def test_pr85_does_not_modify_proven_browser_write_runtime_or_extension_contract() -> (
+    None
+):
     writer = (SRC / "browser_owned_write_runtime.py").read_text(encoding="utf-8")
     adapter = (SRC / "browser_owned_product_transport_core.py").read_text(
         encoding="utf-8"

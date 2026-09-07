@@ -36,7 +36,11 @@ def _resolve_reasoning_effort(
         return reasoning_effort
     if model is not None:
         return None
-    if preserve_model and attached.detected_model and attached.detected_reasoning_effort:
+    if (
+        preserve_model
+        and attached.detected_model
+        and attached.detected_reasoning_effort
+    ):
         return attached.detected_reasoning_effort
     return None
 

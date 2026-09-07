@@ -95,10 +95,9 @@ def send_existing_text_prepared(
         raise ValueError("conversation.conversation_id is required")
     conversation_id = conversation_id.strip()
 
-    parent_message_id = (
-        conversation_dict.get("parent_message_id")
-        or conversation_dict.get("message_id")
-    )
+    parent_message_id = conversation_dict.get(
+        "parent_message_id"
+    ) or conversation_dict.get("message_id")
     if not isinstance(parent_message_id, str) or not parent_message_id.strip():
         raise ValueError("conversation parent/message id is required")
     parent_message_id = parent_message_id.strip()
@@ -169,7 +168,9 @@ def send_existing_text_prepared(
 
     try:
         requirements, proof_header = self._get_ready_requirements()
-        chat_token = requirements.get("token") if isinstance(requirements, dict) else None
+        chat_token = (
+            requirements.get("token") if isinstance(requirements, dict) else None
+        )
         if not isinstance(chat_token, str) or not chat_token:
             raise RequestError("chat-requirements token is missing")
 
@@ -286,20 +287,22 @@ def send_existing_text_prepared(
             or observed_message_id == parent_message_id
         ):
             streamed_prefix = text
-            message, polled_text, _polled_payload = self._poll_conversation_after_prepare(
-                effective_conversation_id,
-                previous_message_id=parent_message_id,
-                timeout=max(
-                    DEFAULT_STREAM_RECOVERY_POLL_TIMEOUT_SECONDS,
-                    float(self.timeout),
-                ),
-                interval=DEFAULT_STREAM_RECOVERY_POLL_INTERVAL_SECONDS,
-                on_token=None if streamed_prefix else on_token,
-                on_event=on_event,
-                reason="prepared_text_send_handoff_recovery"
-                if handoff_seen
-                else "prepared_text_send_recovery",
-                allow_global_fallback=False,
+            message, polled_text, _polled_payload = (
+                self._poll_conversation_after_prepare(
+                    effective_conversation_id,
+                    previous_message_id=parent_message_id,
+                    timeout=max(
+                        DEFAULT_STREAM_RECOVERY_POLL_TIMEOUT_SECONDS,
+                        float(self.timeout),
+                    ),
+                    interval=DEFAULT_STREAM_RECOVERY_POLL_INTERVAL_SECONDS,
+                    on_token=None if streamed_prefix else on_token,
+                    on_event=on_event,
+                    reason="prepared_text_send_handoff_recovery"
+                    if handoff_seen
+                    else "prepared_text_send_recovery",
+                    allow_global_fallback=False,
+                )
             )
             if handoff_seen and not isinstance(message, dict):
                 raise RequestError(
@@ -328,7 +331,9 @@ def send_existing_text_prepared(
                 if diagnostics.get("observed_model") is not None:
                     observed_model = diagnostics.get("observed_model")
                 if diagnostics.get("observed_reasoning_effort") is not None:
-                    observed_reasoning_effort = diagnostics.get("observed_reasoning_effort")
+                    observed_reasoning_effort = diagnostics.get(
+                        "observed_reasoning_effort"
+                    )
         observed_conversation_id = effective_conversation_id
     finally:
         _clear_prefetched_requirements(self)

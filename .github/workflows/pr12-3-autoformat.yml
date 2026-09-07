@@ -1,0 +1,47 @@
+name: PR12.3 branch autoformat
+
+on:
+  push:
+    branches:
+      - pr12-3-import-time-mutation-elimination
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: ${{ !contains(github.event.head_commit.message, '[autoformat]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: pr12-3-import-time-mutation-elimination
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install CI-matched Ruff
+        run: python -m pip install ruff==0.16.6
+      - name: Format changed Python files without touching frozen cores
+        shell: bash
+        run: |
+          mapfile -t files < <(
+            git diff --name-only origin/main...HEAD -- '*.py' \
+              | grep -Ev 'src/chatgpt_web_adapter/(legacy_client_core|browserless_request_transport_core|browser_owned_product_transport_core|product_runtime_core)\.py$'
+          )
+          if [ "${#files[@]}" -eq 0 ]; then
+            exit 0
+          fi
+          python -m ruff check --fix --select I "${files[@]}"
+          python -m ruff format "${files[@]}"
+      - name: Commit formatter output
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- '*.py'
+          git commit -m "PR12.3: apply Ruff formatting [autoformat]"
+          git push origin HEAD:pr12-3-import-time-mutation-elimination

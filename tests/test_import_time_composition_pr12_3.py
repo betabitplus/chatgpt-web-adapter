@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import importlib
+import os
 import subprocess
 import sys
 import textwrap
@@ -25,10 +26,19 @@ def _assert_no_top_level_runtime_mutation(path: Path) -> None:
 
 
 def _run_isolated_python(source: str) -> None:
+    env = os.environ.copy()
+    source_root = str(ROOT / "src")
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        source_root
+        if not existing_pythonpath
+        else os.pathsep.join((source_root, existing_pythonpath))
+    )
     subprocess.run(
         [sys.executable, "-c", textwrap.dedent(source)],
         check=True,
         cwd=ROOT,
+        env=env,
     )
 
 
@@ -155,7 +165,9 @@ def test_public_runtime_and_transports_own_static_composition_points() -> None:
     current_runtime = importlib.import_module("chatgpt_web_adapter.product_runtime")
 
     assert "send" in current_client.ChatGPTWebClient.__dict__
-    assert "_poll_conversation_after_prepare" in current_client.ChatGPTWebClient.__dict__
+    assert (
+        "_poll_conversation_after_prepare" in current_client.ChatGPTWebClient.__dict__
+    )
     assert "__init__" in current_browserless.BrowserlessRequestTransport.__dict__
     assert "_execute" in current_browserless.BrowserlessRequestTransport.__dict__
     assert "capabilities" in current_browser_owned.BrowserOwnedProductTransport.__dict__

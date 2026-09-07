@@ -281,7 +281,10 @@ def _obtain_current_prepare_evidence(
             endpoint=SENTINEL_FINALIZE_PATH,
             request_stage="sentinel_challenge_binding",
         )
-    if not isinstance(evidence.turnstile_token, str) or not evidence.turnstile_token.strip():
+    if (
+        not isinstance(evidence.turnstile_token, str)
+        or not evidence.turnstile_token.strip()
+    ):
         raise RequestError(
             "SENTINEL_TURNSTILE_EVIDENCE_REQUIRED: current-prepare provider did "
             "not return Turnstile evidence",
@@ -457,9 +460,7 @@ def _validate_finalize_response(
         )
     return (
         token.strip(),
-        acquired_monotonic
-        + effective_ttl
-        - SENTINEL_EXPIRY_SAFETY_MARGIN_SECONDS,
+        acquired_monotonic + effective_ttl - SENTINEL_EXPIRY_SAFETY_MARGIN_SECONDS,
     )
 
 
@@ -493,7 +494,9 @@ def acquire_finalized_sentinel_bundle(
             prepare_payload,
             build_sentinel_prepare_headers(client),
         )
-    response, prepare_token = _validate_prepare_response(int(prepare_status), prepare_data)
+    response, prepare_token = _validate_prepare_response(
+        int(prepare_status), prepare_data
+    )
     turnstile = response["turnstile"]
     proofofwork = response["proofofwork"]
     so = response["so"]

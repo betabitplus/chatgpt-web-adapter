@@ -292,10 +292,17 @@ class BrowserOwnedProductWriteRuntime:
         self._browser_context_readback = callable(
             getattr(self.client, "complete_canonical_readback", None)
         )
+        declared_read_plane = getattr(self.client, "canonical_read_plane", None)
         self._read_plane = (
-            BROWSER_CONTEXT_CANONICAL_READ_PLANE
+            declared_read_plane
             if self._browser_context_readback
-            else LEGACY_READ_PLANE
+            and isinstance(declared_read_plane, str)
+            and declared_read_plane.strip()
+            else (
+                BROWSER_CONTEXT_CANONICAL_READ_PLANE
+                if self._browser_context_readback
+                else LEGACY_READ_PLANE
+            )
         )
         self._browser_authority_runtime_policy = browser_authority_policy
         self._browser_authority_runtime_ttl_ms = browser_authority_ttl_ms

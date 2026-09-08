@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from .auth import DEFAULT_AUTH_FILE
+from .browser_authority_backend import (
+    WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
+    assemble_browser_authority_provider,
+    normalize_browser_authority_backend,
+)
 from .client import DEFAULT_TIMEOUT_SECONDS, ChatGPTWebClient
 from .product_capabilities import ProductCapabilities
 from .product_media import browser_owned_media_scope
@@ -899,6 +904,7 @@ def assemble_product_runtime(
     client: Any | None = None,
     provider: Any | None = None,
     write_transport: ProductWriteTransport | None = None,
+    browser_authority_backend: str | None = None,
     browser_authority_policy: str | None = None,
     browser_authority_ttl_ms: int | None = None,
     auth_file: str | Path = DEFAULT_AUTH_FILE,
@@ -915,6 +921,24 @@ def assemble_product_runtime(
     """
 
     normalized = normalize_product_transport(transport)
+    if browser_authority_backend is not None:
+        normalized_backend = normalize_browser_authority_backend(browser_authority_backend)
+        if normalized != BROWSER_OWNED_PRODUCT_TRANSPORT:
+            raise ValueError(
+                "browser authority backend selection requires transport='browser-owned'"
+            )
+        if provider is not None:
+            raise ValueError("provider and browser_authority_backend are mutually exclusive")
+        if write_transport is not None:
+            raise ValueError(
+                "write_transport and browser_authority_backend are mutually exclusive"
+            )
+        provider = assemble_browser_authority_provider(normalized_backend)
+        if (
+            normalized_backend == WKWEBVIEW_BROWSER_AUTHORITY_BACKEND
+            and browser_authority_policy is None
+        ):
+            browser_authority_policy = "TURN_SCOPED"
     if client is None:
         client = ChatGPTWebClient(
             auth_file=auth_file,

@@ -148,6 +148,8 @@ _PROFILE_SELECTION_CAPABILITIES = frozenset({MODEL_SELECTION, REASONING_SELECTIO
 def _build_browser_owned_capabilities(
     *,
     profile_selection_supported: bool = True,
+    temporary_chat_supported: bool = True,
+    media_supported: bool = False,
 ) -> ProductCapabilities:
     return ProductCapabilities.from_entries(
         transport=BROWSER_OWNED_PRODUCT_TRANSPORT,
@@ -156,18 +158,36 @@ def _build_browser_owned_capabilities(
             ProductCapability(
                 name=name,
                 state=(
-                    _BROWSER_OWNED_CAPABILITY_STATES[name]
-                    if profile_selection_supported or name not in _PROFILE_SELECTION_CAPABILITIES
-                    else CapabilityState.UNKNOWN
+                    CapabilityState.UNIMPLEMENTED
+                    if name == TEMPORARY_CHAT and not temporary_chat_supported
+                    else (
+                        CapabilityState.AVAILABLE
+                        if name == IMAGES and media_supported
+                        else (
+                            _BROWSER_OWNED_CAPABILITY_STATES[name]
+                            if profile_selection_supported
+                            or name not in _PROFILE_SELECTION_CAPABILITIES
+                            else CapabilityState.UNKNOWN
+                        )
+                    )
                 ),
                 owner=_BROWSER_OWNED_CAPABILITY_OWNERS.get(
                     name,
                     CapabilityOwner.TRANSPORT,
                 ),
                 evidence=(
-                    _BROWSER_OWNED_CAPABILITY_EVIDENCE.get(name)
-                    if profile_selection_supported or name not in _PROFILE_SELECTION_CAPABILITIES
-                    else "configured browser-native provider does not expose PR8.10 profile requirements"
+                    "configured browser authority provider does not implement Temporary Chat"
+                    if name == TEMPORARY_CHAT and not temporary_chat_supported
+                    else (
+                        "configured browser authority provider accepts execution-local attachment paths"
+                        if name == IMAGES and media_supported
+                        else (
+                            _BROWSER_OWNED_CAPABILITY_EVIDENCE.get(name)
+                            if profile_selection_supported
+                            or name not in _PROFILE_SELECTION_CAPABILITIES
+                            else "configured browser-native provider does not expose PR8.10 profile requirements"
+                        )
+                    )
                 ),
             )
             for name in PRODUCT_CAPABILITY_NAMES
@@ -230,19 +250,35 @@ class BrowserOwnedProductTransport:
 
             provider = ProductModelProfileProvider()
         self.provider = provider
-        self._browser_context_canonical_enabled = isinstance(
-            self.provider,
-            BrowserNativeTurnProvider,
+        canonical_builder = getattr(self.provider, "build_canonical_client", None)
+        self._browser_context_canonical_enabled = (
+            isinstance(self.provider, BrowserNativeTurnProvider)
+            or callable(canonical_builder)
         )
-        self.canonical_client = (
-            source_canonical
-            if isinstance(source_canonical, BrowserContextCanonicalClient)
-            or not self._browser_context_canonical_enabled
-            else BrowserContextCanonicalClient(source_canonical, self.provider)
-        )
+        if isinstance(source_canonical, BrowserContextCanonicalClient):
+            self.canonical_client = source_canonical
+        elif callable(canonical_builder):
+            self.canonical_client = canonical_builder(source_canonical)
+        elif isinstance(self.provider, BrowserNativeTurnProvider):
+            self.canonical_client = BrowserContextCanonicalClient(
+                source_canonical,
+                self.provider,
+            )
+        else:
+            self.canonical_client = source_canonical
         self._model_profile_selection_supported = callable(
             getattr(self.provider, "require_profile", None)
         )
+        self._temporary_chat_supported = getattr(
+            self.provider,
+            "temporary_chat_supported",
+            True,
+        ) is True
+        self._media_supported = getattr(
+            self.provider,
+            "supports_attachment_paths",
+            False,
+        ) is True
         self._browser_authority_runtime_policy = browser_authority_policy
         self._browser_authority_runtime_ttl_ms = browser_authority_ttl_ms
         self._browser_authority_default_resolution = resolve_browser_authority_policy(
@@ -355,9 +391,17 @@ class BrowserOwnedProductTransport:
         return self._health_from_runtime(self._runtime.health(conversation))
 
     def capabilities(self) -> ProductCapabilities:
-        if self._model_profile_selection_supported:
+        if (
+            self._model_profile_selection_supported
+            and self._temporary_chat_supported
+            and not self._media_supported
+        ):
             return _BROWSER_OWNED_CAPABILITIES
-        return _build_browser_owned_capabilities(profile_selection_supported=False)
+        return _build_browser_owned_capabilities(
+            profile_selection_supported=self._model_profile_selection_supported,
+            temporary_chat_supported=self._temporary_chat_supported,
+            media_supported=self._media_supported,
+        )
 
     def stop_generation(
         self,
@@ -568,6 +612,11 @@ class BrowserOwnedProductTransport:
                 "fallback_transport": None,
                 "legacy_direct_write_fallback": False,
                 "browser_authority_product_runtime_policy_supported": True,
+                "browser_authority_backend": getattr(
+                    self.provider,
+                    "browser_authority_backend",
+                    "chrome-native",
+                ),
                 "browser_authority_runtime_default_configurable": True,
                 "browser_authority_per_turn_override_configurable": True,
                 "browser_authority_policy_configuration_surface": "PRODUCT_RUNTIME",
@@ -578,8 +627,16 @@ class BrowserOwnedProductTransport:
                 "browser_authority_configured_runtime_ttl_ms": self._browser_authority_runtime_ttl_ms,
                 "browser_authority_policy_exposes_runtime_tab_identity": False,
                 "browser_authority_policy_requires_native_messaging_details": False,
-                "model_slug_product_runtime_selection_supported": True,
+                "model_slug_product_runtime_selection_supported": getattr(
+                    self.provider,
+                    "supports_model_slug",
+                    True,
+                ),
                 "model_profile_product_runtime_selection_supported": self._model_profile_selection_supported,
+                "media_product_runtime_supported": self._media_supported,
+                "media_semantic_default_model_profile_supported": (
+                    self._media_supported and self._model_profile_selection_supported
+                ),
                 "model_profile_request_values": ["FAST", "BALANCED", "DEEP"],
                 "model_profile_product_modes": {
                     "FAST": "INSTANT",
@@ -608,10 +665,18 @@ class BrowserOwnedProductTransport:
                     "activity_text_revision",
                     "activity_completed",
                 ],
-                "streaming_source": "CDP_NETWORK_STREAM_RESOURCE_CONTENT",
+                "streaming_source": getattr(
+                    self.provider,
+                    "streaming_source",
+                    "CDP_NETWORK_STREAM_RESOURCE_CONTENT",
+                ),
                 "streaming_delivery": "REVISION_SAFE_EVENT_STREAM",
                 "streaming_canonical_finality": (
-                    BROWSER_CONTEXT_CANONICAL_READ_PLANE
+                    getattr(
+                        self.canonical_client,
+                        "canonical_read_plane",
+                        BROWSER_CONTEXT_CANONICAL_READ_PLANE,
+                    )
                     if self._browser_context_canonical_enabled
                     else _LEGACY_CANONICAL_READ_PLANE
                 ),
@@ -671,4 +736,7 @@ class BrowserOwnedProductTransport:
                 "browser_native_send_composes_submit_and_await_final": True,
             }
         )
+        if not self._temporary_chat_supported:
+            governance["temporary_chat_product_runtime_selection_supported"] = False
+            governance["temporary_chat_capability_live_graduated"] = False
         return governance

@@ -14,7 +14,12 @@ from .exceptions import ConversationTimeoutError, RequestError
 from .message_text import extract_message_text
 from .messages import _chat_message_from_node, _current_branch_nodes
 from .product_media import current_browser_owned_attachment_paths
-from .revision_safe_streaming_pr8_9 import RevisionSafeTextAccumulator
+from .revision_safe_streaming_pr8_9 import (
+    ASSISTANT_TEXT_DELTA,
+    ASSISTANT_TEXT_REVISION,
+    ASSISTANT_TEXT_SNAPSHOT,
+    RevisionSafeTextAccumulator,
+)
 from .status import _status_from_payload
 from .types import (
     AttachedConversation,
@@ -621,6 +626,8 @@ def _emit_revision_safe_event(
 def _provider_supports_revision_safe_streaming(provider: Any) -> bool:
     if not callable(getattr(provider, "send_text_streaming", None)):
         return False
+    if getattr(provider, "revision_safe_streaming_supported", False) is True:
+        return True
     rpc = getattr(provider, "_rpc", None)
     if not callable(rpc):
         return False
@@ -963,6 +970,10 @@ def await_browser_native_final(
     passive_message_id: str | None = None
     passive_stream_ended_without_terminal = False
     incomplete_without_terminal = False
+    passive_emitted_message_ids = set(submission.baseline_message_ids)
+    passive_text_sequence = 0
+    passive_text_message_id: str | None = None
+    passive_text_snapshot = ""
 
     if (
         bool(getattr(turn, "passive_observer_armed", False))
@@ -971,12 +982,76 @@ def await_browser_native_final(
         and authority_lease_id
     ):
         def handle_passive_event(event: dict[str, Any]) -> None:
+            nonlocal passive_text_sequence, passive_text_message_id, passive_text_snapshot
             if not isinstance(event, dict):
                 return
-            if event.get("type") == "passive_observer_heartbeat":
+            event_type = event.get("type")
+            if event_type == "passive_observer_heartbeat":
                 return
-            normalized = {**event, "submission_id": submission.submission_id}
-            _emit_revision_safe_event(self, submission.on_event, normalized)
+            if event_type != "canonical_payload_snapshot":
+                normalized = {**event, "submission_id": submission.submission_id}
+                _emit_revision_safe_event(self, submission.on_event, normalized)
+                return
+
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                return
+            for intermediate in _canonical_intermediate_events(
+                payload,
+                baseline_message_ids=submission.baseline_message_ids,
+                emitted_message_ids=passive_emitted_message_ids,
+                submission_id=submission.submission_id,
+            ):
+                _emit_revision_safe_event(self, submission.on_event, intermediate)
+
+            candidates = _assistant_candidates_from_payload(
+                payload,
+                baseline_assistant_ids=submission.baseline_assistant_ids,
+                turn_exchange_id=observed_turn_exchange_id,
+                allow_unfinished=True,
+            )
+            if not candidates:
+                return
+            candidate = candidates[-1]
+            message_id = getattr(candidate, "message_id", None)
+            text = getattr(candidate, "text", "")
+            if not isinstance(text, str) or not text:
+                return
+            if message_id == passive_text_message_id and text == passive_text_snapshot:
+                return
+
+            passive_text_sequence += 1
+            if passive_text_message_id is None or message_id != passive_text_message_id:
+                text_event = {
+                    "type": ASSISTANT_TEXT_SNAPSHOT,
+                    "sequence": passive_text_sequence,
+                    "message_id": message_id,
+                    "text": text,
+                }
+            elif text.startswith(passive_text_snapshot):
+                delta = text[len(passive_text_snapshot) :]
+                if not delta:
+                    return
+                text_event = {
+                    "type": ASSISTANT_TEXT_DELTA,
+                    "sequence": passive_text_sequence,
+                    "message_id": message_id,
+                    "delta": delta,
+                }
+            else:
+                text_event = {
+                    "type": ASSISTANT_TEXT_REVISION,
+                    "sequence": passive_text_sequence,
+                    "message_id": message_id,
+                    "text": text,
+                }
+
+            passive_text_message_id = message_id
+            passive_text_snapshot = text
+            normalized = submission.stream_state.apply(text_event)
+            if normalized is not None:
+                normalized = {**normalized, "submission_id": submission.submission_id}
+                _emit_revision_safe_event(self, submission.on_event, normalized)
 
         try:
             observe_result = observe_turn(

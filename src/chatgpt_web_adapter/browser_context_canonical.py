@@ -485,6 +485,7 @@ class BrowserContextCanonicalClient:
             provider,
             read_timeout=read_timeout,
         )
+        self.canonical_read_plane = BROWSER_CONTEXT_CANONICAL_READ_PLANE
         self._browser_native_turn_provider = provider
 
     def _get_conversation_payload(self, conversation_id: str) -> dict[str, Any]:

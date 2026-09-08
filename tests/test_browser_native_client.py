@@ -961,6 +961,72 @@ def test_passive_observer_waits_without_canonical_polling_then_reconciles_once()
     )
 
 
+def test_passive_canonical_snapshots_feed_revision_safe_text_stream() -> None:
+    partial = _completed_canonical_payload()
+    partial["mapping"]["assistant-node"]["message"]["content"]["parts"] = ["do"]
+    partial["mapping"]["assistant-node"]["message"]["metadata"] = {}
+    partial["mapping"]["assistant-node"]["message"]["end_turn"] = False
+    final = _completed_canonical_payload()
+
+    class Provider(FakeProvider):
+        def send_text(self, text, *, conversation=None, timeout=None):
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id=None,
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=50,
+                browser_authority_lease_id="lease-1",
+                passive_observer_armed=True,
+            )
+
+        def observe_turn(self, **kwargs):
+            callback = kwargs.get("on_event")
+            assert callback is not None
+            callback({"type": "canonical_payload_snapshot", "payload": partial})
+            callback({"type": "canonical_payload_snapshot", "payload": final})
+            return {
+                "ok": True,
+                "conversationId": kwargs["conversation_id"],
+                "turnExchangeId": None,
+                "messageId": "assistant-1",
+                "finishReason": "stop",
+            }
+
+    provider = Provider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def _emit_event(self, callback, event_type, **payload):
+            if callback is not None:
+                callback({"type": event_type, **payload})
+
+        def _get_conversation_payload(self, _conversation_id):
+            return final
+
+    delivered = []
+    response = send_browser_native(
+        Client(),
+        "hello",
+        timeout=2,
+        poll_interval=0.01,
+        on_event=delivered.append,
+    )
+
+    assert response.text == "done"
+    snapshots = [event for event in delivered if event.get("type") == "assistant_text_snapshot"]
+    deltas = [event for event in delivered if event.get("type") == "assistant_text_delta"]
+    assert snapshots and snapshots[0]["text"] == "do"
+    assert deltas and deltas[0]["delta"] == "ne"
+    finalized = [event for event in delivered if event.get("type") == "canonical_text_finalized"][-1]
+    assert finalized["streamed_text_length"] == 4
+    assert finalized["reconciliation"] == "EXACT_MATCH"
+
+
 def test_explicit_stop_signal_short_circuits_non_passive_canonical_wait() -> None:
     class Provider:
         def __init__(self) -> None:

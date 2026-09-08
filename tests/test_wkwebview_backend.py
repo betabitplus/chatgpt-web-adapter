@@ -12,6 +12,7 @@ from chatgpt_web_adapter.browser_authority_backend import (
     WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
     normalize_browser_authority_backend,
 )
+from chatgpt_web_adapter.exceptions import RequestError
 from chatgpt_web_adapter.product_capabilities import (
     IMAGES,
     TEMPORARY_CHAT,
@@ -166,3 +167,295 @@ def test_wkwebview_declares_revision_safe_streaming_capability() -> None:
     assert provider.revision_safe_streaming_supported is True
     assert callable(provider.send_text_streaming)
     assert callable(provider.send_text_with_stale_ui_recovery_streaming)
+
+
+def test_wkwebview_streaming_detaches_write_page_and_resumes_in_lightweight_context(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+
+    def fail_if_duplicate_commit_check_runs(**kwargs):
+        raise AssertionError("helper canonical commit proof must avoid duplicate provider polling")
+
+    monkeypatch.setattr(
+        provider,
+        "_wait_for_canonical_write_commit",
+        fail_if_duplicate_commit_check_runs,
+    )
+
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+    final_canonical = {
+        "current_node": "node-final",
+        "mapping": {"node-final": {"id": "node-final"}},
+    }
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        calls.append((list(command), dict(extra_env) if extra_env else None))
+        if "--resume-conversation" not in command:
+            assert callable(on_lifecycle_event)
+            assert isinstance(extra_env, dict)
+            handoff_path = Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"])
+            assert handoff_path.exists()
+            assert handoff_path.stat().st_mode & 0o777 == 0o600
+            handoff_path.write_text("resume-secret", encoding="utf-8")
+            on_lifecycle_event(
+                {
+                    "type": "write_identity_resolved",
+                    "conversation_id": "conversation-1",
+                }
+            )
+            on_text_event(
+                {
+                    "type": "assistant_text_delta",
+                    "sequence": 1,
+                    "message_id": "assistant-1",
+                    "delta": "hello ",
+                }
+            )
+            return {
+                "ok": True,
+                "conversation_id": "conversation-1",
+                "response_status": 200,
+                "final_url": "https://chatgpt.com/c/conversation-1",
+                "attachment_count": 0,
+                "elapsed_ms": 100,
+                "load_elapsed_ms": 50,
+                "write_commit_proven": True,
+                "write_commit_proof": "RESUME_FENCE",
+                "canonical_committed": False,
+                "committed_current_node": "",
+                "stream_ended": False,
+                "stream_terminal_observed": False,
+                "stream_resume_present": True,
+                "stream_resume_handoff_written": True,
+            }
+
+        assert extra_env == {"CWA_WK_RESUME_VALUE": "resume-secret"}
+        assert "resume-secret" not in command
+        on_text_event(
+            {
+                "type": "assistant_text_delta",
+                "sequence": 1,
+                "message_id": "assistant-1",
+                "delta": "world",
+            }
+        )
+        return {
+            "ok": True,
+            "status": 200,
+            "conversation_id": "conversation-1",
+            "canonical_completed": True,
+            "canonical_body_base64": base64.b64encode(
+                json.dumps(final_canonical).encode("utf-8")
+            ).decode("ascii"),
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    events: list[dict] = []
+    identity_events: list[dict] = []
+
+    result = provider.send_text_streaming(
+        "hello",
+        on_text_event=events.append,
+        on_write_identity=identity_events.append,
+    )
+
+    assert identity_events == [
+        {"type": "write_identity_resolved", "conversation_id": "conversation-1"}
+    ]
+    assert [event["sequence"] for event in events] == [1, 2]
+    assert [event["delta"] for event in events] == ["hello ", "world"]
+    assert result.conversation_id == "conversation-1"
+    assert result.passive_observer_armed is False
+    first_command, first_env = calls[0]
+    assert isinstance(first_env, dict)
+    assert set(first_env) == {"CWA_WK_RESUME_HANDOFF_FILE"}
+    assert not Path(first_env["CWA_WK_RESUME_HANDOFF_FILE"]).exists()
+    assert "--stream-probe-until-resume-token" in first_command
+    assert "--stream-probe-until-end" not in first_command
+    second_command, second_env = calls[1]
+    assert second_env == {"CWA_WK_RESUME_VALUE": "resume-secret"}
+    assert second_command[second_command.index("--resume-offset") + 1] == "0"
+    assert "--resume-value" not in second_command
+
+    def fail_if_helper_runs(*args, **kwargs):
+        raise AssertionError("cached final canonical payload must avoid another helper read")
+
+    monkeypatch.setattr(provider, "_run_helper", fail_if_helper_runs)
+    assert provider.read_conversation_payload("conversation-1", timeout=5) == final_canonical
+
+
+def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonical(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+
+    def fail_if_duplicate_commit_check_runs(**kwargs):
+        raise AssertionError("final canonical helper proof must avoid duplicate polling")
+
+    monkeypatch.setattr(
+        provider,
+        "_wait_for_canonical_write_commit",
+        fail_if_duplicate_commit_check_runs,
+    )
+    final_canonical = {
+        "current_node": "node-final",
+        "mapping": {"node-final": {"id": "node-final"}},
+    }
+    calls: list[list[str]] = []
+    handoff_paths: list[Path] = []
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        calls.append(list(command))
+        assert "--resume-conversation" not in command
+        assert isinstance(extra_env, dict)
+        handoff_path = Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"])
+        handoff_paths.append(handoff_path)
+        assert handoff_path.exists()
+        assert handoff_path.stat().st_mode & 0o777 == 0o600
+        on_text_event(
+            {
+                "type": "assistant_text_snapshot",
+                "sequence": 1,
+                "message_id": "assistant-1",
+                "text": "done",
+            }
+        )
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "final_url": "https://chatgpt.com/c/conversation-1",
+            "attachment_count": 0,
+            "elapsed_ms": 100,
+            "load_elapsed_ms": 50,
+            "write_commit_proven": True,
+            "write_commit_proof": "FINAL_CANONICAL",
+            "canonical_committed": False,
+            "canonical_final_completed": True,
+            "canonical_body_base64": base64.b64encode(
+                json.dumps(final_canonical).encode("utf-8")
+            ).decode("ascii"),
+            "committed_current_node": "node-final",
+            "stream_ended": False,
+            "stream_terminal_observed": False,
+            "stream_resume_present": False,
+            "stream_resume_handoff_written": False,
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    events: list[dict] = []
+
+    result = provider.send_text_streaming("hello", on_text_event=events.append)
+
+    assert len(calls) == 1
+    assert len(handoff_paths) == 1
+    assert not handoff_paths[0].exists()
+    assert result.passive_observer_armed is False
+    assert events[0]["text"] == "done"
+
+    def fail_if_helper_runs(*args, **kwargs):
+        raise AssertionError("cached final canonical payload must avoid another helper read")
+
+    monkeypatch.setattr(provider, "_run_helper", fail_if_helper_runs)
+    assert provider.read_conversation_payload("conversation-1", timeout=5) == final_canonical
+
+
+def test_wkwebview_stop_requires_canonical_client_stopped_proof(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    monkeypatch.setattr(
+        provider,
+        "_run_helper",
+        lambda command, *, timeout: {
+            "ok": True,
+            "stop_requested": True,
+            "status": 200,
+            "conversation_id": "conversation-1",
+        },
+    )
+    monkeypatch.setattr(
+        provider,
+        "_wait_for_stopped_final_payload",
+        lambda conversation_id, *, timeout: None,
+    )
+    monkeypatch.setattr(
+        provider,
+        "_wait_for_canonical_stop_proof",
+        lambda conversation_id, *, timeout: None,
+    )
+
+    with pytest.raises(RequestError, match="WKWEBVIEW_STOP_CANONICAL_NOT_PROVEN"):
+        provider.stop_generation("conversation-1", timeout=5)
+
+    assert provider.stop_requested_for("conversation-1") is False
+
+
+def test_wkwebview_stop_uses_worker_stopped_final_without_second_canonical_reader(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    stopped_canonical = {
+        "current_node": "node-stopped",
+        "mapping": {
+            "node-stopped": {
+                "id": "node-stopped",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "content": {"content_type": "text", "parts": ["partial"]},
+                    "metadata": {
+                        "finish_details": {
+                            "type": "interrupted",
+                            "reason": "client_stopped",
+                        }
+                    },
+                },
+            }
+        },
+    }
+    monkeypatch.setattr(
+        provider,
+        "_run_helper",
+        lambda command, *, timeout: {
+            "ok": True,
+            "stop_requested": True,
+            "status": 200,
+            "conversation_id": "conversation-1",
+        },
+    )
+    monkeypatch.setattr(
+        provider,
+        "_wait_for_stopped_final_payload",
+        lambda conversation_id, *, timeout: stopped_canonical,
+    )
+
+    def fail_if_fallback_reads(*args, **kwargs):
+        raise AssertionError("worker stopped-final proof must avoid fallback canonical reads")
+
+    monkeypatch.setattr(provider, "_wait_for_canonical_stop_proof", fail_if_fallback_reads)
+
+    result = provider.stop_generation("conversation-1", timeout=5)
+
+    assert result["stopped"] is True
+    assert result["conversationId"] == "conversation-1"
+    assert provider.stop_requested_for("conversation-1") is True

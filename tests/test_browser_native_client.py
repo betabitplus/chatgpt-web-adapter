@@ -160,6 +160,67 @@ def test_client_returns_canonical_readback_not_native_body() -> None:
     assert provider.normal_calls == [("hello", "existing-conversation", 2)]
 
 
+def test_streaming_write_identity_is_emitted_before_write_completed() -> None:
+    class IdentityProvider(FakeProvider):
+        revision_safe_streaming_supported = True
+
+        def send_text_streaming(
+            self,
+            text,
+            *,
+            conversation=None,
+            timeout=None,
+            on_text_event,
+            on_write_identity,
+        ):
+            on_write_identity(
+                {
+                    "type": "write_identity_resolved",
+                    "conversation_id": "conversation-early",
+                    "submit_response_observed": True,
+                    "submit_response_status": 200,
+                }
+            )
+            on_text_event(
+                {
+                    "type": "assistant_text_delta",
+                    "sequence": 1,
+                    "message_id": "assistant-early",
+                    "delta": "partial",
+                }
+            )
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-early",
+                turn_exchange_id="turn-early",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-early",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=100,
+            )
+
+    provider = IdentityProvider()
+    client = _client(provider)
+
+    submission = submit_browser_native(
+        client,
+        "hello",
+        timeout=2,
+        poll_interval=0.01,
+        on_event=lambda _event: None,
+    )
+
+    assert submission.turn.conversation_id == "conversation-early"
+    event_types = [event_type for event_type, _payload in client.events]
+    identity_index = event_types.index("browser_native_write_identity_resolved")
+    completed_index = event_types.index("browser_native_write_completed")
+    assert identity_index < completed_index
+    identity_payload = client.events[identity_index][1]
+    assert identity_payload["conversation_id"] == "conversation-early"
+    assert identity_payload["status_code"] == 200
+
+
 def test_completed_continuation_authorizes_bounded_stale_ui_recovery() -> None:
     provider = RecoveryFakeProvider()
     client = _client(provider, status_value="completed")
@@ -1024,6 +1085,100 @@ def test_passive_canonical_snapshots_feed_revision_safe_text_stream() -> None:
     assert deltas and deltas[0]["delta"] == "ne"
     finalized = [event for event in delivered if event.get("type") == "canonical_text_finalized"][-1]
     assert finalized["streamed_text_length"] == 4
+    assert finalized["reconciliation"] == "EXACT_MATCH"
+
+
+def test_streaming_write_can_handoff_to_passive_canonical_text_without_restart() -> None:
+    partial = _completed_canonical_payload()
+    partial["mapping"]["assistant-node"]["message"]["content"]["parts"] = ["done"]
+    partial["mapping"]["assistant-node"]["message"]["metadata"] = {}
+    partial["mapping"]["assistant-node"]["message"]["end_turn"] = False
+    final = _completed_canonical_payload()
+
+    class Provider(FakeProvider):
+        revision_safe_streaming_supported = True
+
+        def send_text_streaming(
+            self,
+            text,
+            *,
+            conversation=None,
+            timeout=None,
+            on_text_event,
+        ):
+            on_text_event(
+                {
+                    "type": "assistant_text_snapshot",
+                    "sequence": 1,
+                    "message_id": "assistant-1",
+                    "text": "do",
+                }
+            )
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id=None,
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=50,
+                browser_authority_lease_id="lease-1",
+                passive_observer_armed=True,
+            )
+
+        def observe_turn(self, **kwargs):
+            callback = kwargs.get("on_event")
+            assert callback is not None
+            callback({"type": "canonical_payload_snapshot", "payload": partial})
+            callback({"type": "canonical_payload_snapshot", "payload": final})
+            return {
+                "ok": True,
+                "conversationId": kwargs["conversation_id"],
+                "turnExchangeId": None,
+                "messageId": "assistant-1",
+                "finishReason": "stop",
+            }
+
+    provider = Provider()
+
+    class Client:
+        _browser_native_turn_provider = provider
+
+        def _emit_event(self, callback, event_type, **payload):
+            if callback is not None:
+                callback({"type": event_type, **payload})
+
+        def _get_conversation_payload(self, _conversation_id):
+            return final
+
+    delivered = []
+    response = send_browser_native(
+        Client(),
+        "hello",
+        timeout=2,
+        poll_interval=0.01,
+        on_event=delivered.append,
+    )
+
+    assert response.text == "done"
+    text_events = [
+        event
+        for event in delivered
+        if event.get("type")
+        in {"assistant_text_snapshot", "assistant_text_delta", "assistant_text_revision"}
+    ]
+    assert [event["type"] for event in text_events] == [
+        "assistant_text_snapshot",
+        "assistant_text_delta",
+    ]
+    assert text_events[0]["sequence"] == 1
+    assert text_events[0]["text"] == "do"
+    assert text_events[1]["sequence"] == 2
+    assert text_events[1]["delta"] == "ne"
+    finalized = [event for event in delivered if event.get("type") == "canonical_text_finalized"][-1]
+    assert finalized["streamed_text_length"] == 4
+    assert finalized["stream_delivery_incomplete"] is False
     assert finalized["reconciliation"] == "EXACT_MATCH"
 
 

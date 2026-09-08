@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -71,6 +72,10 @@ class WKWebViewTurnProvider:
         self._build_lock = threading.Lock()
         self._stopped_lock = threading.Lock()
         self._stopped_conversations: set[str] = set()
+        self._final_payload_lock = threading.Lock()
+        self._final_payload_cache: dict[str, dict[str, Any]] = {}
+        self._stop_final_condition = threading.Condition()
+        self._stopped_final_payloads: dict[str, dict[str, Any]] = {}
 
     @property
     def helper_root(self) -> Path:
@@ -218,6 +223,151 @@ class WKWebViewTurnProvider:
             )
         return parsed
 
+    @staticmethod
+    def _is_client_stopped_payload(payload: dict[str, Any]) -> bool:
+        mapping = payload.get("mapping")
+        current_node = payload.get("current_node")
+        if not isinstance(mapping, dict) or not isinstance(current_node, str) or not current_node:
+            return False
+        node = mapping.get(current_node)
+        message = node.get("message") if isinstance(node, dict) else None
+        if not isinstance(message, dict):
+            return False
+        author = message.get("author")
+        metadata = message.get("metadata")
+        finish = metadata.get("finish_details") if isinstance(metadata, dict) else None
+        return (
+            isinstance(author, dict)
+            and author.get("role") == "assistant"
+            and message.get("recipient") in {None, "all"}
+            and isinstance(finish, dict)
+            and finish.get("type") == "interrupted"
+            and finish.get("reason") == "client_stopped"
+        )
+
+    def _cache_final_payload(self, conversation_id: str, payload: dict[str, Any]) -> None:
+        with self._final_payload_lock:
+            self._final_payload_cache[conversation_id] = payload
+        if self._is_client_stopped_payload(payload):
+            with self._stop_final_condition:
+                self._stopped_final_payloads[conversation_id] = payload
+                self._stop_final_condition.notify_all()
+
+    def _wait_for_stopped_final_payload(
+        self,
+        conversation_id: str,
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._stop_final_condition:
+            while True:
+                payload = self._stopped_final_payloads.get(conversation_id)
+                if isinstance(payload, dict):
+                    return payload
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._stop_final_condition.wait(timeout=min(0.5, remaining))
+
+    def _wait_for_canonical_stop_proof(
+        self,
+        conversation_id: str,
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        total_timeout = max(0.0, timeout)
+        if total_timeout <= 0:
+            return None
+        binary = self._ensure_helper()
+        command = [
+            str(binary),
+            "--observe-conversation",
+            conversation_id,
+            "--poll-interval",
+            "3.000",
+            "--timeout",
+            f"{total_timeout:.3f}",
+        ]
+        env = os.environ.copy()
+        env.setdefault("NSUnbufferedIO", "YES")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+        except OSError as error:
+            raise RequestError(
+                f"WKWEBVIEW_STOP_OBSERVER_LAUNCH_FAILED: {error}",
+                request_stage="wkwebview_stop_generation",
+            ) from error
+
+        deadline = time.monotonic() + total_timeout
+        try:
+            assert process.stdout is not None
+            while time.monotonic() < deadline:
+                with self._stop_final_condition:
+                    cached = self._stopped_final_payloads.get(conversation_id)
+                if isinstance(cached, dict):
+                    return cached
+                line = process.stdout.readline()
+                if not line:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                    continue
+                if not line.startswith(_EVENT_PREFIX):
+                    continue
+                try:
+                    raw_event = json.loads(line[len(_EVENT_PREFIX) :])
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(raw_event, dict) or raw_event.get("type") != "canonical_payload":
+                    continue
+                try:
+                    payload = self._decode_helper_json(
+                        raw_event,
+                        request_stage="wkwebview_stop_generation",
+                        error_prefix="WKWEBVIEW_STOP_CANONICAL",
+                    )
+                except RequestError as error:
+                    if error.status_code in {401, 403}:
+                        raise
+                    continue
+                if self._is_client_stopped_payload(payload):
+                    self._cache_final_payload(conversation_id, payload)
+                    return payload
+        finally:
+            self._terminate_observer_process(process)
+        return None
+
+    def _read_conversation_payload_uncached(
+        self,
+        conversation_id: str,
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
+        binary = self._ensure_helper()
+        payload = self._run_helper(
+            [
+                str(binary),
+                "--canonical-conversation",
+                conversation_id,
+                "--timeout",
+                f"{timeout:.3f}",
+            ],
+            timeout=timeout,
+        )
+        return self._decode_helper_json(
+            payload,
+            request_stage="wkwebview_canonical_read",
+            error_prefix="WKWEBVIEW_CANONICAL",
+        )
+
     def read_conversation_payload(
         self,
         conversation_id: str,
@@ -228,21 +378,21 @@ class WKWebViewTurnProvider:
         total_timeout = float(timeout)
         if total_timeout <= 0:
             raise ValueError("timeout must be positive")
-        binary = self._ensure_helper()
-        payload = self._run_helper(
-            [
-                str(binary),
-                "--canonical-conversation",
-                ref.conversation_id,
-                "--timeout",
-                f"{total_timeout:.3f}",
-            ],
+        with self._final_payload_lock:
+            cached_final = self._final_payload_cache.pop(ref.conversation_id, None)
+        if isinstance(cached_final, dict):
+            cache = getattr(self._canonical_context, "current_nodes", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                self._canonical_context.current_nodes = cache
+            current_node = cached_final.get("current_node")
+            cache[ref.conversation_id] = (
+                current_node if isinstance(current_node, str) and current_node else None
+            )
+            return cached_final
+        parsed = self._read_conversation_payload_uncached(
+            ref.conversation_id,
             timeout=total_timeout,
-        )
-        parsed = self._decode_helper_json(
-            payload,
-            request_stage="wkwebview_canonical_read",
-            error_prefix="WKWEBVIEW_CANONICAL",
         )
         cache = getattr(self._canonical_context, "current_nodes", None)
         if not isinstance(cache, dict):
@@ -499,11 +649,17 @@ class WKWebViewTurnProvider:
         *,
         timeout: float,
         on_text_event: Any,
+        on_lifecycle_event: Any = None,
+        extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if not callable(on_text_event):
             raise TypeError("on_text_event must be callable")
+        if on_lifecycle_event is not None and not callable(on_lifecycle_event):
+            raise TypeError("on_lifecycle_event must be callable")
         env = os.environ.copy()
         env.setdefault("NSUnbufferedIO", "YES")
+        if extra_env:
+            env.update(extra_env)
         try:
             process = subprocess.Popen(
                 command,
@@ -537,16 +693,22 @@ class WKWebViewTurnProvider:
                         continue
                     if not isinstance(event, dict):
                         continue
-                    if event.get("type") not in {
+                    event_type = event.get("type")
+                    if event_type in {
                         "assistant_text_snapshot",
                         "assistant_text_delta",
                         "assistant_text_revision",
                     }:
+                        try:
+                            on_text_event(event)
+                        except Exception:
+                            pass
                         continue
-                    try:
-                        on_text_event(event)
-                    except Exception:
-                        pass
+                    if event_type == "write_identity_resolved" and on_lifecycle_event is not None:
+                        try:
+                            on_lifecycle_event(event)
+                        except Exception:
+                            pass
                     continue
                 if not line.startswith(_RESULT_PREFIX):
                     continue
@@ -727,9 +889,12 @@ class WKWebViewTurnProvider:
         attachment_paths: Sequence[str | Path] | None = None,
         model_slug: str | None = None,
         on_text_event: Any = None,
+        on_write_identity: Any = None,
     ) -> BrowserNativeTurnResult:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text is required")
+        if on_write_identity is not None and not callable(on_write_identity):
+            raise TypeError("on_write_identity must be callable")
         total_timeout = self.turn_timeout if timeout is None else float(timeout)
         if total_timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -754,18 +919,60 @@ class WKWebViewTurnProvider:
             attachment_paths=attachments,
             expected_current_node=baseline_current_node,
         )
+
+        stream_sequence = 0
+
+        def make_stream_relay() -> Any:
+            phase_last_sequence = 0
+
+            def relay(event: dict[str, Any]) -> None:
+                nonlocal stream_sequence, phase_last_sequence
+                if not isinstance(event, dict):
+                    return
+                raw_sequence = event.get("sequence")
+                if isinstance(raw_sequence, int) and not isinstance(raw_sequence, bool) and raw_sequence > 0:
+                    if phase_last_sequence and raw_sequence <= phase_last_sequence:
+                        return
+                    increment = (
+                        raw_sequence - phase_last_sequence if phase_last_sequence else 1
+                    )
+                    phase_last_sequence = raw_sequence
+                else:
+                    increment = 1
+                stream_sequence += max(1, increment)
+                normalized = dict(event)
+                normalized["sequence"] = stream_sequence
+                on_text_event(normalized)
+
+            return relay
+
         if on_text_event is not None:
-            command += ["--observe-stream", "--stream-probe-until-end"]
+            command += ["--observe-stream", "--stream-probe-until-resume-token"]
         started = time.monotonic()
-        payload = (
-            self._run_helper_streaming(
-                command,
-                timeout=total_timeout,
-                on_text_event=on_text_event,
-            )
-            if on_text_event is not None
-            else self._run_helper(command, timeout=total_timeout)
-        )
+        resume_handoff_path: Path | None = None
+        try:
+            if on_text_event is not None:
+                fd, raw_handoff_path = tempfile.mkstemp(prefix="cwa-wk-resume-")
+                os.close(fd)
+                resume_handoff_path = Path(raw_handoff_path)
+                payload = self._run_helper_streaming(
+                    command,
+                    timeout=total_timeout,
+                    on_text_event=make_stream_relay(),
+                    on_lifecycle_event=on_write_identity,
+                    extra_env={"CWA_WK_RESUME_HANDOFF_FILE": str(resume_handoff_path)},
+                )
+                try:
+                    resume_value = resume_handoff_path.read_text(encoding="utf-8").strip()
+                except OSError:
+                    resume_value = ""
+                if resume_value:
+                    payload["stream_resume_value"] = resume_value
+            else:
+                payload = self._run_helper(command, timeout=total_timeout)
+        finally:
+            if resume_handoff_path is not None:
+                resume_handoff_path.unlink(missing_ok=True)
         result_conversation_id = payload.get("conversation_id")
         if not isinstance(result_conversation_id, str) or not result_conversation_id.strip():
             raise RequestError(
@@ -787,12 +994,87 @@ class WKWebViewTurnProvider:
                 "WKWEBVIEW_AUTHORITY_ATTACHMENT_COUNT_MISMATCH",
                 request_stage="wkwebview_authority_turn",
             )
-        self._wait_for_canonical_write_commit(
-            conversation_id=result_conversation_id.strip(),
-            text=text,
-            baseline_current_node=baseline_current_node,
-            timeout=min(30.0, total_timeout),
+        helper_canonical_committed = payload.get("canonical_committed") is True
+        helper_write_commit_proven = (
+            payload.get("write_commit_proven") is True or helper_canonical_committed
         )
+        committed_current_node = payload.get("committed_current_node")
+        if helper_canonical_committed:
+            cache = getattr(self._canonical_context, "current_nodes", None)
+            if not isinstance(cache, dict):
+                cache = {}
+                self._canonical_context.current_nodes = cache
+            cache[result_conversation_id.strip()] = (
+                committed_current_node
+                if isinstance(committed_current_node, str) and committed_current_node
+                else None
+            )
+        elif not helper_write_commit_proven:
+            self._wait_for_canonical_write_commit(
+                conversation_id=result_conversation_id.strip(),
+                text=text,
+                baseline_current_node=baseline_current_node,
+                timeout=min(30.0, total_timeout),
+            )
+
+        phase_one_final_cached = False
+        encoded_phase_one_final = payload.get("canonical_body_base64")
+        if isinstance(encoded_phase_one_final, str) and encoded_phase_one_final:
+            final_payload = self._decode_helper_json(
+                {
+                    "status": payload.get("response_status", 200),
+                    "body_base64": encoded_phase_one_final,
+                },
+                request_stage="wkwebview_stream_finality",
+                error_prefix="WKWEBVIEW_STREAM_CANONICAL",
+            )
+            self._cache_final_payload(result_conversation_id.strip(), final_payload)
+            phase_one_final_cached = True
+
+        passive_observer_armed = on_text_event is None
+        if on_text_event is not None:
+            resume_value = payload.pop("stream_resume_value", None)
+            phase_one_completed = phase_one_final_cached or bool(
+                payload.get("canonical_final_completed")
+            ) or bool(payload.get("stream_ended")) or bool(
+                payload.get("stream_terminal_observed")
+            )
+            if not phase_one_completed:
+                if isinstance(resume_value, str) and resume_value:
+                    remaining = max(1.0, total_timeout - (time.monotonic() - started))
+                    resume_command = [
+                        str(self._ensure_helper()),
+                        "--resume-conversation",
+                        result_conversation_id.strip(),
+                        "--resume-offset",
+                        "0",
+                        "--observe-stream",
+                        "--timeout",
+                        f"{remaining:.3f}",
+                    ]
+                    try:
+                        resume_payload = self._run_helper_streaming(
+                            resume_command,
+                            timeout=remaining,
+                            on_text_event=make_stream_relay(),
+                            extra_env={"CWA_WK_RESUME_VALUE": resume_value},
+                        )
+                        encoded_final = resume_payload.get("canonical_body_base64")
+                        if isinstance(encoded_final, str) and encoded_final:
+                            final_payload = self._decode_helper_json(
+                                {
+                                    "status": resume_payload.get("status", 200),
+                                    "body_base64": encoded_final,
+                                },
+                                request_stage="wkwebview_resume_finality",
+                                error_prefix="WKWEBVIEW_RESUME_CANONICAL",
+                            )
+                            self._cache_final_payload(result_conversation_id.strip(), final_payload)
+                    except RequestError:
+                        passive_observer_armed = True
+                else:
+                    passive_observer_armed = True
+
         elapsed_ms = payload.get("elapsed_ms")
         if not isinstance(elapsed_ms, int):
             elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -820,7 +1102,7 @@ class WKWebViewTurnProvider:
             foreground_activation_observed=False,
             browser_authority_lease_id=self._current_browser_authority_lease_id(),
             attachment_count=attachment_count,
-            passive_observer_armed=on_text_event is None,
+            passive_observer_armed=passive_observer_armed,
         )
 
     def send_text(
@@ -849,6 +1131,7 @@ class WKWebViewTurnProvider:
         attachment_paths: Sequence[str | Path] | None = None,
         model_slug: str | None = None,
         on_text_event: Any,
+        on_write_identity: Any = None,
     ) -> BrowserNativeTurnResult:
         return self._send_text_impl(
             text,
@@ -857,6 +1140,7 @@ class WKWebViewTurnProvider:
             attachment_paths=attachment_paths,
             model_slug=model_slug,
             on_text_event=on_text_event,
+            on_write_identity=on_write_identity,
         )
 
     def send_text_with_stale_ui_recovery(
@@ -892,6 +1176,7 @@ class WKWebViewTurnProvider:
         attachment_paths: Sequence[str | Path] | None = None,
         model_slug: str | None = None,
         on_text_event: Any,
+        on_write_identity: Any = None,
     ) -> BrowserNativeTurnResult:
         if isinstance(canonical_completed_at_ms, bool) or canonical_completed_at_ms <= 0:
             raise ValueError("canonical_completed_at_ms must be a positive integer")
@@ -902,6 +1187,7 @@ class WKWebViewTurnProvider:
             attachment_paths=attachment_paths,
             model_slug=model_slug,
             on_text_event=on_text_event,
+            on_write_identity=on_write_identity,
         )
 
     def stop_generation(
@@ -918,6 +1204,7 @@ class WKWebViewTurnProvider:
         if total_timeout <= 0:
             raise ValueError("timeout must be positive")
         conversation_id = conversation_id.strip()
+        started = time.monotonic()
         command = self._helper_command(
             conversation_id=conversation_id,
             text=None,
@@ -925,12 +1212,33 @@ class WKWebViewTurnProvider:
             stop_only=True,
         )
         payload = self._run_helper(command, timeout=total_timeout)
-        stopped = payload.get("stopped") is True
-        if stopped:
-            self._mark_conversation_stopped(conversation_id)
+        if payload.get("stop_requested") is not True:
+            raise RequestError(
+                "WKWEBVIEW_STOP_REQUEST_NOT_PROVEN",
+                request_stage="wkwebview_stop_generation",
+            )
+
+        remaining = max(0.0, total_timeout - (time.monotonic() - started))
+        final_payload = self._wait_for_stopped_final_payload(
+            conversation_id,
+            timeout=min(8.0, remaining),
+        )
+        if final_payload is None:
+            remaining = max(0.0, total_timeout - (time.monotonic() - started))
+            final_payload = self._wait_for_canonical_stop_proof(
+                conversation_id,
+                timeout=remaining,
+            )
+        if final_payload is None or not self._is_client_stopped_payload(final_payload):
+            raise RequestError(
+                "WKWEBVIEW_STOP_CANONICAL_NOT_PROVEN",
+                request_stage="wkwebview_stop_generation",
+            )
+
+        self._mark_conversation_stopped(conversation_id)
         return {
             "ok": True,
-            "stopped": stopped,
+            "stopped": True,
             "conversationId": conversation_id,
             "provider": "wkwebview",
         }
@@ -964,6 +1272,8 @@ class WKWebViewTurnProvider:
     def clear_stop_requested_for(self, conversation_id: str) -> None:
         with self._stopped_lock:
             self._stopped_conversations.discard(conversation_id)
+        with self._stop_final_condition:
+            self._stopped_final_payloads.pop(conversation_id, None)
 
 
 __all__ = ["WKWebViewTurnProvider"]

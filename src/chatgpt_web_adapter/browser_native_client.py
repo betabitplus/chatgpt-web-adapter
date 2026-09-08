@@ -669,6 +669,20 @@ def _callable_accepts_model_slug(value: Any) -> bool:
     )
 
 
+def _callable_accepts_write_identity(value: Any) -> bool:
+    if not callable(value):
+        return False
+    try:
+        parameters = inspect.signature(value).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "on_write_identity"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def submit_browser_native(
     self: Any,
     prompt: str,
@@ -812,6 +826,26 @@ def submit_browser_native(
             normalized = {**normalized, "submission_id": submission_id}
             _emit_revision_safe_event(self, on_event, normalized)
 
+    def handle_write_identity(event: dict[str, Any]) -> None:
+        if not isinstance(event, dict) or event.get("type") != "write_identity_resolved":
+            return
+        conversation_id = event.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            return
+        status_code = event.get("submit_response_status")
+        self._emit_event(
+            on_event,
+            "browser_native_write_identity_resolved",
+            submission_id=submission_id,
+            conversation_id=conversation_id.strip(),
+            submit_response_observed=bool(event.get("submit_response_observed")),
+            status_code=(
+                status_code
+                if isinstance(status_code, int) and not isinstance(status_code, bool)
+                else None
+            ),
+        )
+
     streaming_requested = (
         on_event is not None and _provider_supports_revision_safe_streaming(provider)
     )
@@ -832,12 +866,18 @@ def submit_browser_native(
                     "BROWSER_NATIVE_RICH_INPUT_RECOVERY_PROVIDER_UNSUPPORTED",
                     request_stage="browser_native_turn_preflight",
                 )
+            write_identity_kwargs = (
+                {"on_write_identity": handle_write_identity}
+                if _callable_accepts_write_identity(recovery_stream_send)
+                else {}
+            )
             turn = recovery_stream_send(
                 prompt,
                 conversation=conversation,
                 timeout=timeout,
                 canonical_completed_at_ms=canonical_completed_at_ms,
                 on_text_event=handle_text_event,
+                **write_identity_kwargs,
                 **provider_kwargs,
             )
         else:
@@ -861,11 +901,17 @@ def submit_browser_native(
                 "BROWSER_NATIVE_RICH_INPUT_STREAM_PROVIDER_UNSUPPORTED",
                 request_stage="browser_native_turn_preflight",
             )
+        write_identity_kwargs = (
+            {"on_write_identity": handle_write_identity}
+            if _callable_accepts_write_identity(stream_send)
+            else {}
+        )
         turn = stream_send(
             prompt,
             conversation=conversation,
             timeout=timeout,
             on_text_event=handle_text_event,
+            **write_identity_kwargs,
             **provider_kwargs,
         )
     else:
@@ -971,9 +1017,14 @@ def await_browser_native_final(
     passive_stream_ended_without_terminal = False
     incomplete_without_terminal = False
     passive_emitted_message_ids = set(submission.baseline_message_ids)
-    passive_text_sequence = 0
-    passive_text_message_id: str | None = None
-    passive_text_snapshot = ""
+    # A provider may deliver the first part of a turn from the write response
+    # itself and then hand finality/continuation to the passive canonical
+    # observer. Seed the observer from the already-normalized stream state so
+    # sequence numbers remain monotonic and the first canonical snapshot can be
+    # emitted as a delta (or revision) instead of restarting the stream.
+    passive_text_sequence = submission.stream_state.last_sequence
+    passive_text_message_id: str | None = submission.stream_state.message_id
+    passive_text_snapshot = submission.stream_state.text
 
     if (
         bool(getattr(turn, "passive_observer_armed", False))

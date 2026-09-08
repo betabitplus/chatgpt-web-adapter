@@ -122,8 +122,11 @@ static NSString *ConversationIdFromURL(NSString *urlString) {
 @property(nonatomic, strong) NSString *submitError;
 @property(nonatomic, assign) BOOL streamHandoffObserved;
 @property(nonatomic, assign) BOOL streamStarted;
+@property(nonatomic, assign) BOOL streamResponseObserved;
+@property(nonatomic, assign) NSInteger streamStatus;
 @property(nonatomic, assign) BOOL streamEnded;
 @property(nonatomic, assign) BOOL streamTerminalObserved;
+@property(nonatomic, strong) NSString *streamResumeToken;
 @property(nonatomic, strong) NSString *streamTopicId;
 @property(nonatomic, strong) NSString *streamTurnExchangeId;
 @property(nonatomic, strong) NSString *streamConversationId;
@@ -162,10 +165,21 @@ completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler {
     if ([message.name isEqualToString:@"cwaStream"] && [message.body isKindOfClass:[NSDictionary class]]) {
         NSDictionary *body = (NSDictionary *)message.body;
         NSString *phase = [body[@"phase"] isKindOfClass:[NSString class]] ? body[@"phase"] : @"";
-        if ([phase isEqualToString:@"started"]) self.streamStarted = YES;
+        if ([phase isEqualToString:@"started"]) {
+            self.streamStarted = YES;
+            NSNumber *status = [body[@"status"] isKindOfClass:[NSNumber class]] ? body[@"status"] : nil;
+            if (status != nil) {
+                self.streamResponseObserved = YES;
+                self.streamStatus = [status integerValue];
+            }
+        }
         else if ([phase isEqualToString:@"ended"] || [phase isEqualToString:@"done"]) self.streamEnded = YES;
         else if ([phase isEqualToString:@"terminal"]) self.streamTerminalObserved = YES;
-        else if ([phase isEqualToString:@"text"]) {
+        else if ([phase isEqualToString:@"resume"]) {
+            self.streamResumeToken = [body[@"token"] isKindOfClass:[NSString class]] ? body[@"token"] : nil;
+            NSString *resumeConversationId = [body[@"conversation_id"] isKindOfClass:[NSString class]] ? body[@"conversation_id"] : nil;
+            if (resumeConversationId.length > 0) self.streamConversationId = resumeConversationId;
+        } else if ([phase isEqualToString:@"text"]) {
             NSString *eventType = [body[@"type"] isKindOfClass:[NSString class]] ? body[@"type"] : @"";
             if ([eventType isEqualToString:@"assistant_text_snapshot"]
                 || [eventType isEqualToString:@"assistant_text_delta"]
@@ -243,10 +257,10 @@ static NSString *PassiveStreamProbeScript(void) {
             "const emitTerminal=()=>post({phase:'terminal',message_id:currentMessageId||null});"
             "const inspectTerminalPatch=(path,value)=>{if(!currentIsFinalText)return;const p=String(path||'');if((p==='/message/end_turn'&&value===true)||(p==='/message/status'&&completedStatus(value))||(p==='/message/async_status'&&completedStatus(value))||(p==='/message/metadata/status'&&completedStatus(value))||(p==='/message/metadata/async_status'&&completedStatus(value))||(p==='/message/metadata/finish_reason'&&!!str(value))||(p==='/message/finish_reason'&&!!str(value))||(p==='/message/metadata/finish_details'&&value&&typeof value==='object'&&!!str(value.type))){emitTerminal();}};"
             "const selectMessage=(message)=>{if(!message||typeof message!=='object')return;const id=str(message.id);const previousMessageId=currentMessageId;const role=str(message.author&&message.author.role)||'';currentRecipient=str(message.recipient)||'all';const contentType=str(message.content&&message.content.content_type)||'';if(id)currentMessageId=id;currentIsFinalText=role==='assistant'&&currentRecipient==='all'&&contentType==='text'&&!(message.metadata&&message.metadata.is_thinking_preamble_message===true);if(!currentIsFinalText)return;const text=contentText(message.content);if(id&&id!==previousMessageId){currentText='';if(text){currentText=text;emitText('assistant_text_snapshot',currentMessageId,text);}}else if(currentText===''&&text){currentText=text;emitText('assistant_text_snapshot',currentMessageId,text);}else applyText(text);if(messageTerminal(message))emitTerminal();};"
-            "const inspectIdentity=(value,depth=0)=>{if(value==null||depth>7)return;if(Array.isArray(value)){for(const item of value.slice(0,128))inspectIdentity(item,depth+1);return;}if(typeof value!=='object')return;if(value.type==='stream_handoff'){let topic=null;const options=Array.isArray(value.options)?value.options:[];for(const option of options.slice(0,16)){if(option&&option.type==='subscribe_ws_topic'&&str(option.topic_id)){topic=str(option.topic_id);break;}}post({phase:'handoff',topic_id:topic,conversation_id:str(value.conversation_id),turn_exchange_id:str(value.turn_exchange_id)});}for(const key of ['message','messages','data','result','payload','turn','v','value']){if(Object.prototype.hasOwnProperty.call(value,key))inspectIdentity(value[key],depth+1);}};"
+            "const inspectIdentity=(value,depth=0)=>{if(value==null||depth>7)return;if(Array.isArray(value)){for(const item of value.slice(0,128))inspectIdentity(item,depth+1);return;}if(typeof value!=='object')return;if(value.type==='resume_conversation_token'&&str(value.token)){post({phase:'resume',token:str(value.token),conversation_id:str(value.conversation_id)});}if(value.type==='stream_handoff'){let topic=null;const options=Array.isArray(value.options)?value.options:[];for(const option of options.slice(0,16)){if(option&&option.type==='subscribe_ws_topic'&&str(option.topic_id)){topic=str(option.topic_id);break;}}post({phase:'handoff',topic_id:topic,conversation_id:str(value.conversation_id),turn_exchange_id:str(value.turn_exchange_id)});}for(const key of ['message','messages','data','result','payload','turn','v','value']){if(Object.prototype.hasOwnProperty.call(value,key))inspectIdentity(value[key],depth+1);}};"
             "const processPayload=(payload)=>{inspectIdentity(payload);if(!payload||typeof payload!=='object')return;const value=payload.v,path=payload.p;if(value&&typeof value==='object'&&!Array.isArray(value)&&value.message)selectMessage(value.message);if(typeof value==='string'&&currentRecipient==='all'&&(path==null||path==='/message/content/parts/0')){currentText+=value;emitText('assistant_text_delta',currentMessageId,value);}inspectTerminalPatch(path,value);if(Array.isArray(value)){for(const item of value.slice(0,128)){if(!item||typeof item!=='object')continue;if(item.v&&typeof item.v==='object'&&!Array.isArray(item.v)&&item.v.message)selectMessage(item.v.message);if(item.p==='/message/content/parts/0'&&typeof item.v==='string'&&currentRecipient==='all'){currentText+=item.v;emitText('assistant_text_delta',currentMessageId,item.v);}else if(item.p==='/message/content'&&item.v&&typeof item.v==='object'&&currentRecipient==='all'){applyText(contentText(item.v));}inspectTerminalPatch(item.p,item.v);}}};"
-            "const isWrite=(url,method)=>{if(String(method||'GET').toUpperCase()!=='POST')return false;try{const u=new URL(url,location.href);const p=u.pathname.replace(/\\/+$/,'');return u.origin===location.origin&&(p.endsWith('/backend-api/conversation')||p.endsWith('/backend-api/f/conversation'));}catch(_){return false;}};"
-            "const observe=async(response)=>{if(!response||!response.body)return;post({phase:'started'});const reader=response.body.getReader();const decoder=new TextDecoder();let buffer='';try{while(true){const chunk=await reader.read();if(chunk.done)break;buffer+=decoder.decode(chunk.value,{stream:true});if(buffer.length>1000000)buffer=buffer.slice(-1000000);while(true){const m=/\\r?\\n\\r?\\n/.exec(buffer);if(!m)break;const block=buffer.slice(0,m.index);buffer=buffer.slice(m.index+m[0].length);const data=block.split(/\\r?\\n/).filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trimStart()).join('\\n').trim();if(!data)continue;if(data==='[DONE]'){post({phase:'done'});continue;}try{processPayload(JSON.parse(data));}catch(_){}}}}catch(_){}finally{try{reader.releaseLock()}catch(_){}post({phase:'ended'});}};"
+            "const isWrite=(url,method)=>{if(String(method||'GET').toUpperCase()!=='POST')return false;try{const u=new URL(url,location.href);const p=u.pathname.replace(/\\/+$/,'');return u.origin===location.origin&&(p.endsWith('/backend-api/conversation')||p.endsWith('/backend-api/f/conversation')||p.endsWith('/backend-api/f/conversation/resume'));}catch(_){return false;}};"
+            "const observe=async(response)=>{if(!response||!response.body)return;post({phase:'started',status:Number(response.status)||0,ok:response.ok===true});const reader=response.body.getReader();const decoder=new TextDecoder();let buffer='';try{while(true){const chunk=await reader.read();if(chunk.done)break;buffer+=decoder.decode(chunk.value,{stream:true});if(buffer.length>1000000)buffer=buffer.slice(-1000000);while(true){const m=/\\r?\\n\\r?\\n/.exec(buffer);if(!m)break;const block=buffer.slice(0,m.index);buffer=buffer.slice(m.index+m[0].length);const data=block.split(/\\r?\\n/).filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trimStart()).join('\\n').trim();if(!data)continue;if(data==='[DONE]'){post({phase:'done'});continue;}try{processPayload(JSON.parse(data));}catch(_){}}}}catch(_){}finally{try{reader.releaseLock()}catch(_){}post({phase:'ended'});}};"
             "window.fetch=new Proxy(originalFetch,{apply(target,thisArg,args){return Reflect.apply(target,thisArg,args).then(response=>{let url='';let method='GET';try{const input=args[0],init=args[1];if(input instanceof Request){url=input.url;method=(init&&init.method)||input.method;}else{url=String(input||'');method=(init&&init.method)||'GET';}}catch(_){}if(isWrite(url,method)){try{void observe(response.clone())}catch(_){}}return response;});}});"
             "})()";
 }
@@ -354,6 +368,22 @@ static NSString *StopScript(void) {
             "})()";
 }
 
+static NSString *ResumeConversationScript(NSString *conversationId, NSString *resumeValue, NSInteger offset) {
+    NSString *conversationLiteral = JSONStringLiteral(conversationId ?: @"");
+    NSString *resumeLiteral = JSONStringLiteral(resumeValue ?: @"");
+    return [NSString stringWithFormat:
+            @"(async()=>{try{"
+             "const s=await fetch('/api/auth/session',{credentials:'include',cache:'no-store'});"
+             "if(!s.ok)throw new Error('AUTH_SESSION_HTTP_'+s.status);"
+             "const j=await s.json();const access=j&&j.accessToken;if(!access)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');"
+             "const r=await fetch('/backend-api/f/conversation/resume',{method:'POST',credentials:'include',cache:'no-store',headers:{Accept:'text/event-stream','Content-Type':'application/json',Authorization:'Bearer '+access,'x-conduit-token':%@,'X-OpenAI-Target-Path':'/backend-api/f/conversation/resume','X-OpenAI-Target-Route':'/backend-api/f/conversation/resume'},body:JSON.stringify({conversation_id:%@,offset:%ld})});"
+             "window.webkit.messageHandlers.cwaCanonical.postMessage({ok:r.ok,status:r.status,contentType:r.headers.get('content-type')||''});"
+             "}catch(e){window.webkit.messageHandlers.cwaCanonical.postMessage({ok:false,status:0,error:String(e)});}return null;})()",
+            resumeLiteral,
+            conversationLiteral,
+            (long)offset];
+}
+
 static NSString *AuthenticatedFetchScript(NSString *endpoint) {
     NSString *literal = JSONStringLiteral(endpoint ?: @"");
     return [NSString stringWithFormat:
@@ -367,10 +397,42 @@ static NSString *AuthenticatedFetchScript(NSString *endpoint) {
             "})()", literal];
 }
 
+static NSString *StopConversationFetchScript(NSString *conversationId) {
+    NSString *idLiteral = JSONStringLiteral(conversationId ?: @"");
+    return [NSString stringWithFormat:
+            @"(()=>{"
+              "const id=%@;"
+              "fetch('/api/auth/session',{credentials:'include',cache:'no-store'})"
+                ".then(async s=>{const session=await s.json();const token=session&&session.accessToken;if(!token)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');return fetch('/backend-api/stop_conversation',{method:'POST',credentials:'include',cache:'no-store',headers:{Accept:'application/json','Content-Type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify({conversation_id:id,exclude_async_types:[]})});})"
+                ".then(async r=>{const body=await r.text();window.webkit.messageHandlers.cwaCanonical.postMessage({ok:r.ok,status:r.status,body});})"
+                ".catch(e=>window.webkit.messageHandlers.cwaCanonical.postMessage({ok:false,status:0,error:String(e)}));"
+              "return true;"
+            "})()", idLiteral];
+}
+
 static NSString *CanonicalFetchScript(NSString *conversationId) {
     NSString *escaped = [conversationId stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]] ?: @"";
     NSString *endpoint = [@"/backend-api/conversation/" stringByAppendingString:escaped];
     return AuthenticatedFetchScript(endpoint);
+}
+
+static NSString *CanonicalCompletionCheckScript(NSString *conversationId) {
+    NSString *idLiteral = JSONStringLiteral(conversationId ?: @"");
+    return [NSString stringWithFormat:
+            @"(()=>{"
+              "const id=%@,url='/backend-api/conversation/'+encodeURIComponent(id);"
+              "const completed=v=>['completed','complete','finished','done','success','succeeded','finished_successfully'].includes(String(v||'').toLowerCase());"
+              "fetch('/api/auth/session',{credentials:'include',cache:'no-store'})"
+                ".then(async s=>{const session=await s.json();const token=session&&session.accessToken;if(!token)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');return fetch(url,{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+token}});})"
+                ".then(async r=>{"
+                  "if(!r.ok){window.webkit.messageHandlers.cwaCanonical.postMessage({ok:false,status:r.status,completed:false});return;}"
+                  "const d=await r.json();const mapping=d&&d.mapping&&typeof d.mapping==='object'?d.mapping:{};const current=typeof d.current_node==='string'?d.current_node:'';const node=mapping[current];const m=node&&node.message;const md=m&&m.metadata&&typeof m.metadata==='object'?m.metadata:{};const fd=md&&md.finish_details&&typeof md.finish_details==='object'?md.finish_details:null;const role=m&&m.author&&typeof m.author.role==='string'?m.author.role:null;const recipient=m&&typeof m.recipient==='string'?m.recipient:null;const asyncStatus=(d&&typeof d.async_status==='string'?d.async_status:null)||(d&&typeof d.status==='string'?d.status:null)||(node&&typeof node.async_status==='string'?node.async_status:null)||(node&&typeof node.status==='string'?node.status:null)||(typeof md.async_status==='string'?md.async_status:null)||(typeof md.status==='string'?md.status:null);const messageStatus=m&&typeof m.status==='string'?m.status:null;const active=v=>['running','in_progress','pending','queued','started','streaming'].includes(String(v||'').toLowerCase());"
+                  "const finalAssistant=role==='assistant'&&(recipient===null||recipient==='all');const finishType=fd&&typeof fd.type==='string'?fd.type:null;const finishReason=(fd&&typeof fd.reason==='string'?fd.reason:null)||(typeof md.finish_reason==='string'?md.finish_reason:null)||(m&&typeof m.finish_reason==='string'?m.finish_reason:null);const finish=finishType||finishReason;const done=!!(finalAssistant&&!active(asyncStatus)&&!active(messageStatus)&&(finish||completed(asyncStatus)||completed(messageStatus)||(m&&m.end_turn===true)));"
+                  "window.webkit.messageHandlers.cwaCanonical.postMessage({ok:true,status:r.status,completed:done,currentNode:current,finishType,finishReason,body:done?JSON.stringify(d):''});"
+                "})"
+                ".catch(e=>window.webkit.messageHandlers.cwaCanonical.postMessage({ok:false,status:0,completed:false,error:String(e)}));"
+              "return true;"
+            "})()", idLiteral];
 }
 
 static NSString *CanonicalCommitCheckScript(NSString *conversationId, NSString *prompt, NSString *baselineCurrentNode) {
@@ -433,6 +495,15 @@ int main(int argc, const char *argv[]) {
         NSString *expectedCurrentNode = ArgValue(args, @"--expected-current-node", @"");
         NSString *canonicalConversation = ArgValue(args, @"--canonical-conversation", @"");
         BOOL canonicalOnly = canonicalConversation.length > 0;
+        NSString *resumeConversation = ArgValue(args, @"--resume-conversation", @"");
+        BOOL resumeOnly = resumeConversation.length > 0;
+        NSString *resumeValue = [[[NSProcessInfo processInfo] environment][@"CWA_WK_RESUME_VALUE"] isKindOfClass:[NSString class]]
+            ? [[NSProcessInfo processInfo] environment][@"CWA_WK_RESUME_VALUE"]
+            : ArgValue(args, @"--resume-value", @"");
+        NSString *resumeHandoffFile = [[[NSProcessInfo processInfo] environment][@"CWA_WK_RESUME_HANDOFF_FILE"] isKindOfClass:[NSString class]]
+            ? [[NSProcessInfo processInfo] environment][@"CWA_WK_RESUME_HANDOFF_FILE"]
+            : @"";
+        NSInteger resumeOffset = [ArgValue(args, @"--resume-offset", @"0") integerValue];
         NSString *observeConversation = ArgValue(args, @"--observe-conversation", @"");
         BOOL observeOnly = observeConversation.length > 0;
         NSString *domObserveConversation = ArgValue(args, @"--dom-observe-conversation", @"");
@@ -447,12 +518,14 @@ int main(int argc, const char *argv[]) {
         NSArray<NSString *> *attachments = ArgValues(args, @"--attach");
         NSTimeInterval timeout = [ArgValue(args, @"--timeout", @"150") doubleValue];
         BOOL stopOnly = HasArg(args, @"--stop-only");
+        NSString *stopConversation = stopOnly ? ConversationIdFromURL(urlString) : @"";
         BOOL visible = HasArg(args, @"--visible");
         BOOL observeSubmit = HasArg(args, @"--observe-submit");
         BOOL observeStream = HasArg(args, @"--observe-stream");
         BOOL streamProbeUntilEnd = HasArg(args, @"--stream-probe-until-end");
-        BOOL readOnly = canonicalOnly || catalogOnly || observeOnly;
-        NSInteger operationModeCount = (canonicalOnly ? 1 : 0) + (catalogOnly ? 1 : 0) + (observeOnly ? 1 : 0) + (domObserveOnly ? 1 : 0) + (stopOnly ? 1 : 0);
+        BOOL streamProbeUntilResumeToken = HasArg(args, @"--stream-probe-until-resume-token");
+        BOOL readOnly = canonicalOnly || catalogOnly || observeOnly || resumeOnly || stopOnly;
+        NSInteger operationModeCount = (canonicalOnly ? 1 : 0) + (catalogOnly ? 1 : 0) + (observeOnly ? 1 : 0) + (resumeOnly ? 1 : 0) + (domObserveOnly ? 1 : 0) + (stopOnly ? 1 : 0);
         if (operationModeCount > 1) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_READ_MODE_CONFLICT"});
             return 18;
@@ -460,6 +533,10 @@ int main(int argc, const char *argv[]) {
         if (catalogOnly && CatalogEndpoint(catalog, catalogOffset, catalogLimit, catalogArchived, catalogStarred) == nil) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_CATALOG_KIND_UNSUPPORTED"});
             return 19;
+        }
+        if (resumeOnly && resumeValue.length == 0) {
+            PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_RESUME_VALUE_REQUIRED"});
+            return 25;
         }
         if (readOnly) urlString = @"https://chatgpt.com/robots.txt";
         if (domObserveOnly) urlString = [@"https://chatgpt.com/c/" stringByAppendingString:domObserveConversation];
@@ -521,6 +598,100 @@ int main(int argc, const char *argv[]) {
             if (!delegate.navigationFinished) {
                 PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_CANONICAL_ORIGIN_NOT_READY"});
                 return 15;
+            }
+            if (stopOnly) {
+                if (stopConversation.length == 0) {
+                    PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_STOP_CONVERSATION_ID_UNRESOLVED"});
+                    return 28;
+                }
+                delegate.canonicalDone = NO;
+                delegate.canonicalResult = nil;
+                EvaluateSync(webView, StopConversationFetchScript(stopConversation), 2.0, nil);
+                NSDate *stopRequestDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(8.0, MAX(0.1, [deadline timeIntervalSinceNow]))];
+                while (!delegate.canonicalDone && [stopRequestDeadline timeIntervalSinceNow] > 0) {
+                    RunLoopFor(0.05);
+                }
+                NSDictionary *stopResult = delegate.canonicalResult;
+                BOOL stopRequestOK = [stopResult isKindOfClass:[NSDictionary class]] && [stopResult[@"ok"] boolValue];
+                NSNumber *stopStatus = [stopResult[@"status"] isKindOfClass:[NSNumber class]] ? stopResult[@"status"] : @0;
+                if (!stopRequestOK) {
+                    PrintResult(@{
+                        @"ok":@NO,
+                        @"error":@"WKWEBVIEW_STOP_HTTP_FAILED",
+                        @"status":stopStatus,
+                        @"conversation_id":stopConversation
+                    });
+                    return 29;
+                }
+                PrintResult(@{
+                    @"ok":@YES,
+                    @"stop_requested":@YES,
+                    @"status":stopStatus,
+                    @"conversation_id":stopConversation
+                });
+                return 0;
+            }
+            if (resumeOnly) {
+                delegate.canonicalDone = NO;
+                delegate.canonicalResult = nil;
+                EvaluateSync(
+                    webView,
+                    ResumeConversationScript(resumeConversation, resumeValue, resumeOffset),
+                    2.0,
+                    nil
+                );
+                NSDate *resumeStartDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(8.0, MAX(0.1, [deadline timeIntervalSinceNow]))];
+                while (!delegate.canonicalDone && [resumeStartDeadline timeIntervalSinceNow] > 0) {
+                    RunLoopFor(0.05);
+                }
+                NSDictionary *resumeResult = delegate.canonicalResult;
+                BOOL resumeOK = [resumeResult isKindOfClass:[NSDictionary class]] && [resumeResult[@"ok"] boolValue];
+                NSNumber *resumeStatus = [resumeResult[@"status"] isKindOfClass:[NSNumber class]] ? resumeResult[@"status"] : @0;
+                if (!resumeOK) {
+                    PrintResult(@{
+                        @"ok":@NO,
+                        @"error":@"WKWEBVIEW_RESUME_HTTP_FAILED",
+                        @"status":resumeStatus,
+                        @"conversation_id":resumeConversation,
+                        @"offset":@(resumeOffset)
+                    });
+                    return 26;
+                }
+                BOOL canonicalCompleted = NO;
+                NSString *canonicalBody = @"";
+                NSTimeInterval nextCanonicalCheckAt = [NSDate timeIntervalSinceReferenceDate];
+                while (!canonicalCompleted && [deadline timeIntervalSinceNow] > 0) {
+                    RunLoopFor(0.05);
+                    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+                    if (now < nextCanonicalCheckAt) continue;
+                    nextCanonicalCheckAt = now + 2.0;
+                    delegate.canonicalDone = NO;
+                    delegate.canonicalResult = nil;
+                    EvaluateSync(webView, CanonicalCompletionCheckScript(resumeConversation), 1.5, nil);
+                    NSDate *canonicalDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(2.0, MAX(0.05, [deadline timeIntervalSinceNow]))];
+                    while (!delegate.canonicalDone && [canonicalDeadline timeIntervalSinceNow] > 0) {
+                        RunLoopFor(0.025);
+                    }
+                    NSDictionary *completionResult = delegate.canonicalResult;
+                    canonicalCompleted = [completionResult isKindOfClass:[NSDictionary class]] && [completionResult[@"completed"] boolValue];
+                    if (canonicalCompleted && [completionResult[@"body"] isKindOfClass:[NSString class]]) {
+                        canonicalBody = completionResult[@"body"];
+                    }
+                }
+                NSData *canonicalBodyData = [canonicalBody dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+                NSString *canonicalBodyBase64 = [canonicalBodyData base64EncodedStringWithOptions:0] ?: @"";
+                PrintResult(@{
+                    @"ok":@(canonicalCompleted),
+                    @"status":resumeStatus,
+                    @"conversation_id":resumeConversation,
+                    @"offset":@(resumeOffset),
+                    @"stream_started":@(delegate.streamStarted),
+                    @"stream_ended":@(delegate.streamEnded),
+                    @"stream_terminal_observed":@(delegate.streamTerminalObserved),
+                    @"canonical_completed":@(canonicalCompleted),
+                    @"canonical_body_base64":canonicalBodyBase64
+                });
+                return canonicalCompleted ? 0 : 27;
             }
             if (observeOnly) {
                 while ([deadline timeIntervalSinceNow] > 0) {
@@ -722,10 +893,36 @@ int main(int argc, const char *argv[]) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_COMPOSER_FILL_FAILED"});
             return 11;
         }
-        RunLoopFor(0.4);
-        NSDictionary *sent = ParseJSONResult(EvaluateSync(webView, SendScript(), 2.0, nil));
-        if (![sent[@"ok"] boolValue]) {
+        NSDate *sendReadyDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(5.0, MAX(0.1, [deadline timeIntervalSinceNow]))];
+        BOOL sendReady = NO;
+        while ([sendReadyDeadline timeIntervalSinceNow] > 0) {
+            NSDictionary *snapshot = ParseJSONResult(EvaluateSync(webView, ReadinessScript(), 1.0, nil));
+            if (snapshot && [snapshot[@"send"] boolValue]) {
+                sendReady = YES;
+                break;
+            }
+            RunLoopFor(0.1);
+        }
+        if (!sendReady) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_SEND_CONTROL_NOT_READY"});
+            return 12;
+        }
+        BOOL sendClicked = NO;
+        NSDate *sendClickDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(5.0, MAX(0.1, [deadline timeIntervalSinceNow]))];
+        while (!sendClicked && [sendClickDeadline timeIntervalSinceNow] > 0) {
+            if (delegate.submitRequestObserved) {
+                sendClicked = YES;
+                break;
+            }
+            NSDictionary *sent = ParseJSONResult(EvaluateSync(webView, SendScript(), 1.0, nil));
+            if ([sent[@"ok"] boolValue]) {
+                sendClicked = YES;
+                break;
+            }
+            RunLoopFor(0.1);
+        }
+        if (!sendClicked) {
+            PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_SEND_CONTROL_CLICK_FAILED"});
             return 12;
         }
 
@@ -762,34 +959,116 @@ int main(int argc, const char *argv[]) {
             return 14;
         }
 
+        PrintEvent(@{
+            @"type":@"write_identity_resolved",
+            @"conversation_id":resolvedConversationId,
+            @"submit_response_observed":@(delegate.submitResponseObserved),
+            @"submit_response_status":@(delegate.submitStatus)
+        });
+
+        if (
+            observeStream
+            && streamProbeUntilResumeToken
+            && delegate.streamResumeToken.length == 0
+            && !delegate.streamEnded
+        ) {
+            NSDate *resumeTokenDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(20.0, MAX(0.0, [deadline timeIntervalSinceNow]))];
+            while (
+                delegate.streamResumeToken.length == 0
+                && !delegate.streamEnded
+                && [resumeTokenDeadline timeIntervalSinceNow] > 0
+            ) {
+                RunLoopFor(0.05);
+            }
+        }
+
+        BOOL submitObserverSucceeded = delegate.submitResponseObserved
+            && delegate.submitStatus >= 200
+            && delegate.submitStatus < 300;
+        BOOL streamResponseSucceeded = delegate.streamResponseObserved
+            && delegate.streamStatus >= 200
+            && delegate.streamStatus < 300;
+        BOOL submitSucceeded = submitObserverSucceeded || streamResponseSucceeded;
+        BOOL resumeConversationMatches = delegate.streamConversationId.length > 0
+            && [delegate.streamConversationId isEqualToString:resolvedConversationId];
+        BOOL resumeCommitFence = observeStream
+            && streamProbeUntilResumeToken
+            && accepted != nil
+            && submitSucceeded
+            && delegate.streamResumeToken.length > 0
+            && resumeConversationMatches;
+
         BOOL canonicalCommitted = NO;
         NSString *committedCurrentNode = @"";
-        NSDate *commitDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(30.0, MAX(1.0, [deadline timeIntervalSinceNow]))];
-        while ([commitDeadline timeIntervalSinceNow] > 0) {
-            delegate.canonicalDone = NO;
-            delegate.canonicalResult = nil;
-            EvaluateSync(
-                webView,
-                CanonicalCommitCheckScript(resolvedConversationId, prompt, expectedCurrentNode),
-                2.0,
-                nil
-            );
-            NSDate *readDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(3.0, MAX(0.1, [commitDeadline timeIntervalSinceNow]))];
-            while (!delegate.canonicalDone && [readDeadline timeIntervalSinceNow] > 0) RunLoopFor(0.05);
-            NSDictionary *proof = delegate.canonicalResult;
-            if ([proof isKindOfClass:[NSDictionary class]] && [proof[@"committed"] boolValue]) {
-                canonicalCommitted = YES;
-                committedCurrentNode = [proof[@"currentNode"] isKindOfClass:[NSString class]] ? proof[@"currentNode"] : @"";
-                break;
+        BOOL heavyFinalCanonicalCompleted = NO;
+        NSString *heavyFinalCanonicalBody = @"";
+        NSString *heavyFinalCurrentNode = @"";
+        BOOL streamingResumeMode = observeStream && streamProbeUntilResumeToken;
+
+        if (streamingResumeMode && !resumeCommitFence) {
+            NSTimeInterval nextCanonicalCheckAt = [NSDate timeIntervalSinceReferenceDate];
+            while (!resumeCommitFence && !heavyFinalCanonicalCompleted && [deadline timeIntervalSinceNow] > 0) {
+                RunLoopFor(0.05);
+
+                resumeConversationMatches = delegate.streamConversationId.length > 0
+                    && [delegate.streamConversationId isEqualToString:resolvedConversationId];
+                resumeCommitFence = accepted != nil
+                    && submitSucceeded
+                    && delegate.streamResumeToken.length > 0
+                    && resumeConversationMatches;
+                if (resumeCommitFence) break;
+
+                NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+                if (now < nextCanonicalCheckAt) continue;
+                nextCanonicalCheckAt = now + 2.0;
+                delegate.canonicalDone = NO;
+                delegate.canonicalResult = nil;
+                EvaluateSync(webView, CanonicalCompletionCheckScript(resolvedConversationId), 1.5, nil);
+                NSDate *canonicalDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(2.0, MAX(0.05, [deadline timeIntervalSinceNow]))];
+                while (!delegate.canonicalDone && [canonicalDeadline timeIntervalSinceNow] > 0) RunLoopFor(0.025);
+                NSDictionary *finalProof = delegate.canonicalResult;
+                heavyFinalCanonicalCompleted = [finalProof isKindOfClass:[NSDictionary class]]
+                    && [finalProof[@"completed"] boolValue];
+                if (heavyFinalCanonicalCompleted) {
+                    heavyFinalCanonicalBody = [finalProof[@"body"] isKindOfClass:[NSString class]] ? finalProof[@"body"] : @"";
+                    heavyFinalCurrentNode = [finalProof[@"currentNode"] isKindOfClass:[NSString class]] ? finalProof[@"currentNode"] : @"";
+                }
             }
-            RunLoopFor(0.2);
+        } else if (!resumeCommitFence) {
+            NSDate *commitDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(30.0, MAX(1.0, [deadline timeIntervalSinceNow]))];
+            while ([commitDeadline timeIntervalSinceNow] > 0) {
+                delegate.canonicalDone = NO;
+                delegate.canonicalResult = nil;
+                EvaluateSync(
+                    webView,
+                    CanonicalCommitCheckScript(resolvedConversationId, prompt, expectedCurrentNode),
+                    2.0,
+                    nil
+                );
+                NSDate *readDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(3.0, MAX(0.1, [commitDeadline timeIntervalSinceNow]))];
+                while (!delegate.canonicalDone && [readDeadline timeIntervalSinceNow] > 0) RunLoopFor(0.05);
+                NSDictionary *proof = delegate.canonicalResult;
+                if ([proof isKindOfClass:[NSDictionary class]] && [proof[@"committed"] boolValue]) {
+                    canonicalCommitted = YES;
+                    committedCurrentNode = [proof[@"currentNode"] isKindOfClass:[NSString class]] ? proof[@"currentNode"] : @"";
+                    break;
+                }
+                RunLoopFor(0.2);
+            }
         }
-        if (!canonicalCommitted) {
+
+        BOOL writeCommitProven = canonicalCommitted || resumeCommitFence || heavyFinalCanonicalCompleted;
+        if (!writeCommitProven) {
             PrintResult(@{
                 @"ok":@NO,
                 @"error":@"WKWEBVIEW_WRITE_CANONICAL_COMMIT_NOT_PROVEN",
                 @"conversation_id":resolvedConversationId,
-                @"final_url":webView.URL.absoluteString ?: @""
+                @"final_url":webView.URL.absoluteString ?: @"",
+                @"submit_response_observed":@(delegate.submitResponseObserved),
+                @"submit_response_status":@(delegate.submitStatus),
+                @"resume_token_present":@(delegate.streamResumeToken.length > 0),
+                @"resume_conversation_matches":@(resumeConversationMatches),
+                @"heavy_final_canonical_completed":@(heavyFinalCanonicalCompleted)
             });
             return 21;
         }
@@ -797,6 +1076,7 @@ int main(int argc, const char *argv[]) {
         if (
             observeStream
             && streamProbeUntilEnd
+            && !streamProbeUntilResumeToken
             && !delegate.streamHandoffObserved
             && !delegate.streamEnded
             && !delegate.streamTerminalObserved
@@ -812,24 +1092,43 @@ int main(int argc, const char *argv[]) {
             }
         }
 
+        NSData *heavyFinalBodyData = [heavyFinalCanonicalBody dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+        NSString *heavyFinalBodyBase64 = [heavyFinalBodyData base64EncodedStringWithOptions:0] ?: @"";
+        BOOL resumeHandoffWritten = NO;
+        if (delegate.streamResumeToken.length > 0 && resumeHandoffFile.length > 0) {
+            resumeHandoffWritten = [delegate.streamResumeToken writeToFile:resumeHandoffFile
+                                                                 atomically:NO
+                                                                   encoding:NSUTF8StringEncoding
+                                                                      error:nil];
+        }
         NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - started;
         NSTimeInterval loadElapsed = delegate.navigationFinishedAt > 0 ? delegate.navigationFinishedAt - started : 0;
         PrintResult(@{
             @"ok":@YES,
             @"conversation_id":resolvedConversationId,
-            @"response_status":@(delegate.submitResponseObserved ? delegate.submitStatus : 200),
+            @"response_status":@(delegate.submitResponseObserved ? delegate.submitStatus : (delegate.streamResponseObserved ? delegate.streamStatus : 200)),
             @"submit_request_observed":@(delegate.submitRequestObserved),
             @"submit_response_observed":@(delegate.submitResponseObserved),
             @"submit_response_status":@(delegate.submitStatus),
+            @"stream_response_observed":@(delegate.streamResponseObserved),
+            @"stream_response_status":@(delegate.streamStatus),
             @"submit_error":delegate.submitError ?: @"",
             @"final_url":webView.URL.absoluteString ?: @"",
             @"elapsed_ms":@((NSInteger)llround(elapsed * 1000.0)),
             @"load_elapsed_ms":@((NSInteger)llround(MAX(0, loadElapsed) * 1000.0)),
             @"attachment_count":@(attachments.count),
             @"profile":profile ?: @"",
+            @"write_commit_proven":@(writeCommitProven),
+            @"write_commit_proof":resumeCommitFence ? @"RESUME_FENCE" : (heavyFinalCanonicalCompleted ? @"FINAL_CANONICAL" : @"CANONICAL"),
+            @"canonical_committed":@(canonicalCommitted),
+            @"canonical_final_completed":@(heavyFinalCanonicalCompleted),
+            @"canonical_body_base64":heavyFinalBodyBase64,
+            @"committed_current_node":canonicalCommitted ? (committedCurrentNode ?: @"") : (heavyFinalCurrentNode ?: @""),
             @"stream_started":@(delegate.streamStarted),
             @"stream_ended":@(delegate.streamEnded),
             @"stream_terminal_observed":@(delegate.streamTerminalObserved),
+            @"stream_resume_present":@(delegate.streamResumeToken.length > 0),
+            @"stream_resume_handoff_written":@(resumeHandoffWritten),
             @"stream_handoff_observed":@(delegate.streamHandoffObserved),
             @"stream_topic_id":delegate.streamTopicId ?: @"",
             @"turn_exchange_id":delegate.streamTurnExchangeId ?: @"",

@@ -148,6 +148,7 @@ def _safe_source_url(value: Any) -> str | None:
         return None
     if any(_sensitive_query_key(key) for key, _ in query_items):
         return None
+    # Fragments are not required for source identity and may contain secrets.
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
 
 
@@ -276,183 +277,182 @@ class ProductRequiredActionObservation:
         return payload
 
 
-@dataclass(frozen=True)
-class StructuredProductObservation:
-    observation_id: str
-    kind: ProductObservationKind
-    phase: ProductObservationPhase
-    label: str | None = None
-    text: str | None = None
-    sequence: int | None = None
-    observed_at_ms: int | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload["kind"] = self.kind.value
-        payload["phase"] = self.phase.value
-        return payload
-
-
-ProductObservation: TypeAlias = (
+StructuredProductObservation: TypeAlias = (
     ProductActivityObservation
     | ProductSourceObservation
     | ProductCitationObservation
     | ProductRequiredActionObservation
-    | StructuredProductObservation
 )
 
 
 class ProductObservationCollector:
-    """Convert sanitized browser activity/source events into typed observations."""
+    """Normalize safe product-turn events without acquiring product authority."""
 
     def __init__(self) -> None:
-        self._observations: list[ProductObservation] = []
-        self._activity_index: dict[str, int] = {}
+        self._observations: list[StructuredProductObservation] = []
+        self._activity_text: dict[str, str] = {}
+        self._source_url_by_id: dict[str, str] = {}
         self.dropped_event_count = 0
 
     @property
-    def observations(self) -> tuple[ProductObservation, ...]:
+    def observations(self) -> tuple[StructuredProductObservation, ...]:
         return tuple(self._observations)
 
-    def _record_activity(self, event: dict[str, Any]) -> bool:
+    def _drop(self) -> None:
+        self.dropped_event_count += 1
+
+    def _append(
+        self, observation: StructuredProductObservation
+    ) -> StructuredProductObservation:
+        self._observations.append(observation)
+        return observation
+
+    def consume(self, event: dict[str, Any]) -> StructuredProductObservation | None:
+        if not isinstance(event, dict):
+            self._drop()
+            return None
+
         event_type = _optional_text(event.get("type"))
-        if event_type not in _ACTIVITY_EVENT_TYPES:
-            return False
+        if event_type in _ACTIVITY_EVENT_TYPES:
+            return self._consume_activity(event_type, event)
+        if event_type == PRODUCT_SOURCE_OBSERVED:
+            return self._consume_source(event)
+        if event_type == PRODUCT_CITATION_OBSERVED:
+            return self._consume_citation(event)
+        if event_type == PRODUCT_REQUIRED_ACTION_OBSERVED:
+            return self._consume_required_action(event)
+
+        return None
+
+    def _consume_activity(
+        self,
+        event_type: str,
+        event: dict[str, Any],
+    ) -> ProductActivityObservation | None:
         activity_id = _optional_text(event.get("activity_id"))
         if activity_id is None:
-            self.dropped_event_count += 1
-            return True
-
-        content_type = _optional_text(event.get("content_type"))
-        if content_type in _PRIVATE_ACTIVITY_CONTENT_TYPES:
-            return True
+            self._drop()
+            return None
 
         activity_kind = _optional_text(event.get("activity_kind"))
         operation = _optional_text(event.get("operation"))
         tool_name = _optional_text(event.get("tool_name"))
+        source_content_type = _optional_text(event.get("source_content_type"))
+        private_source_content_type = (
+            source_content_type.casefold() if source_content_type is not None else None
+        )
         kind = _activity_observation_kind(
             activity_kind=activity_kind,
             operation=operation,
         )
-        label = _optional_text(event.get("label"))
-        text = _optional_text(event.get("text"))
-        sequence = _non_negative_int(event.get("sequence"))
-        observed_at_ms = _non_negative_int(event.get("observed_at_ms"))
+        uncorrelated_tool = _uncorrelated_tool_event(
+            activity_id=activity_id,
+            tool_name=tool_name,
+        )
 
-        if _uncorrelated_tool_event(activity_id=activity_id, tool_name=tool_name):
-            phase = (
-                ProductObservationPhase.STARTED
-                if event_type == ACTIVITY_STARTED
-                else ProductObservationPhase.OBSERVED
-            )
-            self._observations.append(
-                ProductActivityObservation(
-                    observation_id=activity_id,
-                    kind=kind,
-                    phase=phase,
-                    activity_kind=activity_kind,
-                    operation=operation,
-                    tool_name=tool_name,
-                    label=label,
-                    text=text,
-                    source_content_type=content_type,
-                    sequence=sequence,
-                    observed_at_ms=observed_at_ms,
-                )
-            )
-            return True
+        if (
+            event_type
+            in {ACTIVITY_TEXT_SNAPSHOT, ACTIVITY_TEXT_DELTA, ACTIVITY_TEXT_REVISION}
+            and private_source_content_type in _PRIVATE_ACTIVITY_CONTENT_TYPES
+        ):
+            self._drop()
+            return None
 
         if event_type == ACTIVITY_STARTED:
-            observation = ProductActivityObservation(
+            phase = (
+                ProductObservationPhase.OBSERVED
+                if uncorrelated_tool
+                else ProductObservationPhase.STARTED
+            )
+            text = None
+        elif event_type == ACTIVITY_COMPLETED:
+            phase = (
+                ProductObservationPhase.OBSERVED
+                if uncorrelated_tool
+                else ProductObservationPhase.COMPLETED
+            )
+            if private_source_content_type in _PRIVATE_ACTIVITY_CONTENT_TYPES:
+                self._activity_text.pop(activity_id, None)
+                text = None
+            else:
+                text = self._activity_text.get(activity_id)
+        else:
+            phase = ProductObservationPhase.UPDATED
+            if event_type == ACTIVITY_TEXT_DELTA:
+                delta = event.get("delta")
+                if not isinstance(delta, str):
+                    self._drop()
+                    return None
+                text = self._activity_text.get(activity_id, "") + delta
+            else:
+                text = event.get("text")
+                if not isinstance(text, str):
+                    self._drop()
+                    return None
+            self._activity_text[activity_id] = text
+
+        return self._append(
+            ProductActivityObservation(
                 observation_id=activity_id,
                 kind=kind,
-                phase=ProductObservationPhase.STARTED,
+                phase=phase,
                 activity_kind=activity_kind,
                 operation=operation,
                 tool_name=tool_name,
-                label=label,
+                label=_optional_text(event.get("label")),
                 text=text,
-                source_content_type=content_type,
-                sequence=sequence,
-                observed_at_ms=observed_at_ms,
-            )
-            self._activity_index[activity_id] = len(self._observations)
-            self._observations.append(observation)
-            return True
-
-        index = self._activity_index.get(activity_id)
-        if index is None:
-            self.dropped_event_count += 1
-            return True
-        current = self._observations[index]
-        if not isinstance(current, ProductActivityObservation):
-            self.dropped_event_count += 1
-            return True
-
-        phase = current.phase
-        if event_type == ACTIVITY_COMPLETED:
-            phase = ProductObservationPhase.COMPLETED
-        elif event_type in {
-            ACTIVITY_TEXT_SNAPSHOT,
-            ACTIVITY_TEXT_DELTA,
-            ACTIVITY_TEXT_REVISION,
-        }:
-            phase = ProductObservationPhase.UPDATED
-
-        self._observations[index] = ProductActivityObservation(
-            observation_id=current.observation_id,
-            kind=kind,
-            phase=phase,
-            activity_kind=activity_kind or current.activity_kind,
-            operation=operation or current.operation,
-            tool_name=tool_name or current.tool_name,
-            label=label or current.label,
-            text=text if text is not None else current.text,
-            source_content_type=content_type or current.source_content_type,
-            sequence=sequence if sequence is not None else current.sequence,
-            observed_at_ms=(
-                observed_at_ms if observed_at_ms is not None else current.observed_at_ms
-            ),
-        )
-        return True
-
-    def _record_source(self, event: dict[str, Any]) -> bool:
-        if event.get("type") != PRODUCT_SOURCE_OBSERVED:
-            return False
-        source_id = _optional_text(event.get("source_id"))
-        url = _safe_source_url(event.get("url"))
-        if source_id is None or url is None:
-            self.dropped_event_count += 1
-            return True
-        self._observations.append(
-            ProductSourceObservation(
-                observation_id=f"source:{source_id}",
-                source_id=source_id,
-                url=url,
-                title=_optional_text(event.get("title")),
-                domain=_optional_text(event.get("domain")),
-                attribution=_optional_text(event.get("attribution")),
-                source_origin=_optional_text(event.get("source_origin")),
+                source_content_type=source_content_type,
                 sequence=_non_negative_int(event.get("sequence")),
                 observed_at_ms=_non_negative_int(event.get("observed_at_ms")),
             )
         )
-        return True
 
-    def _record_citation(self, event: dict[str, Any]) -> bool:
-        if event.get("type") != PRODUCT_CITATION_OBSERVED:
-            return False
+    def _consume_source(self, event: dict[str, Any]) -> ProductSourceObservation | None:
+        observation_id = _optional_text(event.get("observation_id"))
+        source_id = _optional_text(event.get("source_id"))
+        url = _safe_source_url(event.get("url"))
+        if observation_id is None or source_id is None or url is None:
+            self._drop()
+            return None
+
+        prior_url = self._source_url_by_id.get(source_id)
+        if prior_url is not None and prior_url != url:
+            self._drop()
+            return None
+
+        observation = ProductSourceObservation(
+            observation_id=observation_id,
+            source_id=source_id,
+            url=url,
+            title=_optional_text(event.get("title")),
+            domain=_optional_text(event.get("domain")),
+            attribution=_optional_text(event.get("attribution")),
+            source_origin=_optional_text(event.get("source_origin")),
+            sequence=_non_negative_int(event.get("sequence")),
+            observed_at_ms=_non_negative_int(event.get("observed_at_ms")),
+        )
+        self._source_url_by_id[source_id] = url
+        return self._append(observation)
+
+    def _consume_citation(self, event: dict[str, Any]) -> ProductCitationObservation | None:
+        observation_id = _optional_text(event.get("observation_id"))
         citation_id = _optional_text(event.get("citation_id"))
         source_id = _optional_text(event.get("source_id"))
-        if citation_id is None or source_id is None:
-            self.dropped_event_count += 1
-            return True
         citation_range = _citation_range(event)
-        start_index = citation_range[0] if citation_range is not None else None
-        end_index = citation_range[1] if citation_range is not None else None
-        self._observations.append(
+        if (
+            observation_id is None
+            or citation_id is None
+            or source_id is None
+            or source_id not in self._source_url_by_id
+            or citation_range is None
+        ):
+            self._drop()
+            return None
+        start_index, end_index = citation_range
+
+        return self._append(
             ProductCitationObservation(
-                observation_id=f"citation:{citation_id}",
+                observation_id=observation_id,
                 citation_id=citation_id,
                 source_id=source_id,
                 citation_index=_non_negative_int(event.get("citation_index")),
@@ -464,36 +464,22 @@ class ProductObservationCollector:
                 observed_at_ms=_non_negative_int(event.get("observed_at_ms")),
             )
         )
-        return True
 
-    def _record_required_action(self, event: dict[str, Any]) -> bool:
-        if event.get("type") != PRODUCT_REQUIRED_ACTION_OBSERVED:
-            return False
+    def _consume_required_action(
+        self,
+        event: dict[str, Any],
+    ) -> ProductRequiredActionObservation | None:
+        observation_id = _optional_text(event.get("observation_id"))
         action_type = _optional_text(event.get("action_type"))
-        if action_type is None:
-            self.dropped_event_count += 1
-            return True
-        action_id = _optional_text(event.get("action_id")) or action_type
-        self._observations.append(
+        if observation_id is None or action_type is None:
+            self._drop()
+            return None
+        return self._append(
             ProductRequiredActionObservation(
-                observation_id=f"required-action:{action_id}",
+                observation_id=observation_id,
                 action_type=action_type,
                 label=_optional_text(event.get("label")),
                 sequence=_non_negative_int(event.get("sequence")),
                 observed_at_ms=_non_negative_int(event.get("observed_at_ms")),
             )
         )
-        return True
-
-    def consume(self, event: dict[str, Any]) -> None:
-        if not isinstance(event, dict):
-            self.dropped_event_count += 1
-            return
-        if self._record_activity(event):
-            return
-        if self._record_source(event):
-            return
-        if self._record_citation(event):
-            return
-        if self._record_required_action(event):
-            return

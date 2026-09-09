@@ -265,6 +265,321 @@ static NSString *PassiveStreamProbeScript(void) {
             "})()";
 }
 
+static NSString *BrokerFrameRequestId(WKFrameInfo *frameInfo) {
+    NSString *fragment = frameInfo.request.URL.fragment;
+    NSString *prefix = @"cwa-broker=";
+    if (![fragment isKindOfClass:[NSString class]] || ![fragment hasPrefix:prefix]) return nil;
+    NSString *value = [fragment substringFromIndex:prefix.length];
+    return value.length > 0 ? [value stringByRemovingPercentEncoding] : nil;
+}
+
+static NSString *BrokerFrameScript(void) {
+    return @"(()=>{"
+            "if(window===parent)return;"
+            "const prefix='#cwa-broker=';if(!location.hash.startsWith(prefix)||window.__cwaBrokerFrameInstalled)return;window.__cwaBrokerFrameInstalled=true;"
+            "const requestId=decodeURIComponent(location.hash.slice(prefix.length));const post=(x)=>{try{window.webkit.messageHandlers.cwaBroker.postMessage({...x,request_id:requestId})}catch(_){}};"
+            "const completed=v=>['completed','complete','finished','done','success','succeeded','finished_successfully'].includes(String(v||'').toLowerCase());"
+            "const active=v=>['running','in_progress','pending','queued','started','streaming'].includes(String(v||'').toLowerCase());"
+            "const canonical=async(access,id)=>{const r=await fetch('/backend-api/conversation/'+encodeURIComponent(id),{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+access}});if(!r.ok)return{done:false,status:r.status};const d=await r.json();const mapping=d&&d.mapping&&typeof d.mapping==='object'?d.mapping:{};const current=typeof d.current_node==='string'?d.current_node:'';const node=mapping[current];const m=node&&node.message;const md=m&&m.metadata&&typeof m.metadata==='object'?m.metadata:{};const fd=md&&md.finish_details&&typeof md.finish_details==='object'?md.finish_details:null;const role=m&&m.author&&typeof m.author.role==='string'?m.author.role:null;const recipient=m&&typeof m.recipient==='string'?m.recipient:null;const asyncStatus=(d&&typeof d.async_status==='string'?d.async_status:null)||(d&&typeof d.status==='string'?d.status:null)||(node&&typeof node.async_status==='string'?node.async_status:null)||(node&&typeof node.status==='string'?node.status:null)||(typeof md.async_status==='string'?md.async_status:null)||(typeof md.status==='string'?md.status:null);const messageStatus=m&&typeof m.status==='string'?m.status:null;const finishType=fd&&typeof fd.type==='string'?fd.type:null;const finishReason=(fd&&typeof fd.reason==='string'?fd.reason:null)||(typeof md.finish_reason==='string'?md.finish_reason:null)||(m&&typeof m.finish_reason==='string'?m.finish_reason:null);const finish=finishType||finishReason;const finalAssistant=role==='assistant'&&(recipient===null||recipient==='all');const done=!!(finalAssistant&&!active(asyncStatus)&&!active(messageStatus)&&(finish||completed(asyncStatus)||completed(messageStatus)||(m&&m.end_turn===true)));return{done,status:r.status,body:done?JSON.stringify(d):''};};"
+            "window.addEventListener('message',async e=>{if(e.source!==parent||e.origin!==location.origin)return;const c=e.data;if(!c||c.request_id!==requestId)return;try{if(c.type==='start_resume'){if(window.__cwaBrokerResumeStarted)return;window.__cwaBrokerResumeStarted=true;const id=String(c.conversation_id||''),resumeToken=String(c.resume_token||''),offset=Number(c.offset||0);if(!id||!resumeToken)throw new Error('BROKER_RESUME_INPUT_INVALID');const s=await fetch('/api/auth/session',{credentials:'include',cache:'no-store'});if(!s.ok)throw new Error('AUTH_SESSION_HTTP_'+s.status);const j=await s.json(),access=j&&j.accessToken;if(!access)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');const r=await fetch('/backend-api/f/conversation/resume',{method:'POST',credentials:'include',cache:'no-store',headers:{Accept:'text/event-stream','Content-Type':'application/json',Authorization:'Bearer '+access,'x-conduit-token':resumeToken,'X-OpenAI-Target-Path':'/backend-api/f/conversation/resume','X-OpenAI-Target-Route':'/backend-api/f/conversation/resume'},body:JSON.stringify({conversation_id:id,offset})});post({phase:'resume_http',ok:r.ok,status:r.status,conversation_id:id});if(!r.ok)throw new Error('BROKER_RESUME_HTTP_'+r.status);window.__cwaBrokerAccess=access;window.__cwaBrokerConversationId=id;try{if(r.body)void r.body.cancel()}catch(_){}return;}if(c.type==='canonical_tick'){const access=window.__cwaBrokerAccess,id=window.__cwaBrokerConversationId;if(!access||!id||window.__cwaBrokerCanonicalBusy)return;window.__cwaBrokerCanonicalBusy=true;try{let result,failed=false;try{result=await canonical(access,id);}catch(_){failed=true;}post({phase:'canonical_probe',failed,status:failed?0:Number(result&&result.status||0)});if(failed)return;if(result.status===401||result.status===403)throw new Error('BROKER_CANONICAL_HTTP_'+result.status);if(result.done)post({phase:'final',status:result.status,conversation_id:id,body:result.body});}finally{window.__cwaBrokerCanonicalBusy=false;}}}catch(error){post({phase:'error',error:String(error)});}});"
+            "post({phase:'frame_ready'});"
+            "})()";
+}
+
+static NSString *BrokerCreateFrameScript(NSString *requestId) {
+    NSString *literal = JSONStringLiteral(requestId ?: @"");
+    return [NSString stringWithFormat:
+            @"(()=>{const id=%@;if(!id)return false;const old=document.getElementById('cwa-broker-'+id);if(old)old.remove();const f=document.createElement('iframe');f.id='cwa-broker-'+id;f.src='/robots.txt#cwa-broker='+encodeURIComponent(id);f.style.cssText='position:fixed;left:0;top:0;width:10px;height:10px;border:0';document.body.appendChild(f);return true;})()",
+            literal];
+}
+
+static NSString *BrokerRemoveFrameScript(NSString *requestId) {
+    NSString *literal = JSONStringLiteral(requestId ?: @"");
+    return [NSString stringWithFormat:@"(()=>{const f=document.getElementById('cwa-broker-'+%@);if(f)f.remove();return true;})()", literal];
+}
+
+static NSString *BrokerStartFrameScript(NSDictionary *command) {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:command options:0 error:nil];
+    NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"{}";
+    NSString *requestId = [command[@"request_id"] isKindOfClass:[NSString class]] ? command[@"request_id"] : @"";
+    NSString *literal = JSONStringLiteral(requestId);
+    return [NSString stringWithFormat:
+            @"(()=>{const f=document.getElementById('cwa-broker-'+%@);if(!f||!f.contentWindow)return false;f.contentWindow.postMessage(%@,location.origin);return true;})()",
+            literal,
+            json];
+}
+
+static NSString *BrokerCanonicalTickScript(NSString *requestId) {
+    NSString *literal = JSONStringLiteral(requestId ?: @"");
+    return [NSString stringWithFormat:
+            @"(()=>{const id=%@,f=document.getElementById('cwa-broker-'+id);if(!f||!f.contentWindow)return false;f.contentWindow.postMessage({type:'canonical_tick',request_id:id},location.origin);return true;})()",
+            literal];
+}
+
+@interface WKResumeBrokerDelegate : NSObject <WKNavigationDelegate, WKScriptMessageHandler>
+@property(nonatomic, strong) WKWebView *webView;
+@property(nonatomic, assign) BOOL navigationFinished;
+@property(nonatomic, assign) BOOL shouldExit;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *pendingCommands;
+@property(nonatomic, strong) NSMutableArray<NSString *> *canonicalQueue;
+@property(nonatomic, copy) NSString *canonicalInFlight;
+@property(nonatomic, assign) NSTimeInterval canonicalInFlightStartedAt;
+@property(nonatomic, assign) NSTimeInterval nextCanonicalAt;
+@end
+
+@implementation WKResumeBrokerDelegate
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        self.pendingCommands = [NSMutableDictionary dictionary];
+        self.canonicalQueue = [NSMutableArray array];
+        self.nextCanonicalAt = 0;
+    }
+    return self;
+}
+
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
+    self.navigationFinished = YES;
+}
+
+- (void)finishRequest:(NSString *)requestId {
+    if (requestId.length == 0) return;
+    [self.pendingCommands removeObjectForKey:requestId];
+    [self.canonicalQueue removeObject:requestId];
+    if ([self.canonicalInFlight isEqualToString:requestId]) {
+        self.canonicalInFlight = nil;
+        self.canonicalInFlightStartedAt = 0;
+    }
+    EvaluateSync(self.webView, BrokerRemoveFrameScript(requestId), 1.0, nil);
+}
+
+- (void)enqueueCanonicalRequest:(NSString *)requestId {
+    if (requestId.length == 0 || self.pendingCommands[requestId] == nil) return;
+    if (![self.canonicalQueue containsObject:requestId]) [self.canonicalQueue addObject:requestId];
+}
+
+- (void)completeCanonicalProbeForRequest:(NSString *)requestId body:(NSDictionary *)body {
+    if ([self.canonicalInFlight isEqualToString:requestId]) {
+        self.canonicalInFlight = nil;
+        self.canonicalInFlightStartedAt = 0;
+    }
+    NSTimeInterval delay = 1.5;
+    BOOL failed = [body[@"failed"] boolValue];
+    NSInteger status = [body[@"status"] respondsToSelector:@selector(integerValue)] ? [body[@"status"] integerValue] : 0;
+    if (failed) delay = 3.0;
+    else if (status == 429) delay = 5.0;
+    self.nextCanonicalAt = [NSDate timeIntervalSinceReferenceDate] + delay;
+}
+
+- (void)pumpCanonicalScheduler {
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (self.canonicalInFlight.length > 0) {
+        if (self.canonicalInFlightStartedAt > 0 && now - self.canonicalInFlightStartedAt > 10.0) {
+            self.canonicalInFlight = nil;
+            self.canonicalInFlightStartedAt = 0;
+            self.nextCanonicalAt = now + 1.0;
+        } else {
+            return;
+        }
+    }
+    if (self.canonicalQueue.count == 0 || now < self.nextCanonicalAt) return;
+
+    NSString *requestId = self.canonicalQueue.firstObject;
+    [self.canonicalQueue removeObjectAtIndex:0];
+    if (requestId.length == 0 || self.pendingCommands[requestId] == nil) return;
+    [self.canonicalQueue addObject:requestId];
+    id ticked = EvaluateSync(self.webView, BrokerCanonicalTickScript(requestId), 1.0, nil);
+    if ([ticked respondsToSelector:@selector(boolValue)] && [ticked boolValue]) {
+        self.canonicalInFlight = requestId;
+        self.canonicalInFlightStartedAt = now;
+        return;
+    }
+    self.nextCanonicalAt = now + 1.0;
+}
+
+- (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {
+    if (![message.body isKindOfClass:[NSDictionary class]]) return;
+    NSDictionary *body = (NSDictionary *)message.body;
+    NSString *requestId = [body[@"request_id"] isKindOfClass:[NSString class]] ? body[@"request_id"] : BrokerFrameRequestId(message.frameInfo);
+    if (requestId.length == 0) return;
+
+    if ([message.name isEqualToString:@"cwaStream"]) {
+        NSString *phase = [body[@"phase"] isKindOfClass:[NSString class]] ? body[@"phase"] : @"";
+        if ([phase isEqualToString:@"text"]) {
+            NSMutableDictionary *event = [body mutableCopy];
+            [event removeObjectForKey:@"phase"];
+            event[@"request_id"] = requestId;
+            PrintEvent(event);
+        } else if ([phase isEqualToString:@"started"]) {
+            PrintEvent(@{@"type":@"broker_stream_started",@"request_id":requestId,@"status":[body[@"status"] isKindOfClass:[NSNumber class]]?body[@"status"]:@0});
+        } else if ([phase isEqualToString:@"ended"] || [phase isEqualToString:@"done"]) {
+            PrintEvent(@{@"type":@"broker_stream_ended",@"request_id":requestId});
+        } else if ([phase isEqualToString:@"terminal"]) {
+            PrintEvent(@{@"type":@"broker_stream_terminal",@"request_id":requestId});
+        } else if ([phase isEqualToString:@"handoff"]) {
+            PrintEvent(@{@"type":@"broker_stream_handoff",@"request_id":requestId,@"topic_present":@([body[@"topic_id"] isKindOfClass:[NSString class]] && [body[@"topic_id"] length] > 0)});
+        } else if ([phase isEqualToString:@"resume"]) {
+            PrintEvent(@{@"type":@"broker_resume_token_observed",@"request_id":requestId,@"token_present":@([body[@"token"] isKindOfClass:[NSString class]] && [body[@"token"] length] > 0)});
+        }
+        return;
+    }
+
+    if (![message.name isEqualToString:@"cwaBroker"]) return;
+    NSString *phase = [body[@"phase"] isKindOfClass:[NSString class]] ? body[@"phase"] : @"";
+    if ([phase isEqualToString:@"frame_ready"]) {
+        NSDictionary *command = self.pendingCommands[requestId];
+        if (!command) return;
+        id started = EvaluateSync(self.webView, BrokerStartFrameScript(command), 1.5, nil);
+        if (![started respondsToSelector:@selector(boolValue)] || ![started boolValue]) {
+            PrintEvent(@{@"type":@"broker_error",@"request_id":requestId,@"error":@"BROKER_FRAME_START_FAILED"});
+            [self finishRequest:requestId];
+        }
+        return;
+    }
+    if ([phase isEqualToString:@"resume_http"]) {
+        BOOL ok = [body[@"ok"] boolValue];
+        NSInteger status = [body[@"status"] respondsToSelector:@selector(integerValue)] ? [body[@"status"] integerValue] : 0;
+        PrintEvent(@{
+            @"type":@"broker_resume_started",
+            @"request_id":requestId,
+            @"conversation_id":[body[@"conversation_id"] isKindOfClass:[NSString class]]?body[@"conversation_id"]:@"",
+            @"ok":@(ok),
+            @"status":[body[@"status"] isKindOfClass:[NSNumber class]]?body[@"status"]:@0
+        });
+        if (ok && status >= 200 && status < 300) [self enqueueCanonicalRequest:requestId];
+        return;
+    }
+    if ([phase isEqualToString:@"canonical_probe"]) {
+        [self completeCanonicalProbeForRequest:requestId body:body];
+        PrintEvent(@{
+            @"type":@"broker_canonical_probe",
+            @"request_id":requestId,
+            @"failed":@([body[@"failed"] boolValue]),
+            @"status":[body[@"status"] isKindOfClass:[NSNumber class]]?body[@"status"]:@0
+        });
+        return;
+    }
+    if ([phase isEqualToString:@"final"]) {
+        NSString *raw = [body[@"body"] isKindOfClass:[NSString class]] ? body[@"body"] : @"";
+        NSData *data = [raw dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+        NSString *encoded = [data base64EncodedStringWithOptions:0] ?: @"";
+        PrintEvent(@{
+            @"type":@"broker_final",
+            @"request_id":requestId,
+            @"conversation_id":[body[@"conversation_id"] isKindOfClass:[NSString class]]?body[@"conversation_id"]:@"",
+            @"status":[body[@"status"] isKindOfClass:[NSNumber class]]?body[@"status"]:@0,
+            @"canonical_body_base64":encoded
+        });
+        [self finishRequest:requestId];
+        return;
+    }
+    if ([phase isEqualToString:@"error"]) {
+        PrintEvent(@{
+            @"type":@"broker_error",
+            @"request_id":requestId,
+            @"error":[body[@"error"] isKindOfClass:[NSString class]]?body[@"error"]:@"BROKER_UNKNOWN_ERROR"
+        });
+        [self finishRequest:requestId];
+    }
+}
+
+@end
+
+static void HandleResumeBrokerCommand(WKResumeBrokerDelegate *delegate, NSDictionary *command) {
+    NSString *type = [command[@"type"] isKindOfClass:[NSString class]] ? command[@"type"] : @"";
+    NSString *requestId = [command[@"request_id"] isKindOfClass:[NSString class]] ? command[@"request_id"] : @"";
+    if ([type isEqualToString:@"shutdown"]) {
+        delegate.shouldExit = YES;
+        PrintEvent(@{@"type":@"broker_shutdown"});
+        return;
+    }
+    if ([type isEqualToString:@"cancel"]) {
+        if (requestId.length > 0) {
+            [delegate finishRequest:requestId];
+            PrintEvent(@{@"type":@"broker_cancelled",@"request_id":requestId});
+        }
+        return;
+    }
+    if (![type isEqualToString:@"start_resume"] || requestId.length == 0) {
+        PrintEvent(@{@"type":@"broker_error",@"request_id":requestId ?: @"",@"error":@"BROKER_COMMAND_INVALID"});
+        return;
+    }
+    NSString *conversationId = [command[@"conversation_id"] isKindOfClass:[NSString class]] ? command[@"conversation_id"] : @"";
+    NSString *resumeToken = [command[@"resume_token"] isKindOfClass:[NSString class]] ? command[@"resume_token"] : @"";
+    if (conversationId.length == 0 || resumeToken.length == 0 || delegate.pendingCommands[requestId] != nil) {
+        PrintEvent(@{@"type":@"broker_error",@"request_id":requestId,@"error":@"BROKER_RESUME_INPUT_INVALID"});
+        return;
+    }
+    delegate.pendingCommands[requestId] = command;
+    id created = EvaluateSync(delegate.webView, BrokerCreateFrameScript(requestId), 1.5, nil);
+    if (![created respondsToSelector:@selector(boolValue)] || ![created boolValue]) {
+        PrintEvent(@{@"type":@"broker_error",@"request_id":requestId,@"error":@"BROKER_FRAME_CREATE_FAILED"});
+        [delegate.pendingCommands removeObjectForKey:requestId];
+    }
+}
+
+static int RunResumeBroker(void) {
+    [NSApplication sharedApplication];
+    WKResumeBrokerDelegate *delegate = [WKResumeBrokerDelegate new];
+    WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
+    configuration.websiteDataStore = [WKWebsiteDataStore defaultDataStore];
+    [configuration.userContentController addScriptMessageHandler:delegate name:@"cwaBroker"];
+    [configuration.userContentController addScriptMessageHandler:delegate name:@"cwaStream"];
+    [configuration.userContentController addUserScript:[[WKUserScript alloc] initWithSource:PassiveStreamProbeScript() injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
+    [configuration.userContentController addUserScript:[[WKUserScript alloc] initWithSource:BrokerFrameScript() injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
+
+    WKWebView *webView = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 700) configuration:configuration];
+    NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect(-20000, -20000, 1000, 700) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+    window.contentView = webView;
+    [window orderFront:nil];
+    delegate.webView = webView;
+    webView.navigationDelegate = delegate;
+    [webView loadHTMLString:@"<!doctype html><meta charset='utf-8'><body>broker" baseURL:[NSURL URLWithString:@"https://chatgpt.com/"]];
+    NSDate *readyDeadline = [NSDate dateWithTimeIntervalSinceNow:10.0];
+    while (!delegate.navigationFinished && [readyDeadline timeIntervalSinceNow] > 0) RunLoopFor(0.02);
+    if (!delegate.navigationFinished) {
+        PrintEvent(@{@"type":@"broker_error",@"request_id":@"",@"error":@"BROKER_ORIGIN_NOT_READY"});
+        return 30;
+    }
+
+    NSFileHandle *input = [NSFileHandle fileHandleWithStandardInput];
+    __block NSMutableData *buffer = [NSMutableData data];
+    input.readabilityHandler = ^(NSFileHandle *handle) {
+        NSData *chunk = [handle availableData];
+        if (chunk.length == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{ delegate.shouldExit = YES; });
+            return;
+        }
+        @synchronized (buffer) {
+            [buffer appendData:chunk];
+            while (buffer.length > 0) {
+                const uint8_t *bytes = buffer.bytes;
+                NSUInteger newline = NSNotFound;
+                for (NSUInteger idx = 0; idx < buffer.length; idx++) {
+                    if (bytes[idx] == '\n') { newline = idx; break; }
+                }
+                if (newline == NSNotFound) break;
+                NSData *line = [buffer subdataWithRange:NSMakeRange(0, newline)];
+                [buffer replaceBytesInRange:NSMakeRange(0, newline + 1) withBytes:NULL length:0];
+                if (line.length == 0) continue;
+                id parsed = [NSJSONSerialization JSONObjectWithData:line options:0 error:nil];
+                if (![parsed isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *command = (NSDictionary *)parsed;
+                dispatch_async(dispatch_get_main_queue(), ^{ HandleResumeBrokerCommand(delegate, command); });
+            }
+        }
+    };
+
+    PrintEvent(@{@"type":@"broker_ready"});
+    while (!delegate.shouldExit) {
+        RunLoopFor(0.05);
+        [delegate pumpCanonicalScheduler];
+    }
+    input.readabilityHandler = nil;
+    return 0;
+}
+
 static NSString *ScrollBottomScript(void) {
     return @"(()=>{"
             "const root=document.scrollingElement||document.documentElement||document.body;"
@@ -278,7 +593,7 @@ static NSString *ScrollBottomScript(void) {
 
 static NSString *ReadinessScript(void) {
     return @"(()=>{"
-            "const composer=document.querySelector('#prompt-textarea')||document.querySelector('textarea[aria-label=\"Chat with ChatGPT\"]');"
+            "const editor=document.querySelector('div.ProseMirror[contenteditable=\"true\"]')||document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"]');const fallback=document.querySelector('#prompt-textarea')||document.querySelector('textarea[aria-label=\"Chat with ChatGPT\"]');const composer=editor||fallback;const composerFallback=!!(composer&&composer===fallback&&/fallbackTextarea/i.test(String(composer.className||'')));const composerReady=!!composer&&!composerFallback;"
             "const composerTag=composer?composer.tagName:null;const composerContentEditable=composer?composer.getAttribute('contenteditable'):null;const composerClass=composer?(composer.className||'').toString().slice(0,200):null;"
             "const send=document.querySelector('button[data-testid=\"send-button\"]')||[...document.querySelectorAll('button')].find(b=>/send prompt/i.test(b.getAttribute('aria-label')||''));"
             "const stop=document.querySelector('button[data-testid=\"stop-button\"]')||[...document.querySelectorAll('button')].find(b=>/stop answering/i.test(b.getAttribute('aria-label')||''));"
@@ -288,7 +603,7 @@ static NSString *ReadinessScript(void) {
             "let selectedMode=null;const modeCandidates=[];"
             "if(composer){const cr=composer.getBoundingClientRect();for(const e of document.querySelectorAll('button,[role=button],span,div')){if(e.children.length)continue;const t=(e.textContent||'').trim();if(!/^(Instant|Medium|High)$/i.test(t))continue;const r=e.getBoundingClientRect();if(!r.width||!r.height)continue;const d=Math.hypot((r.left+r.width/2)-(cr.left+cr.width/2),(r.top+r.height/2)-(cr.top+cr.height/2));modeCandidates.push({text:t,distance:Math.round(d)});}modeCandidates.sort((a,b)=>a.distance-b.distance);if(modeCandidates.length&&modeCandidates[0].distance<700)selectedMode=modeCandidates[0].text;}"
             "const bodyTail=body.slice(-1200);if(!selectedMode){const lines=bodyTail.split(/\\n+/).map(x=>x.trim()).filter(x=>/^(Instant|Medium|High)$/i.test(x));if(lines.length)selectedMode=lines[lines.length-1];}"
-            "return JSON.stringify({url:location.href,title:document.title,composer:!!composer,composerTag,composerContentEditable,composerClass,send:!!send&&!send.disabled,stop:!!stop,latestMessageId,selectedMode,modeCandidates:modeCandidates.slice(0,8),login:/log in|sign up/i.test(body.slice(0,4000)),bodyTail});"
+            "return JSON.stringify({url:location.href,title:document.title,composer:!!composer,composerReady,composerFallback,composerTag,composerContentEditable,composerClass,send:!!send&&!send.disabled&&send.getAttribute('aria-disabled')!=='true',stop:!!stop,latestMessageId,selectedMode,modeCandidates:modeCandidates.slice(0,8),login:/log in|sign up/i.test(body.slice(0,4000)),bodyTail});"
             "})()";
 }
 
@@ -296,7 +611,7 @@ static NSString *FillScript(NSString *prompt) {
     NSString *literal = JSONStringLiteral(prompt ?: @"");
     return [NSString stringWithFormat:
             @"(()=>{"
-              "const e=document.querySelector('#prompt-textarea')||document.querySelector('textarea[aria-label=\"Chat with ChatGPT\"]');"
+              "const e=document.querySelector('div.ProseMirror[contenteditable=\"true\"]')||document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"]')||document.querySelector('#prompt-textarea')||document.querySelector('textarea[aria-label=\"Chat with ChatGPT\"]');"
               "if(!e)return JSON.stringify({ok:false,reason:'no_composer'});"
               "const text=%@;e.focus();"
               "if(e.tagName==='TEXTAREA'){"
@@ -317,6 +632,42 @@ static NSString *ClickFileScript(void) {
             "if(!i)return JSON.stringify({ok:false,reason:'no_file_input'});i.click();"
             "return JSON.stringify({ok:true,id:i.id||null,accept:i.accept||null});"
             "})()";
+}
+
+static NSString *AttachmentMimeType(NSString *path) {
+    NSString *ext = path.pathExtension.lowercaseString;
+    if ([ext isEqualToString:@"png"]) return @"image/png";
+    if ([ext isEqualToString:@"jpg"] || [ext isEqualToString:@"jpeg"]) return @"image/jpeg";
+    if ([ext isEqualToString:@"gif"]) return @"image/gif";
+    if ([ext isEqualToString:@"webp"]) return @"image/webp";
+    if ([ext isEqualToString:@"heic"] || [ext isEqualToString:@"heif"]) return @"image/heic";
+    if ([ext isEqualToString:@"pdf"]) return @"application/pdf";
+    if ([ext isEqualToString:@"txt"] || [ext isEqualToString:@"md"]) return @"text/plain";
+    if ([ext isEqualToString:@"json"]) return @"application/json";
+    return @"application/octet-stream";
+}
+
+static NSString *InjectAttachmentFilesScript(NSArray<NSString *> *paths) {
+    NSMutableArray *files = [NSMutableArray array];
+    for (NSString *path in paths ?: @[]) {
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data) return nil;
+        [files addObject:@{
+            @"name":path.lastPathComponent ?: @"attachment",
+            @"type":AttachmentMimeType(path),
+            @"base64":[data base64EncodedStringWithOptions:0] ?: @""
+        }];
+    }
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:files options:0 error:nil];
+    NSString *json = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+    if (json.length == 0) return nil;
+    return [NSString stringWithFormat:
+            @"(()=>{const specs=%@;const i=document.querySelector('#upload-photos')||document.querySelector('input[type=file][accept*=\"image\"]')||document.querySelector('input[type=file]');"
+              "if(!i)return JSON.stringify({ok:false,reason:'no_file_input'});if(typeof DataTransfer!=='function'||typeof File!=='function')return JSON.stringify({ok:false,reason:'file_api_unavailable'});"
+              "const dt=new DataTransfer();for(const s of specs){const raw=atob(s.base64||'');const bytes=new Uint8Array(raw.length);for(let n=0;n<raw.length;n++)bytes[n]=raw.charCodeAt(n);dt.items.add(new File([bytes],s.name||'attachment',{type:s.type||'application/octet-stream'}));}"
+              "try{i.files=dt.files}catch(_){const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'files')?.set;if(!setter)return JSON.stringify({ok:false,reason:'files_setter_unavailable'});setter.call(i,dt.files);}"
+              "const assignedCount=i.files?i.files.length:0;i.dispatchEvent(new Event('input',{bubbles:true}));i.dispatchEvent(new Event('change',{bubbles:true}));const afterCount=i.files?i.files.length:0;return JSON.stringify({ok:assignedCount===specs.length,count:assignedCount,afterCount});})()",
+            json];
 }
 
 static NSString *SendScript(void) {
@@ -488,6 +839,7 @@ static BOOL ModeMatches(NSDictionary *snapshot, NSString *requested) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSArray<NSString *> *args = [[NSProcessInfo processInfo] arguments];
+        if (HasArg(args, @"--resume-broker")) return RunResumeBroker();
         NSString *urlString = ArgValue(args, @"--url", @"https://chatgpt.com/");
         NSString *prompt64 = ArgValue(args, @"--prompt-base64", @"");
         NSString *prompt = DecodeBase64(prompt64);
@@ -787,7 +1139,7 @@ int main(int argc, const char *argv[]) {
                         NSString *latestMessageId = [snapshot[@"latestMessageId"] isKindOfClass:[NSString class]] ? snapshot[@"latestMessageId"] : nil;
                         parentReady = latestMessageId != nil && [latestMessageId isEqualToString:expectedCurrentNode];
                     }
-                    if ([snapshot[@"composer"] boolValue]
+                    if ([snapshot[@"composerReady"] boolValue]
                         && parentReady
                         && (profile.length == 0 || ModeMatches(snapshot, profile))) {
                         break;
@@ -856,7 +1208,7 @@ int main(int argc, const char *argv[]) {
             return stopped ? 0 : 6;
         }
 
-        if (![readySnapshot[@"composer"] boolValue]) {
+        if (![readySnapshot[@"composerReady"] boolValue]) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_COMPOSER_NOT_READY",@"final_url":webView.URL.absoluteString ?: @""});
             return 7;
         }
@@ -883,8 +1235,17 @@ int main(int argc, const char *argv[]) {
             }
             RunLoopFor(2.0);
             if (delegate.chooserCount == 0) {
-                PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_FILE_CHOOSER_NOT_INVOKED"});
-                return 10;
+                NSString *injectScript = InjectAttachmentFilesScript(attachments);
+                NSDictionary *injected = injectScript.length > 0
+                    ? ParseJSONResult(EvaluateSync(webView, injectScript, 8.0, nil))
+                    : nil;
+                NSInteger injectedCount = [injected[@"count"] respondsToSelector:@selector(integerValue)] ? [injected[@"count"] integerValue] : 0;
+                if (![injected[@"ok"] boolValue] || injectedCount != attachments.count) {
+                    NSString *reason = [injected[@"reason"] isKindOfClass:[NSString class]] ? injected[@"reason"] : @"count_mismatch";
+                    PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_FILE_INJECTION_FAILED",@"detail":reason});
+                    return 10;
+                }
+                RunLoopFor(2.0);
             }
         }
 

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import inspect
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .browser_native_provider import BrowserNativeTurnProvider
+from .canonical_product_observation_gate_pr9_3 import (
+    _gate_send_browser_native,
+    _gate_wait_for_new_final_assistant,
+)
 from .exceptions import ConversationTimeoutError, RequestError
 from .messages import _chat_message_from_node, _current_branch_nodes
 from .product_media import current_browser_owned_attachment_paths
@@ -42,7 +46,9 @@ class BrowserNativeSubmission:
     final_response: ChatResponse | None = None
 
 
-def set_browser_native_turn_provider(self: Any, provider: BrowserNativeTurnProvider | None) -> None:
+def set_browser_native_turn_provider(
+    self: Any, provider: BrowserNativeTurnProvider | None
+) -> None:
     if provider is not None and not callable(getattr(provider, "send_text", None)):
         raise TypeError("provider must expose a callable send_text() or be None")
     self._browser_native_turn_provider = provider
@@ -99,6 +105,7 @@ def _assistant_candidates_from_payload(
     return candidates
 
 
+@_gate_wait_for_new_final_assistant
 def _wait_for_new_final_assistant(
     self: Any,
     conversation_id: str,
@@ -245,7 +252,11 @@ def submit_browser_native(
     self: Any,
     prompt: str,
     *,
-    conversation: ConversationRef | ChatConversation | dict[str, Any] | str | None = None,
+    conversation: ConversationRef
+    | ChatConversation
+    | dict[str, Any]
+    | str
+    | None = None,
     timeout: float = 150.0,
     poll_interval: float = 0.5,
     on_token: Callable[[str], None] | None = None,
@@ -270,7 +281,9 @@ def submit_browser_native(
         if scoped_paths is not None:
             attachment_paths = scoped_paths
     normalized_attachment_paths = tuple(attachment_paths or ())
-    if normalized_attachment_paths and not _callable_accepts_attachment_paths(provider.send_text):
+    if normalized_attachment_paths and not _callable_accepts_attachment_paths(
+        provider.send_text
+    ):
         raise RequestError(
             "BROWSER_NATIVE_RICH_INPUT_PROVIDER_UNSUPPORTED",
             request_stage="browser_native_turn_preflight",
@@ -361,7 +374,9 @@ def submit_browser_native(
                 **attachment_kwargs,
             )
     elif streaming_requested and callable(stream_send):
-        if normalized_attachment_paths and not _callable_accepts_attachment_paths(stream_send):
+        if normalized_attachment_paths and not _callable_accepts_attachment_paths(
+            stream_send
+        ):
             raise RequestError(
                 "BROWSER_NATIVE_RICH_INPUT_STREAM_PROVIDER_UNSUPPORTED",
                 request_stage="browser_native_turn_preflight",
@@ -459,13 +474,15 @@ def await_browser_native_final(
         1.0,
         submission.timeout - (time.monotonic() - submission.started_monotonic),
     )
-    final_message, canonical_payload, canonical_payload_read_count = _wait_for_new_final_assistant(
-        self,
-        turn.conversation_id,
-        baseline_assistant_ids=submission.baseline_assistant_ids,
-        timeout=remaining,
-        interval=submission.poll_interval,
-        include_readback=True,
+    final_message, canonical_payload, canonical_payload_read_count = (
+        _wait_for_new_final_assistant(
+            self,
+            turn.conversation_id,
+            baseline_assistant_ids=submission.baseline_assistant_ids,
+            timeout=remaining,
+            interval=submission.poll_interval,
+            include_readback=True,
+        )
     )
 
     if canonical_payload is not None:
@@ -540,11 +557,16 @@ def await_browser_native_final(
     return response
 
 
+@_gate_send_browser_native
 def send_browser_native(
     self: Any,
     prompt: str,
     *,
-    conversation: ConversationRef | ChatConversation | dict[str, Any] | str | None = None,
+    conversation: ConversationRef
+    | ChatConversation
+    | dict[str, Any]
+    | str
+    | None = None,
     timeout: float = 150.0,
     poll_interval: float = 0.5,
     on_token: Callable[[str], None] | None = None,

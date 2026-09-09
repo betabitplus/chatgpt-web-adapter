@@ -133,12 +133,7 @@ def test_two_phase_finalize_uses_current_prepare_provider_bundle_only() -> None:
     assert bundle.turnstile_token == "current-turnstile-token"
     assert bundle.expires_monotonic > bundle.acquired_monotonic
 
-    rendered = (
-        repr(bundle)
-        + repr(context)
-        + repr(client.traces)
-        + repr(client.events)
-    )
+    rendered = repr(bundle) + repr(context) + repr(client.traces) + repr(client.events)
     for secret in (
         "secret-prepare-token",
         "secret-turnstile-dx",
@@ -199,7 +194,7 @@ def test_provider_receives_exact_prepare_input(monkeypatch) -> None:
     client.auth.proof_token = ["browser-proof-material"]
     client.expected_prepare_input = "current-prepare-input"
     monkeypatch.setattr(
-        "chatgpt_web_adapter.sentinel_transaction.client_mod._get_requirements_token",
+        "chatgpt_web_adapter.sentinel_transaction._get_requirements_token",
         lambda proof: "current-prepare-input",
     )
     client.install_current_provider()

@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Callable, Sequence
 
-from .client import DEFAULT_MODEL
-from .types import AttachedConversation, ChatConversation, ChatResponse, ConversationRef, MediaItem
+from .model_registry import DEFAULT_MODEL
+from .types import (
+    AttachedConversation,
+    ChatConversation,
+    ChatResponse,
+    ConversationRef,
+    MediaItem,
+)
 
 
 def _resolve_send_model(
@@ -30,7 +36,11 @@ def _resolve_reasoning_effort(
         return reasoning_effort
     if model is not None:
         return None
-    if preserve_model and attached.detected_model and attached.detected_reasoning_effort:
+    if (
+        preserve_model
+        and attached.detected_model
+        and attached.detected_reasoning_effort
+    ):
         return attached.detected_reasoning_effort
     return None
 

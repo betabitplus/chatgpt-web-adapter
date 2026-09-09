@@ -5,9 +5,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import client as client_mod
 from .auth import CHAT_URL
 from .exceptions import RequestError
+from .legacy_client_core import _get_requirements_token
 from .sentinel_requirements import (
     OBSERVED_PREPARE_RESPONSE_KEYS,
     OBSERVED_PROOFOFWORK_KEYS,
@@ -196,7 +196,7 @@ def _derive_prepare_input(client: Any) -> str | None:
     if not isinstance(proof_token, list):
         return None
     try:
-        return client_mod._get_requirements_token(proof_token)
+        return _get_requirements_token(proof_token)
     except Exception as error:
         raise RequestError(
             "SENTINEL_PREPARE_INPUT_DERIVATION_FAILED: could not derive current "
@@ -281,7 +281,10 @@ def _obtain_current_prepare_evidence(
             endpoint=SENTINEL_FINALIZE_PATH,
             request_stage="sentinel_challenge_binding",
         )
-    if not isinstance(evidence.turnstile_token, str) or not evidence.turnstile_token.strip():
+    if (
+        not isinstance(evidence.turnstile_token, str)
+        or not evidence.turnstile_token.strip()
+    ):
         raise RequestError(
             "SENTINEL_TURNSTILE_EVIDENCE_REQUIRED: current-prepare provider did "
             "not return Turnstile evidence",
@@ -457,9 +460,7 @@ def _validate_finalize_response(
         )
     return (
         token.strip(),
-        acquired_monotonic
-        + effective_ttl
-        - SENTINEL_EXPIRY_SAFETY_MARGIN_SECONDS,
+        acquired_monotonic + effective_ttl - SENTINEL_EXPIRY_SAFETY_MARGIN_SECONDS,
     )
 
 
@@ -493,7 +494,9 @@ def acquire_finalized_sentinel_bundle(
             prepare_payload,
             build_sentinel_prepare_headers(client),
         )
-    response, prepare_token = _validate_prepare_response(int(prepare_status), prepare_data)
+    response, prepare_token = _validate_prepare_response(
+        int(prepare_status), prepare_data
+    )
     turnstile = response["turnstile"]
     proofofwork = response["proofofwork"]
     so = response["so"]

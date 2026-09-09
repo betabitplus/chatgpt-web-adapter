@@ -5,14 +5,20 @@ import uuid
 from typing import Any, Callable, Sequence
 
 from .auth import CHAT_URL
-from .client import (
+from .conversation_prepare import prepare_text_turn
+from .exceptions import RequestError
+from .legacy_client_core import (
     DEFAULT_STREAM_RECOVERY_POLL_INTERVAL_SECONDS,
     DEFAULT_STREAM_RECOVERY_POLL_TIMEOUT_SECONDS,
 )
-from .conversation_prepare import prepare_text_turn
-from .exceptions import RequestError
 from .sentinel_bundle import start_finalized_sentinel_bundle_refill
-from .types import ChatConversation, ChatMetrics, ChatRequestDiagnostics, ChatResponse, MediaItem
+from .types import (
+    ChatConversation,
+    ChatMetrics,
+    ChatRequestDiagnostics,
+    ChatResponse,
+    MediaItem,
+)
 
 CONVERSATION_PATH = "/backend-api/f/conversation"
 _SAFE_STREAM_DIAGNOSTIC_KEYS = (
@@ -89,10 +95,9 @@ def send_existing_text_prepared(
         raise ValueError("conversation.conversation_id is required")
     conversation_id = conversation_id.strip()
 
-    parent_message_id = (
-        conversation_dict.get("parent_message_id")
-        or conversation_dict.get("message_id")
-    )
+    parent_message_id = conversation_dict.get(
+        "parent_message_id"
+    ) or conversation_dict.get("message_id")
     if not isinstance(parent_message_id, str) or not parent_message_id.strip():
         raise ValueError("conversation parent/message id is required")
     parent_message_id = parent_message_id.strip()
@@ -163,7 +168,9 @@ def send_existing_text_prepared(
 
     try:
         requirements, proof_header = self._get_ready_requirements()
-        chat_token = requirements.get("token") if isinstance(requirements, dict) else None
+        chat_token = (
+            requirements.get("token") if isinstance(requirements, dict) else None
+        )
         if not isinstance(chat_token, str) or not chat_token:
             raise RequestError("chat-requirements token is missing")
 
@@ -229,7 +236,10 @@ def send_existing_text_prepared(
         )
 
         def capture_parse_event(event_payload: Any, state: dict[str, Any]):
-            if isinstance(event_payload, dict) and event_payload.get("type") == "stream_handoff":
+            if (
+                isinstance(event_payload, dict)
+                and event_payload.get("type") == "stream_handoff"
+            ):
                 stream_diagnostics["handoff_seen"] = True
             tokens, maybe_title = original_parse_event(event_payload, state)
             _copy_safe_stream_diagnostics(state, stream_diagnostics)
@@ -247,11 +257,13 @@ def send_existing_text_prepared(
 
         self._parse_event = capture_parse_event
         try:
-            observed_conversation_id, observed_message_id, text = self._stream_backend_payload(
-                payload,
-                headers,
-                on_token=on_token,
-                on_event=forward_non_token_stream_event,
+            observed_conversation_id, observed_message_id, text = (
+                self._stream_backend_payload(
+                    payload,
+                    headers,
+                    on_token=on_token,
+                    on_event=forward_non_token_stream_event,
+                )
             )
         finally:
             if had_instance_parse_event:
@@ -268,22 +280,29 @@ def send_existing_text_prepared(
         handoff_seen = bool(stream_diagnostics.get("handoff_seen"))
 
         effective_conversation_id = observed_conversation_id or conversation_id
-        if handoff_seen or not text or not observed_message_id or observed_message_id == parent_message_id:
+        if (
+            handoff_seen
+            or not text
+            or not observed_message_id
+            or observed_message_id == parent_message_id
+        ):
             streamed_prefix = text
-            message, polled_text, _polled_payload = self._poll_conversation_after_prepare(
-                effective_conversation_id,
-                previous_message_id=parent_message_id,
-                timeout=max(
-                    DEFAULT_STREAM_RECOVERY_POLL_TIMEOUT_SECONDS,
-                    float(self.timeout),
-                ),
-                interval=DEFAULT_STREAM_RECOVERY_POLL_INTERVAL_SECONDS,
-                on_token=None if streamed_prefix else on_token,
-                on_event=on_event,
-                reason="prepared_text_send_handoff_recovery"
-                if handoff_seen
-                else "prepared_text_send_recovery",
-                allow_global_fallback=False,
+            message, polled_text, _polled_payload = (
+                self._poll_conversation_after_prepare(
+                    effective_conversation_id,
+                    previous_message_id=parent_message_id,
+                    timeout=max(
+                        DEFAULT_STREAM_RECOVERY_POLL_TIMEOUT_SECONDS,
+                        float(self.timeout),
+                    ),
+                    interval=DEFAULT_STREAM_RECOVERY_POLL_INTERVAL_SECONDS,
+                    on_token=None if streamed_prefix else on_token,
+                    on_event=on_event,
+                    reason="prepared_text_send_handoff_recovery"
+                    if handoff_seen
+                    else "prepared_text_send_recovery",
+                    allow_global_fallback=False,
+                )
             )
             if handoff_seen and not isinstance(message, dict):
                 raise RequestError(
@@ -312,7 +331,9 @@ def send_existing_text_prepared(
                 if diagnostics.get("observed_model") is not None:
                     observed_model = diagnostics.get("observed_model")
                 if diagnostics.get("observed_reasoning_effort") is not None:
-                    observed_reasoning_effort = diagnostics.get("observed_reasoning_effort")
+                    observed_reasoning_effort = diagnostics.get(
+                        "observed_reasoning_effort"
+                    )
         observed_conversation_id = effective_conversation_id
     finally:
         _clear_prefetched_requirements(self)
@@ -338,7 +359,9 @@ def send_existing_text_prepared(
         ),
         metrics=ChatMetrics(total=total_latency),
         request=ChatRequestDiagnostics(
-            requested_model=model.strip() if isinstance(model, str) and model.strip() else None,
+            requested_model=model.strip()
+            if isinstance(model, str) and model.strip()
+            else None,
             requested_reasoning_effort=reasoning_effort.strip()
             if isinstance(reasoning_effort, str) and reasoning_effort.strip()
             else None,

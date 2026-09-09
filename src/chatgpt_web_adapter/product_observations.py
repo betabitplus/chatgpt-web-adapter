@@ -434,7 +434,9 @@ class ProductObservationCollector:
         self._source_url_by_id[source_id] = url
         return self._append(observation)
 
-    def _consume_citation(self, event: dict[str, Any]) -> ProductCitationObservation | None:
+    def _consume_citation(
+        self, event: dict[str, Any]
+    ) -> ProductCitationObservation | None:
         observation_id = _optional_text(event.get("observation_id"))
         citation_id = _optional_text(event.get("citation_id"))
         source_id = _optional_text(event.get("source_id"))

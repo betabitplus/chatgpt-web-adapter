@@ -40,7 +40,10 @@ def test_canonical_observation_gates_are_statically_composed() -> None:
         browser_owned_write_runtime.send_browser_native
         is browser_native_client.send_browser_native
     )
-    assert ChatGPTWebClient.send_browser_native is browser_native_client.send_browser_native
+    assert (
+        ChatGPTWebClient.send_browser_native
+        is browser_native_client.send_browser_native
+    )
 
 
 def test_legacy_installer_is_identity_stable_after_static_composition() -> None:
@@ -51,7 +54,9 @@ def test_legacy_installer_is_identity_stable_after_static_composition() -> None:
     assert _topology_snapshot() == before
 
 
-def test_observed_execution_does_not_install_or_replace_browser_native_functions() -> None:
+def test_observed_execution_does_not_install_or_replace_browser_native_functions() -> (
+    None
+):
     before = _topology_snapshot()
 
     def fake_send_text_observed(self, text, *args, **kwargs):

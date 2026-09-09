@@ -140,11 +140,13 @@ class BrowserlessRequestTransport(_core.BrowserlessRequestTransport):
                 )
 
             remaining = max(0.0, deadline - monotonic())
-            canonical_status, canonical_message, canonical_text = self._canonical_finalize(
-                response,
-                previous_message_id=previous_message_id,
-                timeout=remaining,
-                poll_interval=poll_interval,
+            canonical_status, canonical_message, canonical_text = (
+                self._canonical_finalize(
+                    response,
+                    previous_message_id=previous_message_id,
+                    timeout=remaining,
+                    poll_interval=poll_interval,
+                )
             )
             reconciliation = accumulator.reconcile(canonical_text)
 

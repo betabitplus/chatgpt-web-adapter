@@ -133,12 +133,7 @@ def test_two_phase_finalize_uses_current_prepare_provider_bundle_only() -> None:
     assert bundle.turnstile_token == "current-turnstile-token"
     assert bundle.expires_monotonic > bundle.acquired_monotonic
 
-    rendered = (
-        repr(bundle)
-        + repr(context)
-        + repr(client.traces)
-        + repr(client.events)
-    )
+    rendered = repr(bundle) + repr(context) + repr(client.traces) + repr(client.events)
     for secret in (
         "secret-prepare-token",
         "secret-turnstile-dx",

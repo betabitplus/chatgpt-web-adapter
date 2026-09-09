@@ -199,7 +199,7 @@ def test_provider_receives_exact_prepare_input(monkeypatch) -> None:
     client.auth.proof_token = ["browser-proof-material"]
     client.expected_prepare_input = "current-prepare-input"
     monkeypatch.setattr(
-        "chatgpt_web_adapter.sentinel_transaction.client_mod._get_requirements_token",
+        "chatgpt_web_adapter.sentinel_transaction._get_requirements_token",
         lambda proof: "current-prepare-input",
     )
     client.install_current_provider()

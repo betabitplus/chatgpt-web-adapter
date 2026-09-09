@@ -21,15 +21,11 @@ def gate_product_runtime_send_text_observed(
     privacy-filtered values. A transport cannot acquire typed-observation authority
     by pre-populating ``ProductRuntimeExecution.observations`` itself.
 
-    The function is intentionally side-effect-free at import/composition time.
+    The function is side-effect-free at import, composition, and execution time.
     Historical activity precedence, browser-owned capability graduation, submission
-    lifecycle, and UI-liveness ownership now live in their intrinsic modules/classes
-    rather than being installed as a consequence of importing this gate.
-
-    Canonical source/citation observation still uses the historical runtime-time
-    compatibility gate. That gate is installed only when an observed execution is
-    actually requested; eliminating that call-time patch is outside PR12.3's
-    import-time mutation scope.
+    lifecycle, UI-liveness ownership, and canonical source/citation observation
+    are composed in their intrinsic modules/classes rather than installed as a
+    consequence of importing or invoking this gate.
     """
 
     if getattr(send_text_observed, _PR93_PRODUCT_OBSERVATION_GATE_MARKER, False):
@@ -42,12 +38,6 @@ def gate_product_runtime_send_text_observed(
         *args: Any,
         **kwargs: Any,
     ) -> ProductRuntimeExecution:
-        from .canonical_product_observation_gate_pr9_3 import (
-            install_canonical_product_observation_gate,
-        )
-
-        install_canonical_product_observation_gate()
-
         caller_on_event = kwargs.get("on_event")
         collector = ProductArtifactObservationCollector()
 

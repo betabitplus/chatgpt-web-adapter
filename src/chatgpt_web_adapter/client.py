@@ -122,7 +122,7 @@ def _remap_legacy_endpoint(url: str) -> str:
         if url == historical:
             return current
         if url.startswith(f"{historical}/") or url.startswith(f"{historical}?"):
-            return f"{current}{url[len(historical):]}"
+            return f"{current}{url[len(historical) :]}"
 
     marker = "{conversation_id}"
     historical_template = _core.CHAT_CONVERSATION_URL
@@ -131,7 +131,7 @@ def _remap_legacy_endpoint(url: str) -> str:
         historical_prefix = historical_template.split(marker, 1)[0]
         current_prefix = current_template.split(marker, 1)[0]
         if url.startswith(historical_prefix):
-            return f"{current_prefix}{url[len(historical_prefix):]}"
+            return f"{current_prefix}{url[len(historical_prefix) :]}"
 
     return url
 

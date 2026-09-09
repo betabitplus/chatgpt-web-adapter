@@ -93,6 +93,48 @@ DEFAULT_STREAM_RECOVERY_POLL_INTERVAL_SECONDS = (
     _core.DEFAULT_STREAM_RECOVERY_POLL_INTERVAL_SECONDS
 )
 
+# Keep historical endpoint seams owned by the public client module. The frozen
+# core retains its original values; composed calls resolve any patched endpoint
+# at the curl-command boundary without mutating shared core globals.
+CHAT_REQUIREMENTS_URL = _core.CHAT_REQUIREMENTS_URL
+CHAT_BACKEND_URL = _core.CHAT_BACKEND_URL
+CHAT_CONVERSATION_PREPARE_URL = _core.CHAT_CONVERSATION_PREPARE_URL
+CHAT_CONVERSATION_URL = _core.CHAT_CONVERSATION_URL
+CHAT_CONVERSATIONS_URL = _core.CHAT_CONVERSATIONS_URL
+CHAT_FILES_URL = _core.CHAT_FILES_URL
+CELSIUS_WS_USER_URL = _core.CELSIUS_WS_USER_URL
+
+
+def _remap_legacy_endpoint(url: str) -> str:
+    for historical, current in (
+        (_core.CHAT_REQUIREMENTS_URL, CHAT_REQUIREMENTS_URL),
+        (_core.CHAT_BACKEND_URL, CHAT_BACKEND_URL),
+        (_core.CHAT_CONVERSATION_PREPARE_URL, CHAT_CONVERSATION_PREPARE_URL),
+        (_core.CELSIUS_WS_USER_URL, CELSIUS_WS_USER_URL),
+    ):
+        if url == historical:
+            return current
+
+    for historical, current in (
+        (_core.CHAT_CONVERSATIONS_URL, CHAT_CONVERSATIONS_URL),
+        (_core.CHAT_FILES_URL, CHAT_FILES_URL),
+    ):
+        if url == historical:
+            return current
+        if url.startswith(f"{historical}/") or url.startswith(f"{historical}?"):
+            return f"{current}{url[len(historical):]}"
+
+    marker = "{conversation_id}"
+    historical_template = _core.CHAT_CONVERSATION_URL
+    current_template = CHAT_CONVERSATION_URL
+    if marker in historical_template and marker in current_template:
+        historical_prefix = historical_template.split(marker, 1)[0]
+        current_prefix = current_template.split(marker, 1)[0]
+        if url.startswith(historical_prefix):
+            return f"{current_prefix}{url[len(historical_prefix):]}"
+
+    return url
+
 
 def __getattr__(name: str) -> Any:
     """Delegate untouched legacy module attributes to the frozen core.
@@ -118,6 +160,28 @@ class ChatGPTWebClient(_core.ChatGPTWebClient):
     _poll_conversation_after_prepare = gate_browserless_poll_deadline(
         _core.ChatGPTWebClient._poll_conversation_after_prepare
     )
+
+    def _build_curl_command(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        header_path: str,
+        body_path: str | None = None,
+        *,
+        no_buffer: bool = False,
+        follow_redirects: bool = False,
+    ) -> list[str]:
+        return _core.ChatGPTWebClient._build_curl_command(
+            self,
+            method,
+            _remap_legacy_endpoint(url),
+            headers,
+            header_path,
+            body_path,
+            no_buffer=no_buffer,
+            follow_redirects=follow_redirects,
+        )
 
     _get_ready_requirements = _gate_prepared_get_ready_requirements(
         _gate_get_ready_requirements(_core.ChatGPTWebClient._get_ready_requirements)

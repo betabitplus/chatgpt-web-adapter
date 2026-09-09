@@ -465,14 +465,18 @@ def test_unknown_write_outcome_requires_reconciliation_and_is_not_retried() -> N
 
 
 def test_canonical_finality_failure_requires_reconciliation() -> None:
-    client = _DirectClient(status="running")
+    client = _DirectClient()
 
-    with pytest.raises(BrowserlessRequestTransportError) as captured:
-        BrowserlessRequestTransport(client).send_text(
-            "hello",
-            timeout=0.01,
-            poll_interval=0.005,
-        )
+    def fail_canonical_status(_conversation):
+        raise RuntimeError("canonical status unavailable")
+
+    client.get_status = fail_canonical_status
+
+    with pytest.raises(
+        BrowserlessRequestTransportError,
+        match="canonical status read failed after browserless write",
+    ) as captured:
+        BrowserlessRequestTransport(client).send_text("hello")
 
     assert captured.value.request_stage == "canonical_reconciliation"
     assert captured.value.write_may_have_been_submitted is True

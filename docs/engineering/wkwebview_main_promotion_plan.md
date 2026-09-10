@@ -62,9 +62,9 @@ Required invariants:
 |---|---|---|---|---|
 | WK-MAIN-001 | P0 | LIVE PROVEN | Remove turn data from process argv | Prompt, conversation identifiers where avoidable, attachment descriptors, model/profile data and other per-turn payload move to stdin or inherited/private IPC. `ps` must not expose prompt text. |
 | WK-MAIN-002 | P0 | LIVE PROVEN | Remove named resume-secret handoff file | Replace `cwa-wk-resume-*` file transport with an inherited pipe/FD or unlink-after-open equivalent. Abrupt process death must not leave resume credentials on disk. |
-| WK-MAIN-003 | P0 | OPEN | Refactor `wkwebview_provider.py` orchestration | Break the ~2.1k-line provider into focused components. Provider becomes orchestration rather than build/process/curl/WS/finality/attachment/legacy implementation all at once. |
-| WK-MAIN-004 | P0 | OPEN | Replace private `ChatGPTWebClient` coupling | Introduce a small typed/internal transport contract instead of reaching into `_build_headers`, `_capture_resume_token_diagnostics`, `_stream_handoff_via_ws_topic`, `_probe_celsius_ws_user`, `_upload_media_files`. |
-| WK-MAIN-005 | P0 | OPEN | Remove/isolate superseded resume implementations | Shared-WK broker and old WK resume paths must not remain interleaved with the new primary hot path. Keep only a deliberate compatibility fallback if still required. |
+| WK-MAIN-003 | P0 | IN PROGRESS | Refactor `wkwebview_provider.py` orchestration | Provider reduced from >2.1k lines to ~1.4k by extracting native helper lifecycle and lightweight transport. Continue with observer/stop process plumbing and turn orchestration until the provider is primarily coordination. |
+| WK-MAIN-004 | P0 | LIVE PROVEN | Replace private `ChatGPTWebClient` coupling | Provider now consumes an explicit `WKLightweightTransport` / source-client contract and no longer reaches into the listed private methods. New-chat, continuation and image live gates passed on the refactored boundary. |
+| WK-MAIN-005 | P0 | DONE | Remove/isolate superseded resume implementations | Removed the superseded shared-WK broker/daemon/socket/env path. The remaining direct-WK resume is isolated in an explicit compatibility fallback method; curl/WS remains the primary second leg. |
 | WK-MAIN-006 | P0 | OPEN | Add macOS availability contract | Explicitly require macOS 12+ for the minimal WK path because `loadSimulatedRequest:responseHTMLString:` is macOS 12+. Older macOS/non-Darwin must use the existing supported backend. |
 | WK-MAIN-007 | P0 | OPEN | Add macOS CI/release coverage | Add `macos-latest` coverage for helper build, strict native warnings, minimal-shell JS syntax, targeted WK tests and installed-wheel helper/resource smoke. |
 | WK-MAIN-008 | P0 | OPEN | Make branch pass repository quality gate | `uv run python tools/engineering_quality_gate.py --base-ref main` must pass. Apply/accept Ruff formatting policy for the branch delta. |
@@ -207,6 +207,14 @@ Append concise entries here whenever a tracker state changes. Reference task IDs
 - `WK-MAIN-009` is done: the native helper compiles cleanly with `clang -Wall -Wextra -Werror`.
 - Full CWA regression is 2144/2144 green using `uv run python -m pytest -q`; downstream gptty is 286/286 green against the exact pre-release source.
 - Local `uv run pytest` resolved a stale console-script/import path from another checkout; module invocation (`uv run python -m pytest`) is the reproducible repo-root test command and successfully collects/runs the release tests from this workspace.
+
+### 2026-09-10 — Helper runtime and lightweight transport refactor
+
+- `WK-MAIN-003` moved to `IN PROGRESS`: `wkwebview_provider.py` has been reduced from more than 2.1k lines to roughly 1.4k by extracting native helper build/process/IPC lifecycle into `wkwebview_helper_runtime.py` and curl/WS/canonical/upload work into `wkwebview_lightweight_transport.py`.
+- `WK-MAIN-004` is live-proven: the provider no longer reaches directly into `_build_headers`, `_capture_resume_token_diagnostics`, `_stream_handoff_via_ws_topic`, `_probe_celsius_ws_user` or `_upload_media_files`. `ChatGPTWebClient` exposes a small explicit WK transport boundary consumed through an internal protocol.
+- `WK-MAIN-005` is done: the experimental shared-WK resume broker, daemon/socket runtime and `CWA_WK_SHARED_RESUME_BROKER` path were removed from the pre-release implementation. Direct WK resume remains only as a named compatibility fallback.
+- Added focused lightweight transport unit coverage for authenticated canonical reads, attachment upload and resume-topic streaming/finality. Refactored WK/transport targeted suite is 25/25 green; full CWA is 2143/2143 green and downstream gptty remains 286/286 green.
+- Live regression on the refactored boundary passed a new-chat exact-marker retry, a two-turn continuation with exact markers on both turns, and an image upload where the model correctly identified the generated solid-red fixture. One initial new-chat attempt hit the previously observed intermittent `WKWEBVIEW_MINIMAL_SECURITY_RESUME_FENCE_MISSING`; the immediate retry succeeded, so resilience remains tracked under `WK-MAIN-023` rather than being hidden by the refactor.
 
 ## Rules for maintaining this tracker
 

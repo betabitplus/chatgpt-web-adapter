@@ -2,18 +2,12 @@ from __future__ import annotations
 
 import base64
 import fcntl
-import hashlib
 import json
 import os
-import shutil
 import subprocess
-import sys
 import threading
 import time
-import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
-from importlib import resources
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -29,374 +23,15 @@ from .product_model_profile_pr8_10 import (
 )
 from .status import _status_from_payload
 from .types import ChatConversation, ConversationRef
-from .wkwebview_shared_broker import WKSystemResumeBrokerClient
+from .wkwebview_helper_runtime import (
+    WKHelperInvocation as _WKHelperInvocation,
+)
+from .wkwebview_helper_runtime import (
+    WKWebViewHelperRuntime,
+)
+from .wkwebview_lightweight_transport import WKLightweightTransport
 
-_HELPER_BUNDLE_ID = "local.gptty.webkit-authority"
-_HELPER_DIRNAME = "wkwebview-authority"
-_RESULT_PREFIX = "WK_RESULT "
 _EVENT_PREFIX = "WK_EVENT "
-
-
-@dataclass
-class _WKHelperInvocation:
-    command: list[str]
-    request: dict[str, Any]
-    capture_resume: bool = False
-
-
-class _WKSharedResumeState:
-    def __init__(self, on_text_event: Any) -> None:
-        self.condition = threading.Condition()
-        self.on_text_event = on_text_event
-        self.final: dict[str, Any] | None = None
-        self.error: str | None = None
-        self.stream_started = False
-        self.stream_ended = False
-        self.stream_terminal = False
-        self.canonical_polls = 0
-        self.last_canonical_status: int | None = None
-
-
-class _WKSharedResumeBroker:
-    """Multiplex resume streams through one persistent WKWebView helper process."""
-
-    def __init__(self, helper: Path, *, idle_timeout: float = 1.0) -> None:
-        self.helper = Path(helper)
-        self.idle_timeout = max(0.0, float(idle_timeout))
-        self._lock = threading.Lock()
-        self._write_lock = threading.Lock()
-        self._process: subprocess.Popen[str] | None = None
-        self._ready_event: threading.Event | None = None
-        self._pending: dict[str, _WKSharedResumeState] = {}
-        self._idle_timer: threading.Timer | None = None
-        self._generation = 0
-        self._stderr_tail: list[str] = []
-
-    def _drain_stderr(self, process: subprocess.Popen[str]) -> None:
-        stream = process.stderr
-        if stream is None:
-            return
-        try:
-            for line in stream:
-                value = line.rstrip()
-                if not value:
-                    continue
-                with self._lock:
-                    self._stderr_tail.append(value)
-                    if len(self._stderr_tail) > 20:
-                        del self._stderr_tail[:-20]
-        except Exception:
-            pass
-
-    def _reader_loop(self, process: subprocess.Popen[str], ready: threading.Event) -> None:
-        stream = process.stdout
-        if stream is None:
-            self._fail_current_process(process, "WKWEBVIEW_SHARED_RESUME_STDOUT_MISSING")
-            return
-        try:
-            for raw in stream:
-                if not raw.startswith(_EVENT_PREFIX):
-                    continue
-                try:
-                    event = json.loads(raw[len(_EVENT_PREFIX) :])
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                event_type = event.get("type")
-                if event_type == "broker_ready":
-                    ready.set()
-                    continue
-                request_id = event.get("request_id")
-                if not isinstance(request_id, str) or not request_id:
-                    continue
-                with self._lock:
-                    state = self._pending.get(request_id)
-                if state is None:
-                    continue
-                if event_type in {
-                    "assistant_text_snapshot",
-                    "assistant_text_delta",
-                    "assistant_text_revision",
-                }:
-                    callback_event = dict(event)
-                    callback_event.pop("request_id", None)
-                    try:
-                        state.on_text_event(callback_event)
-                    except Exception:
-                        pass
-                    continue
-                terminal = False
-                with state.condition:
-                    if event_type in {"broker_resume_started", "broker_stream_started"}:
-                        state.stream_started = True
-                    elif event_type == "broker_stream_ended":
-                        state.stream_ended = True
-                    elif event_type == "broker_stream_terminal":
-                        state.stream_terminal = True
-                    elif event_type == "broker_canonical_probe":
-                        state.canonical_polls += 1
-                        raw_status = event.get("status")
-                        if isinstance(raw_status, int) and not isinstance(raw_status, bool):
-                            state.last_canonical_status = raw_status
-                    elif event_type == "broker_final":
-                        state.final = event
-                        terminal = True
-                    elif event_type == "broker_error":
-                        state.error = str(event.get("error") or "WKWEBVIEW_SHARED_RESUME_FAILED")
-                        terminal = True
-                    elif event_type == "broker_cancelled":
-                        state.error = "WKWEBVIEW_SHARED_RESUME_CANCELLED"
-                        terminal = True
-                    if terminal:
-                        state.condition.notify_all()
-                if terminal:
-                    self._finish_pending(request_id, state)
-        finally:
-            self._fail_current_process(process, "WKWEBVIEW_SHARED_RESUME_PROCESS_ENDED")
-
-    def _fail_current_process(self, process: subprocess.Popen[str], error: str) -> None:
-        with self._lock:
-            if self._process is not process:
-                return
-            states = list(self._pending.values())
-            self._pending.clear()
-            self._process = None
-            self._ready_event = None
-            self._generation += 1
-        for state in states:
-            with state.condition:
-                if state.final is None and state.error is None:
-                    state.error = error
-                state.condition.notify_all()
-
-    def _finish_pending(self, request_id: str, state: _WKSharedResumeState) -> None:
-        with self._lock:
-            if self._pending.get(request_id) is state:
-                del self._pending[request_id]
-            self._schedule_idle_locked()
-
-    def _schedule_idle_locked(self) -> None:
-        if self._pending or self._process is None:
-            return
-        if self._idle_timer is not None:
-            self._idle_timer.cancel()
-        self._generation += 1
-        generation = self._generation
-        timer = threading.Timer(self.idle_timeout, self._shutdown_if_idle, args=(generation,))
-        timer.daemon = True
-        self._idle_timer = timer
-        timer.start()
-
-    def _shutdown_if_idle(self, generation: int) -> None:
-        with self._lock:
-            if generation != self._generation or self._pending or self._process is None:
-                return
-            process = self._process
-            self._process = None
-            self._ready_event = None
-            self._idle_timer = None
-            self._generation += 1
-        self._send_to_process(process, {"type": "shutdown"}, ignore_errors=True)
-        try:
-            process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            try:
-                process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-
-    def _send_to_process(
-        self,
-        process: subprocess.Popen[str],
-        command: dict[str, Any],
-        *,
-        ignore_errors: bool = False,
-    ) -> None:
-        try:
-            payload = json.dumps(command, separators=(",", ":"), ensure_ascii=True) + "\n"
-            with self._write_lock:
-                if process.stdin is None:
-                    raise BrokenPipeError("broker stdin is unavailable")
-                process.stdin.write(payload)
-                process.stdin.flush()
-        except (OSError, BrokenPipeError, ValueError) as error:
-            if not ignore_errors:
-                raise RequestError(
-                    f"WKWEBVIEW_SHARED_RESUME_WRITE_FAILED: {error}",
-                    request_stage="wkwebview_shared_resume",
-                ) from error
-
-    def _ensure_started(self) -> subprocess.Popen[str]:
-        with self._lock:
-            if self._idle_timer is not None:
-                self._idle_timer.cancel()
-                self._idle_timer = None
-            self._generation += 1
-            process = self._process
-            if process is not None and process.poll() is None:
-                ready = self._ready_event
-            else:
-                ready = threading.Event()
-                try:
-                    process = subprocess.Popen(
-                        [str(self.helper), "--resume-broker"],
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        bufsize=1,
-                    )
-                except OSError as error:
-                    raise RequestError(
-                        f"WKWEBVIEW_SHARED_RESUME_LAUNCH_FAILED: {error}",
-                        request_stage="wkwebview_shared_resume",
-                    ) from error
-                self._process = process
-                self._ready_event = ready
-                threading.Thread(
-                    target=self._reader_loop,
-                    args=(process, ready),
-                    daemon=True,
-                    name="wk-shared-resume-reader",
-                ).start()
-                threading.Thread(
-                    target=self._drain_stderr,
-                    args=(process,),
-                    daemon=True,
-                    name="wk-shared-resume-stderr",
-                ).start()
-        if ready is None or not ready.wait(timeout=10.0):
-            self._fail_current_process(process, "WKWEBVIEW_SHARED_RESUME_READY_TIMEOUT")
-            if process.poll() is None:
-                process.terminate()
-            detail = ""
-            with self._lock:
-                if self._stderr_tail:
-                    detail = ": " + self._stderr_tail[-1]
-            raise RequestError(
-                "WKWEBVIEW_SHARED_RESUME_READY_TIMEOUT" + detail,
-                request_stage="wkwebview_shared_resume",
-            )
-        return process
-
-    def resume(
-        self,
-        *,
-        conversation_id: str,
-        resume_token: str,
-        offset: int,
-        timeout: float,
-        on_text_event: Any,
-    ) -> dict[str, Any]:
-        if not isinstance(conversation_id, str) or not conversation_id.strip():
-            raise ValueError("conversation_id is required")
-        if not isinstance(resume_token, str) or not resume_token:
-            raise ValueError("resume_token is required")
-        if not callable(on_text_event):
-            raise TypeError("on_text_event must be callable")
-        total_timeout = float(timeout)
-        if total_timeout <= 0:
-            raise ValueError("timeout must be positive")
-        process = self._ensure_started()
-        request_id = str(uuid.uuid4())
-        state = _WKSharedResumeState(on_text_event)
-        with self._lock:
-            if self._process is not process or process.poll() is not None:
-                raise RequestError(
-                    "WKWEBVIEW_SHARED_RESUME_PROCESS_UNAVAILABLE",
-                    request_stage="wkwebview_shared_resume",
-                )
-            self._pending[request_id] = state
-        try:
-            self._send_to_process(
-                process,
-                {
-                    "type": "start_resume",
-                    "request_id": request_id,
-                    "conversation_id": conversation_id.strip(),
-                    "resume_token": resume_token,
-                    "offset": int(offset),
-                },
-            )
-        except Exception:
-            self._finish_pending(request_id, state)
-            raise
-
-        deadline = time.monotonic() + total_timeout
-        with state.condition:
-            while state.final is None and state.error is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                state.condition.wait(timeout=min(remaining, 0.5))
-        if state.final is None and state.error is None:
-            with self._lock:
-                if self._pending.get(request_id) is state:
-                    del self._pending[request_id]
-                self._schedule_idle_locked()
-            self._send_to_process(
-                process,
-                {"type": "cancel", "request_id": request_id},
-                ignore_errors=True,
-            )
-            raise RequestError(
-                "WKWEBVIEW_SHARED_RESUME_TIMEOUT:"
-                f"stream_started={int(state.stream_started)}:"
-                f"canonical_polls={state.canonical_polls}:"
-                f"last_status={state.last_canonical_status if state.last_canonical_status is not None else 0}",
-                request_stage="wkwebview_shared_resume",
-            )
-        if state.error is not None:
-            raise RequestError(
-                f"{state.error}:stream_started={int(state.stream_started)}:"
-                f"canonical_polls={state.canonical_polls}:"
-                f"last_status={state.last_canonical_status if state.last_canonical_status is not None else 0}",
-                request_stage="wkwebview_shared_resume",
-            )
-        assert state.final is not None
-        status = state.final.get("status")
-        if not isinstance(status, int) or isinstance(status, bool):
-            status = 200
-        encoded = state.final.get("canonical_body_base64")
-        return {
-            "ok": True,
-            "status": status,
-            "conversation_id": conversation_id.strip(),
-            "offset": int(offset),
-            "stream_started": state.stream_started,
-            "stream_ended": state.stream_ended,
-            "stream_terminal_observed": state.stream_terminal,
-            "canonical_completed": True,
-            "canonical_polls": state.canonical_polls,
-            "last_canonical_status": state.last_canonical_status,
-            "canonical_body_base64": encoded if isinstance(encoded, str) else "",
-        }
-
-    def close(self) -> None:
-        with self._lock:
-            if self._idle_timer is not None:
-                self._idle_timer.cancel()
-                self._idle_timer = None
-            process = self._process
-            self._process = None
-            self._ready_event = None
-            states = list(self._pending.values())
-            self._pending.clear()
-            self._generation += 1
-        for state in states:
-            with state.condition:
-                if state.final is None and state.error is None:
-                    state.error = "WKWEBVIEW_SHARED_RESUME_CLOSED"
-                state.condition.notify_all()
-        if process is None:
-            return
-        self._send_to_process(process, {"type": "shutdown"}, ignore_errors=True)
-        try:
-            process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            process.terminate()
 
 
 class WKWebViewTurnProvider:
@@ -439,137 +74,44 @@ class WKWebViewTurnProvider:
         )
         self.turn_timeout = float(turn_timeout)
         self.build_timeout = float(build_timeout)
+        self._helper_runtime = WKWebViewHelperRuntime(
+            self.state_dir, build_timeout=self.build_timeout
+        )
         self._profile_context = threading.local()
         self._authority_context = threading.local()
         self._canonical_context = threading.local()
-        self._build_lock = threading.Lock()
         self._stopped_lock = threading.Lock()
         self._stopped_conversations: set[str] = set()
         self._final_payload_lock = threading.Lock()
         self._final_payload_cache: dict[str, dict[str, Any]] = {}
         self._stop_final_condition = threading.Condition()
         self._stopped_final_payloads: dict[str, dict[str, Any]] = {}
-        self._shared_resume_lock = threading.Lock()
-        self._shared_resume_instance: WKSystemResumeBrokerClient | None = None
-        self._source_client: Any | None = None
+        self._lightweight_transport: WKLightweightTransport | None = None
 
     @property
     def helper_root(self) -> Path:
-        return self.state_dir / _HELPER_DIRNAME
+        return self._helper_runtime.helper_root
 
     @property
     def helper_app(self) -> Path:
-        return self.helper_root / "WKChatGPTAuthority.app"
+        return self._helper_runtime.helper_app
 
     @property
     def helper_binary(self) -> Path:
-        return self.helper_app / "Contents" / "MacOS" / "WKChatGPTAuthority"
+        return self._helper_runtime.helper_binary
 
     def _source_paths(self) -> tuple[Path, Path, Path]:
-        package_root = resources.files("chatgpt_web_adapter")
-        helper_root = package_root.joinpath("wkwebview_helper")
-        source = Path(str(helper_root.joinpath("WKChatGPTAuthority.m")))
-        plist = Path(str(helper_root.joinpath("Info.plist")))
-        minimal_shell = Path(str(helper_root.joinpath("minimal_security_shell.js")))
-        return source, plist, minimal_shell
+        return self._helper_runtime.source_paths()
 
     @staticmethod
     def _source_digest(source: Path, plist: Path, minimal_shell: Path) -> str:
-        digest = hashlib.sha256()
-        digest.update(source.read_bytes())
-        digest.update(plist.read_bytes())
-        digest.update(minimal_shell.read_bytes())
-        return digest.hexdigest()
+        return WKWebViewHelperRuntime.source_digest(source, plist, minimal_shell)
 
     def _ensure_helper(self) -> Path:
-        if sys.platform != "darwin":
-            raise RequestError(
-                "WKWEBVIEW_AUTHORITY_UNAVAILABLE: macOS is required",
-                request_stage="wkwebview_authority_build",
-            )
-        source, plist, minimal_shell = self._source_paths()
-        if not source.is_file() or not plist.is_file() or not minimal_shell.is_file():
-            raise RequestError(
-                "WKWEBVIEW_AUTHORITY_SOURCE_MISSING",
-                request_stage="wkwebview_authority_build",
-            )
-        if shutil.which("clang") is None or shutil.which("codesign") is None:
-            raise RequestError(
-                "WKWEBVIEW_AUTHORITY_TOOLCHAIN_MISSING: clang/codesign required",
-                request_stage="wkwebview_authority_build",
-            )
-
-        expected = self._source_digest(source, plist, minimal_shell)
-        stamp = self.helper_root / "source.sha256"
-        with self._build_lock:
-            self.helper_root.mkdir(parents=True, exist_ok=True)
-            lock_path = self.helper_root / ".build.lock"
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                # Another process may have completed the same build while this
-                # process waited for the OS-wide lock, so re-check under the lock.
-                if self.helper_binary.is_file() and stamp.is_file():
-                    try:
-                        if stamp.read_text(encoding="utf-8").strip() == expected:
-                            return self.helper_binary
-                    except OSError:
-                        pass
-
-                macos_dir = self.helper_app / "Contents" / "MacOS"
-                resources_dir = self.helper_app / "Contents" / "Resources"
-                macos_dir.mkdir(parents=True, exist_ok=True)
-                resources_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(plist, self.helper_app / "Contents" / "Info.plist")
-                shutil.copy2(minimal_shell, resources_dir / "minimal_security_shell.js")
-                command = [
-                    "clang",
-                    "-fobjc-arc",
-                    "-framework",
-                    "Cocoa",
-                    "-framework",
-                    "WebKit",
-                    str(source),
-                    "-o",
-                    str(self.helper_binary),
-                ]
-                self._run_build(command)
-                self._run_build(
-                    ["codesign", "--force", "--deep", "--sign", "-", str(self.helper_app)]
-                )
-                stamp.write_text(expected + "\n", encoding="utf-8")
-            finally:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(lock_fd)
-        return self.helper_binary
+        return self._helper_runtime.ensure_helper()
 
     def _run_build(self, command: list[str]) -> None:
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=self.build_timeout,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise RequestError(
-                f"WKWEBVIEW_AUTHORITY_BUILD_FAILED: {error}",
-                request_stage="wkwebview_authority_build",
-            ) from error
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "build failed").strip()
-            raise RequestError(
-                f"WKWEBVIEW_AUTHORITY_BUILD_FAILED: {detail[-1500:]}",
-                request_stage="wkwebview_authority_build",
-            )
-
-    @staticmethod
-    def _shared_resume_enabled() -> bool:
-        value = os.environ.get("CWA_WK_SHARED_RESUME_BROKER", "").strip().lower()
-        return value in {"1", "true", "yes", "on"}
+        self._helper_runtime.run_build(command)
 
     @staticmethod
     def _curl_ws_second_leg_enabled() -> bool:
@@ -580,21 +122,6 @@ class WKWebViewTurnProvider:
     def _minimal_security_shell_enabled() -> bool:
         value = os.environ.get("CWA_WK_MINIMAL_SECURITY_SHELL", "").strip().lower()
         return value in {"1", "true", "yes", "on"}
-
-    def _get_shared_resume_broker(self) -> WKSystemResumeBrokerClient:
-        with self._shared_resume_lock:
-            broker = self._shared_resume_instance
-            if broker is None:
-                broker = WKSystemResumeBrokerClient(self._ensure_helper())
-                self._shared_resume_instance = broker
-            return broker
-
-    def _close_shared_resume_broker(self) -> None:
-        with self._shared_resume_lock:
-            broker = self._shared_resume_instance
-            self._shared_resume_instance = None
-        if broker is not None:
-            broker.close()
 
     @contextmanager
     def _heavy_submit_gate(self, timeout: float) -> Iterator[None]:
@@ -649,7 +176,11 @@ class WKWebViewTurnProvider:
     def build_canonical_client(self, source_client: Any) -> Any:
         from .wkwebview_canonical import WKWebViewCanonicalClient
 
-        self._source_client = source_client
+        self._lightweight_transport = WKLightweightTransport(
+            source_client,
+            canonical_matches_write=self._canonical_payload_matches_write,
+            cache_final_payload=self._cache_final_payload,
+        )
         return WKWebViewCanonicalClient(source_client, self)
 
     @staticmethod
@@ -726,154 +257,20 @@ class WKWebViewTurnProvider:
         text: str,
         baseline_current_node: str | None,
     ) -> dict[str, Any]:
-        source_client = self._source_client
-        if source_client is None:
+        transport = self._lightweight_transport
+        if transport is None:
             raise RequestError(
                 "WKWEBVIEW_CURL_WS_SOURCE_CLIENT_MISSING",
                 request_stage="wkwebview_curl_ws_second_leg",
             )
-        try:
-            import copy
-
-            from curl_cffi import requests as curl_requests
-        except ImportError as error:
-            raise RequestError(
-                "WKWEBVIEW_CURL_WS_DEPENDENCY_MISSING",
-                request_stage="wkwebview_curl_ws_second_leg",
-            ) from error
-
-        ws_client = copy.copy(source_client)
-        state: dict[str, Any] = {"conversation_id": conversation_id}
-        capture = getattr(ws_client, "_capture_resume_token_diagnostics", None)
-        if not callable(capture):
-            raise RequestError(
-                "WKWEBVIEW_CURL_WS_TOPIC_DECODER_MISSING",
-                request_stage="wkwebview_curl_ws_second_leg",
-            )
-        capture(resume_value, state)
-        topic_id = state.get("resume_turn_topic_id")
-        if not isinstance(topic_id, str) or not topic_id:
-            raise RequestError(
-                "WKWEBVIEW_CURL_WS_TOPIC_UNRESOLVED",
-                request_stage="wkwebview_curl_ws_second_leg",
-            )
-
-        celsius_path = "/backend-api/celsius/ws/user"
-        celsius_headers = ws_client._build_headers(
-            {
-                "accept": "*/*",
-                "referer": "https://chatgpt.com/",
-                "x-openai-target-path": celsius_path,
-                "x-openai-target-route": celsius_path,
-            }
+        return transport.resume_turn(
+            conversation_id=conversation_id,
+            resume_value=resume_value,
+            timeout=timeout,
+            relay_text_event=relay_text_event,
+            text=text,
+            baseline_current_node=baseline_current_node,
         )
-        with curl_requests.Session(impersonate="safari") as celsius_session:
-            celsius = celsius_session.get(
-                "https://chatgpt.com" + celsius_path,
-                headers=celsius_headers,
-                timeout=min(20.0, max(1.0, float(timeout))),
-            )
-            if celsius.status_code != 200:
-                raise RequestError(
-                    f"WKWEBVIEW_CURL_WS_CELSIUS_HTTP:{celsius.status_code}",
-                    request_stage="wkwebview_curl_ws_second_leg",
-                    status_code=celsius.status_code,
-                )
-            celsius_payload = celsius.json()
-        websocket_url = (
-            celsius_payload.get("websocket_url") if isinstance(celsius_payload, dict) else None
-        )
-        if not isinstance(websocket_url, str) or not websocket_url:
-            raise RequestError(
-                "WKWEBVIEW_CURL_WS_URL_MISSING",
-                request_stage="wkwebview_curl_ws_second_leg",
-            )
-
-        def probe_celsius() -> dict[str, Any]:
-            return {"websocket_url": websocket_url}
-
-        ws_client._probe_celsius_ws_user = probe_celsius
-        raw_sequence = 0
-
-        def on_token(value: str) -> None:
-            nonlocal raw_sequence
-            if not isinstance(value, str) or not value:
-                return
-            raw_sequence += 1
-            event: dict[str, Any] = {
-                "type": "assistant_text_delta",
-                "sequence": raw_sequence,
-                "delta": value,
-            }
-            message_id = state.get("message_id")
-            if isinstance(message_id, str) and message_id:
-                event["message_id"] = message_id
-            relay_text_event(event)
-
-        started = time.monotonic()
-        ws_stream = getattr(ws_client, "_stream_handoff_via_ws_topic", None)
-        if not callable(ws_stream):
-            raise RequestError(
-                "WKWEBVIEW_CURL_WS_STREAM_METHOD_MISSING",
-                request_stage="wkwebview_curl_ws_second_leg",
-            )
-        ws_stream(
-            topic_id,
-            state=state,
-            on_event=None,
-            on_token=on_token,
-        )
-
-        deadline = started + max(1.0, float(timeout))
-        canonical_url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
-        canonical_headers = ws_client._build_headers(
-            {
-                "accept": "application/json",
-                "referer": f"https://chatgpt.com/c/{conversation_id}",
-            }
-        )
-        last_status = 0
-        with curl_requests.Session(impersonate="safari") as canonical_session:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RequestError(
-                        f"WKWEBVIEW_CURL_WS_CANONICAL_TIMEOUT:last_status={last_status}",
-                        request_stage="wkwebview_curl_ws_second_leg",
-                    )
-                response = canonical_session.get(
-                    canonical_url,
-                    headers=canonical_headers,
-                    timeout=min(20.0, max(1.0, remaining)),
-                )
-                last_status = response.status_code
-                if response.status_code in {401, 403}:
-                    raise RequestError(
-                        f"WKWEBVIEW_CURL_WS_CANONICAL_HTTP:{response.status_code}",
-                        request_stage="wkwebview_curl_ws_second_leg",
-                        status_code=response.status_code,
-                    )
-                if response.status_code == 200:
-                    canonical_payload = response.json()
-                    if isinstance(
-                        canonical_payload, dict
-                    ) and self._canonical_payload_matches_write(
-                        canonical_payload,
-                        text=text,
-                        baseline_current_node=baseline_current_node,
-                    ):
-                        self._cache_final_payload(conversation_id, canonical_payload)
-                        return {
-                            "ok": True,
-                            "status": 200,
-                            "conversation_id": conversation_id,
-                            "canonical_completed": True,
-                            "stream_started": True,
-                            "stream_ended": True,
-                            "stream_terminal_observed": True,
-                            "ws_token_events": raw_sequence,
-                        }
-                time.sleep(min(0.5, max(0.05, remaining)))
 
     @staticmethod
     def _decode_helper_json(
@@ -1053,35 +450,10 @@ class WKWebViewTurnProvider:
         *,
         timeout: float,
     ) -> dict[str, Any] | None:
-        source_client = self._source_client
-        build_headers = getattr(source_client, "_build_headers", None) if source_client is not None else None
-        if not callable(build_headers):
+        transport = self._lightweight_transport
+        if transport is None:
             return None
-        try:
-            from curl_cffi import requests as curl_requests
-        except ImportError:
-            return None
-
-        url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
-        headers = build_headers(
-            {
-                "accept": "application/json",
-                "referer": f"https://chatgpt.com/c/{conversation_id}",
-            }
-        )
-        try:
-            with curl_requests.Session(impersonate="safari") as session:
-                response = session.get(
-                    url,
-                    headers=headers,
-                    timeout=max(1.0, float(timeout)),
-                )
-            if response.status_code != 200:
-                return None
-            payload = response.json()
-        except Exception:
-            return None
-        return payload if isinstance(payload, dict) else None
+        return transport.read_canonical(conversation_id, timeout=timeout)
 
     def _read_conversation_payload_uncached(
         self,
@@ -1316,37 +688,10 @@ class WKWebViewTurnProvider:
         self,
         attachment_paths: Sequence[str],
     ) -> tuple[dict[str, Any], ...] | None:
-        if not attachment_paths:
-            return ()
-        source_client = self._source_client
-        uploader = getattr(source_client, "_upload_media_files", None) if source_client is not None else None
-        if not callable(uploader):
+        transport = self._lightweight_transport
+        if transport is None:
             return None
-        try:
-            uploaded = uploader(
-                [(Path(path), Path(path).name) for path in attachment_paths]
-            )
-        except Exception:
-            return None
-        if not isinstance(uploaded, list) or len(uploaded) != len(attachment_paths):
-            return None
-        descriptors: list[dict[str, Any]] = []
-        for item in uploaded:
-            if not isinstance(item, dict):
-                return None
-            file_id = item.get("file_id")
-            if not isinstance(file_id, str) or not file_id.strip():
-                return None
-            descriptor = {
-                "file_id": file_id.strip(),
-                "file_name": item.get("file_name") if isinstance(item.get("file_name"), str) else "attachment",
-                "file_size": item.get("file_size") if isinstance(item.get("file_size"), int) else None,
-                "mime_type": item.get("mime_type") if isinstance(item.get("mime_type"), str) else None,
-                "width": item.get("width") if isinstance(item.get("width"), int) else None,
-                "height": item.get("height") if isinstance(item.get("height"), int) else None,
-            }
-            descriptors.append(descriptor)
-        return tuple(descriptors)
+        return transport.upload_attachments(attachment_paths)
 
     def _helper_command(
         self,
@@ -1388,15 +733,7 @@ class WKWebViewTurnProvider:
     def _helper_subprocess_input(
         invocation: list[str] | _WKHelperInvocation,
     ) -> tuple[list[str], str | None]:
-        if isinstance(invocation, _WKHelperInvocation):
-            command = [*invocation.command, "--request-stdin"]
-            request_input = json.dumps(
-                invocation.request,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            return command, request_input
-        return list(invocation), None
+        return WKWebViewHelperRuntime.subprocess_input(invocation)
 
     def _run_helper(
         self,
@@ -1404,52 +741,7 @@ class WKWebViewTurnProvider:
         *,
         timeout: float,
     ) -> dict[str, Any]:
-        env = os.environ.copy()
-        env.setdefault("NSUnbufferedIO", "YES")
-        command, request_input = self._helper_subprocess_input(invocation)
-        try:
-            completed = subprocess.run(
-                command,
-                input=request_input,
-                capture_output=True,
-                text=True,
-                timeout=max(1.0, timeout + 5.0),
-                env=env,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise RequestError(
-                "WKWEBVIEW_AUTHORITY_TIMEOUT",
-                request_stage="wkwebview_authority_turn",
-            ) from error
-        except OSError as error:
-            raise RequestError(
-                f"WKWEBVIEW_AUTHORITY_LAUNCH_FAILED: {error}",
-                request_stage="wkwebview_authority_turn",
-            ) from error
-
-        payload = None
-        for line in reversed(completed.stdout.splitlines()):
-            if line.startswith(_RESULT_PREFIX):
-                try:
-                    candidate = json.loads(line[len(_RESULT_PREFIX) :])
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(candidate, dict):
-                    payload = candidate
-                    break
-        if payload is None:
-            detail = (completed.stderr or completed.stdout or "no helper result").strip()
-            raise RequestError(
-                f"WKWEBVIEW_AUTHORITY_NO_RESULT: {detail[-2000:]}",
-                request_stage="wkwebview_authority_turn",
-            )
-        if payload.get("ok") is not True:
-            raise RequestError(
-                str(payload.get("error") or "WKWEBVIEW_AUTHORITY_TURN_FAILED"),
-                request_stage="wkwebview_authority_turn",
-            )
-        return payload
+        return self._helper_runtime.run(invocation, timeout=timeout)
 
     def _run_helper_streaming(
         self,
@@ -1460,151 +752,17 @@ class WKWebViewTurnProvider:
         on_lifecycle_event: Any = None,
         extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        if not callable(on_text_event):
-            raise TypeError("on_text_event must be callable")
-        if on_lifecycle_event is not None and not callable(on_lifecycle_event):
-            raise TypeError("on_lifecycle_event must be callable")
-        env = os.environ.copy()
-        env.setdefault("NSUnbufferedIO", "YES")
-        if extra_env:
-            env.update(extra_env)
-        command, request_input = self._helper_subprocess_input(invocation)
-        resume_read_fd: int | None = None
-        resume_write_fd: int | None = None
-        pass_fds: tuple[int, ...] = ()
-        if isinstance(invocation, _WKHelperInvocation) and invocation.capture_resume:
-            resume_read_fd, resume_write_fd = os.pipe()
-            os.set_inheritable(resume_write_fd, True)
-            command += ["--resume-handoff-fd", str(resume_write_fd)]
-            pass_fds = (resume_write_fd,)
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE if request_input is not None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                env=env,
-                pass_fds=pass_fds,
-            )
-        except OSError as error:
-            if resume_read_fd is not None:
-                os.close(resume_read_fd)
-            if resume_write_fd is not None:
-                os.close(resume_write_fd)
-            raise RequestError(
-                f"WKWEBVIEW_AUTHORITY_LAUNCH_FAILED: {error}",
-                request_stage="wkwebview_authority_turn",
-            ) from error
-        if resume_write_fd is not None:
-            os.close(resume_write_fd)
-            resume_write_fd = None
-        if request_input is not None:
-            assert process.stdin is not None
-            try:
-                process.stdin.write(request_input)
-                process.stdin.close()
-            except OSError:
-                pass
-
-        deadline = time.monotonic() + max(1.0, timeout + 5.0)
-        payload: dict[str, Any] | None = None
-        try:
-            assert process.stdout is not None
-            while time.monotonic() < deadline:
-                line = process.stdout.readline()
-                if not line:
-                    if process.poll() is not None:
-                        break
-                    time.sleep(0.02)
-                    continue
-                if line.startswith(_EVENT_PREFIX):
-                    try:
-                        event = json.loads(line[len(_EVENT_PREFIX) :])
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    event_type = event.get("type")
-                    if event_type in {
-                        "assistant_text_snapshot",
-                        "assistant_text_delta",
-                        "assistant_text_revision",
-                    }:
-                        try:
-                            on_text_event(event)
-                        except Exception:
-                            pass
-                        continue
-                    if event_type == "write_identity_resolved" and on_lifecycle_event is not None:
-                        try:
-                            on_lifecycle_event(event)
-                        except Exception:
-                            pass
-                    continue
-                if not line.startswith(_RESULT_PREFIX):
-                    continue
-                try:
-                    candidate = json.loads(line[len(_RESULT_PREFIX) :])
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(candidate, dict):
-                    payload = candidate
-                    break
-        finally:
-            if process.poll() is None:
-                self._terminate_observer_process(process)
-
-        resume_value = ""
-        if resume_read_fd is not None:
-            try:
-                chunks: list[bytes] = []
-                while True:
-                    chunk = os.read(resume_read_fd, 65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                resume_value = b"".join(chunks).decode("utf-8").strip()
-            except (OSError, UnicodeDecodeError):
-                resume_value = ""
-            finally:
-                os.close(resume_read_fd)
-        if payload is not None and resume_value:
-            payload["stream_resume_value"] = resume_value
-
-        if payload is None:
-            detail = "no helper result"
-            if process.stderr is not None:
-                try:
-                    stderr = process.stderr.read().strip()
-                except Exception:
-                    stderr = ""
-                if stderr:
-                    detail = stderr
-            if time.monotonic() >= deadline:
-                detail = "streaming helper timed out"
-            raise RequestError(
-                f"WKWEBVIEW_AUTHORITY_NO_RESULT: {detail[-2000:]}",
-                request_stage="wkwebview_authority_turn",
-            )
-        if payload.get("ok") is not True:
-            raise RequestError(
-                str(payload.get("error") or "WKWEBVIEW_AUTHORITY_TURN_FAILED"),
-                request_stage="wkwebview_authority_turn",
-            )
-        return payload
+        return self._helper_runtime.run_streaming(
+            invocation,
+            timeout=timeout,
+            on_text_event=on_text_event,
+            on_lifecycle_event=on_lifecycle_event,
+            extra_env=extra_env,
+        )
 
     @staticmethod
     def _terminate_observer_process(process: subprocess.Popen[str]) -> None:
-        if process.poll() is not None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2.0)
+        WKWebViewHelperRuntime.terminate_process(process)
 
     def observe_turn(
         self,
@@ -1735,6 +893,36 @@ class WKWebViewTurnProvider:
         raise RequestError(
             "PASSIVE_OBSERVER_STREAM_ENDED_WITHOUT_TERMINAL",
             request_stage="browser_native_observe_turn",
+        )
+
+    def _resume_via_legacy_wk(
+        self,
+        *,
+        conversation_id: str,
+        resume_value: str,
+        timeout: float,
+        on_text_event: Any,
+    ) -> dict[str, Any]:
+        """Compatibility fallback for environments without the lightweight second leg."""
+
+        invocation = _WKHelperInvocation(
+            command=[
+                str(self._ensure_helper()),
+                "--observe-stream",
+                "--timeout",
+                f"{timeout:.3f}",
+            ],
+            request={
+                "resume_conversation": conversation_id,
+                "resume_offset": 0,
+                "resume_value": resume_value,
+                "timeout": timeout,
+            },
+        )
+        return self._run_helper_streaming(
+            invocation,
+            timeout=timeout,
+            on_text_event=on_text_event,
         )
 
     def _send_text_impl(
@@ -1880,7 +1068,7 @@ class WKWebViewTurnProvider:
         started = time.monotonic()
         if on_text_event is not None:
             phase_timeout = total_timeout
-            if self._shared_resume_enabled() or self._curl_ws_second_leg_enabled():
+            if self._curl_ws_second_leg_enabled():
                 gate_wait = max(0.001, total_timeout - (time.monotonic() - started))
                 with self._heavy_submit_gate(gate_wait):
                     phase_timeout = max(1.0, total_timeout - (time.monotonic() - started))
@@ -1979,31 +1167,10 @@ class WKWebViewTurnProvider:
                                 text=text,
                                 baseline_current_node=baseline_current_node,
                             )
-                        elif self._shared_resume_enabled():
-                            resume_payload = self._get_shared_resume_broker().resume(
-                                conversation_id=result_conversation_id.strip(),
-                                resume_token=resume_value,
-                                offset=0,
-                                timeout=remaining,
-                                on_text_event=make_stream_relay(),
-                            )
                         else:
-                            resume_invocation = _WKHelperInvocation(
-                                command=[
-                                    str(self._ensure_helper()),
-                                    "--observe-stream",
-                                    "--timeout",
-                                    f"{remaining:.3f}",
-                                ],
-                                request={
-                                    "resume_conversation": result_conversation_id.strip(),
-                                    "resume_offset": 0,
-                                    "resume_value": resume_value,
-                                    "timeout": remaining,
-                                },
-                            )
-                            resume_payload = self._run_helper_streaming(
-                                resume_invocation,
+                            resume_payload = self._resume_via_legacy_wk(
+                                conversation_id=result_conversation_id.strip(),
+                                resume_value=resume_value,
                                 timeout=remaining,
                                 on_text_event=make_stream_relay(),
                             )

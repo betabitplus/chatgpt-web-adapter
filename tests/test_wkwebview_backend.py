@@ -3,8 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,11 +24,7 @@ from chatgpt_web_adapter.wkwebview_canonical import (
     WKWEBVIEW_CONTEXT_CANONICAL_READ_PLANE,
     WKWebViewCanonicalClient,
 )
-from chatgpt_web_adapter.wkwebview_provider import (
-    WKWebViewTurnProvider,
-    _WKSharedResumeBroker,
-)
-from chatgpt_web_adapter.wkwebview_shared_broker import WKSystemResumeBrokerClient
+from chatgpt_web_adapter.wkwebview_provider import WKWebViewTurnProvider
 
 
 def _invocation_argv(invocation) -> list[str]:
@@ -672,259 +666,6 @@ def test_wkwebview_stop_uses_worker_stopped_final_without_second_canonical_reade
 
 
 
-def test_shared_resume_broker_multiplexes_two_requests_in_one_process(tmp_path) -> None:
-    helper = tmp_path / "fake_broker.py"
-    starts = tmp_path / "starts.txt"
-    helper.write_text(
-        """#!/usr/bin/env python3
-import base64
-import json
-import sys
-from pathlib import Path
-
-Path(%r).open("a", encoding="utf-8").write("start\\n")
-print("WK_EVENT " + json.dumps({"type": "broker_ready"}), flush=True)
-for raw in sys.stdin:
-    command = json.loads(raw)
-    kind = command.get("type")
-    if kind == "shutdown":
-        print("WK_EVENT " + json.dumps({"type": "broker_shutdown"}), flush=True)
-        break
-    if kind == "cancel":
-        print("WK_EVENT " + json.dumps({"type": "broker_cancelled", "request_id": command.get("request_id")}), flush=True)
-        continue
-    if kind != "start_resume":
-        continue
-    request_id = command["request_id"]
-    conversation_id = command["conversation_id"]
-    print("WK_EVENT " + json.dumps({"type": "broker_resume_started", "request_id": request_id, "status": 200}), flush=True)
-    print("WK_EVENT " + json.dumps({"type": "assistant_text_delta", "request_id": request_id, "sequence": 1, "message_id": "m-" + conversation_id, "delta": conversation_id}), flush=True)
-    final = {"current_node": "node-" + conversation_id, "mapping": {}}
-    encoded = base64.b64encode(json.dumps(final).encode()).decode()
-    print("WK_EVENT " + json.dumps({"type": "broker_final", "request_id": request_id, "conversation_id": conversation_id, "status": 200, "canonical_body_base64": encoded}), flush=True)
-""" % str(starts),
-        encoding="utf-8",
-    )
-    helper.chmod(0o755)
-    broker = _WKSharedResumeBroker(helper, idle_timeout=0.25)
-    barrier = threading.Barrier(3)
-    results: dict[str, dict] = {}
-    events: dict[str, list[dict]] = {"a": [], "b": []}
-    errors: list[BaseException] = []
-
-    def run(name: str, conversation_id: str, token: str) -> None:
-        try:
-            barrier.wait(timeout=2)
-            results[name] = broker.resume(
-                conversation_id=conversation_id,
-                resume_token=token,
-                offset=0,
-                timeout=5,
-                on_text_event=events[name].append,
-            )
-        except BaseException as error:  # pragma: no cover - surfaced below
-            errors.append(error)
-
-    threads = [
-        threading.Thread(target=run, args=("a", "conversation-a", "secret-a")),
-        threading.Thread(target=run, args=("b", "conversation-b", "secret-b")),
-    ]
-    try:
-        for thread in threads:
-            thread.start()
-        barrier.wait(timeout=2)
-        for thread in threads:
-            thread.join(timeout=8)
-        assert errors == []
-        assert set(results) == {"a", "b"}
-        assert events["a"][0]["delta"] == "conversation-a"
-        assert events["b"][0]["delta"] == "conversation-b"
-        assert results["a"]["stream_started"] is True
-        assert results["b"]["stream_started"] is True
-        assert len(starts.read_text(encoding="utf-8").splitlines()) == 1
-        with broker._lock:
-            process = broker._process
-        assert process is not None
-        argv = " ".join(str(value) for value in process.args)
-        assert argv.endswith("--resume-broker")
-        assert "secret-a" not in argv
-        assert "secret-b" not in argv
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            with broker._lock:
-                if broker._process is None:
-                    break
-            time.sleep(0.02)
-        with broker._lock:
-            assert broker._process is None
-    finally:
-        broker.close()
-
-
-def test_system_resume_broker_clients_share_one_daemon_helper(tmp_path) -> None:
-    helper = tmp_path / "fake_broker.py"
-    starts = tmp_path / "starts.txt"
-    helper.write_text(
-        """#!/usr/bin/env python3
-import base64
-import json
-import sys
-from pathlib import Path
-
-Path(%r).open("a", encoding="utf-8").write("start\\n")
-print("WK_EVENT " + json.dumps({"type": "broker_ready"}), flush=True)
-for raw in sys.stdin:
-    command = json.loads(raw)
-    kind = command.get("type")
-    if kind == "shutdown":
-        break
-    if kind != "start_resume":
-        continue
-    request_id = command["request_id"]
-    conversation_id = command["conversation_id"]
-    print("WK_EVENT " + json.dumps({"type": "broker_resume_started", "request_id": request_id, "status": 200}), flush=True)
-    print("WK_EVENT " + json.dumps({"type": "assistant_text_delta", "request_id": request_id, "sequence": 1, "message_id": "m-" + conversation_id, "delta": conversation_id}), flush=True)
-    final = {"current_node": "node-" + conversation_id, "mapping": {}}
-    encoded = base64.b64encode(json.dumps(final).encode()).decode()
-    print("WK_EVENT " + json.dumps({"type": "broker_final", "request_id": request_id, "conversation_id": conversation_id, "status": 200, "canonical_body_base64": encoded}), flush=True)
-""" % str(starts),
-        encoding="utf-8",
-    )
-    helper.chmod(0o755)
-    runtime_dir = Path("/tmp") / f"cwa-wk-broker-test-{time.time_ns()}"
-    clients = [
-        WKSystemResumeBrokerClient(helper, runtime_dir=runtime_dir, idle_timeout=0.75),
-        WKSystemResumeBrokerClient(helper, runtime_dir=runtime_dir, idle_timeout=0.75),
-    ]
-    barrier = threading.Barrier(3)
-    results: dict[str, dict] = {}
-    events: dict[str, list[dict]] = {"a": [], "b": []}
-    errors: list[BaseException] = []
-
-    def run(index: int, name: str) -> None:
-        try:
-            barrier.wait(timeout=2)
-            results[name] = clients[index].resume(
-                conversation_id="conversation-" + name,
-                resume_token="secret-" + name,
-                offset=0,
-                timeout=5,
-                on_text_event=events[name].append,
-            )
-        except BaseException as error:  # pragma: no cover - surfaced below
-            errors.append(error)
-
-    threads = [
-        threading.Thread(target=run, args=(0, "a")),
-        threading.Thread(target=run, args=(1, "b")),
-    ]
-    for thread in threads:
-        thread.start()
-    barrier.wait(timeout=2)
-    for thread in threads:
-        thread.join(timeout=8)
-
-    assert errors == []
-    assert set(results) == {"a", "b"}
-    assert events["a"][0]["delta"] == "conversation-a"
-    assert events["b"][0]["delta"] == "conversation-b"
-    assert len(starts.read_text(encoding="utf-8").splitlines()) == 1
-    assert runtime_dir.stat().st_mode & 0o777 == 0o700
-    socket_path = runtime_dir / "broker.sock"
-    if socket_path.exists():
-        assert socket_path.stat().st_mode & 0o777 == 0o600
-    deadline = time.monotonic() + 4
-    while socket_path.exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert not socket_path.exists()
-    (runtime_dir / "launch.lock").unlink(missing_ok=True)
-    runtime_dir.rmdir()
-
-
-def test_wkwebview_shared_resume_opt_in_avoids_second_helper_process(monkeypatch) -> None:
-    provider = WKWebViewTurnProvider()
-    monkeypatch.setenv("CWA_WK_SHARED_RESUME_BROKER", "1")
-    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
-    final_canonical = _final_canonical_for_prompt("hello", assistant_text="hello world")
-
-    def fake_stream(
-        command,
-        *,
-        timeout,
-        on_text_event,
-        on_lifecycle_event=None,
-        extra_env=None,
-    ):
-        assert "--resume-conversation" not in _invocation_argv(command)
-        on_text_event(
-            {
-                "type": "assistant_text_delta",
-                "sequence": 1,
-                "message_id": "assistant-1",
-                "delta": "hello ",
-            }
-        )
-        return {
-            "ok": True,
-            "conversation_id": "conversation-1",
-            "response_status": 200,
-            "final_url": "https://chatgpt.com/c/conversation-1",
-            "attachment_count": 0,
-            "elapsed_ms": 100,
-            "load_elapsed_ms": 50,
-            "write_commit_proven": True,
-            "write_commit_proof": "RESUME_FENCE",
-            "canonical_committed": False,
-            "committed_current_node": "",
-            "stream_ended": False,
-            "stream_terminal_observed": False,
-            "stream_resume_present": True,
-            "stream_resume_handoff_written": True,
-                "stream_resume_value": "resume-secret",
-        }
-
-    class FakeBroker:
-        def __init__(self) -> None:
-            self.calls: list[dict] = []
-
-        def resume(self, **kwargs):
-            self.calls.append(dict(kwargs))
-            assert kwargs["resume_token"] == "resume-secret"
-            kwargs["on_text_event"](
-                {
-                    "type": "assistant_text_delta",
-                    "sequence": 1,
-                    "message_id": "assistant-1",
-                    "delta": "world",
-                }
-            )
-            return {
-                "ok": True,
-                "status": 200,
-                "conversation_id": "conversation-1",
-                "stream_started": True,
-                "canonical_completed": True,
-                "canonical_body_base64": base64.b64encode(
-                    json.dumps(final_canonical).encode("utf-8")
-                ).decode("ascii"),
-            }
-
-    fake_broker = FakeBroker()
-    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
-    monkeypatch.setattr(provider, "_get_shared_resume_broker", lambda: fake_broker)
-    events: list[dict] = []
-
-    result = provider.send_text_streaming("hello", on_text_event=events.append)
-
-    assert result.conversation_id == "conversation-1"
-    assert result.passive_observer_armed is False
-    assert [event["sequence"] for event in events] == [1, 2]
-    assert [event["delta"] for event in events] == ["hello ", "world"]
-    assert len(fake_broker.calls) == 1
-    assert fake_broker.calls[0]["conversation_id"] == "conversation-1"
-    assert fake_broker.calls[0]["offset"] == 0
-
-
 def test_wkwebview_minimal_security_shell_gate_is_narrow(monkeypatch) -> None:
     provider = WKWebViewTurnProvider()
     monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
@@ -1155,7 +896,7 @@ def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
     attachment.write_bytes(b"fake-png")
 
     class FakeSourceClient:
-        def _upload_media_files(self, media):
+        def wk_transport_upload_media_files(self, media):
             assert len(media) == 1
             assert Path(media[0][0]) == attachment
             return [
@@ -1169,7 +910,7 @@ def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
                 }
             ]
 
-    provider._source_client = FakeSourceClient()
+    provider.build_canonical_client(FakeSourceClient())
     commands: list[list[str]] = []
     requests: list[dict] = []
 
@@ -1248,10 +989,10 @@ def test_wkwebview_minimal_security_attachment_upload_failure_falls_back_to_spa(
     attachment.write_bytes(b"fake-png")
 
     class FailingSourceClient:
-        def _upload_media_files(self, media):
+        def wk_transport_upload_media_files(self, media):
             raise RuntimeError("upload unavailable")
 
-    provider._source_client = FailingSourceClient()
+    provider.build_canonical_client(FailingSourceClient())
     commands: list[list[str]] = []
     requests: list[dict] = []
 
@@ -1447,93 +1188,3 @@ def test_wkwebview_curl_ws_resume_runs_after_phase_one_stream_eof(monkeypatch) -
     assert [event["delta"] for event in events] == ["world"]
     assert len(calls) == 1
     assert calls[0]["conversation_id"] == "conversation-1"
-
-
-def test_wkwebview_shared_resume_serializes_heavy_phase_across_providers(monkeypatch) -> None:
-    monkeypatch.setenv("CWA_WK_SHARED_RESUME_BROKER", "1")
-    providers = [WKWebViewTurnProvider(), WKWebViewTurnProvider()]
-    monitor = threading.Lock()
-    active = 0
-    max_active = 0
-    errors: list[BaseException] = []
-    results: list[str] = []
-
-    class FakeBroker:
-        def resume(self, **kwargs):
-            prompt = kwargs["conversation_id"].rsplit("-", 1)[-1]
-            final_canonical = _final_canonical_for_prompt(prompt)
-            return {
-                "ok": True,
-                "status": 200,
-                "conversation_id": kwargs["conversation_id"],
-                "stream_started": True,
-                "canonical_completed": True,
-                "canonical_body_base64": base64.b64encode(
-                    json.dumps(final_canonical).encode("utf-8")
-                ).decode("ascii"),
-            }
-
-    def install(provider: WKWebViewTurnProvider, name: str) -> None:
-        monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
-        monkeypatch.setattr(provider, "_get_shared_resume_broker", lambda: FakeBroker())
-
-        def fake_stream(
-            command,
-            *,
-            timeout,
-            on_text_event,
-            on_lifecycle_event=None,
-            extra_env=None,
-        ):
-            nonlocal active, max_active
-            with monitor:
-                active += 1
-                max_active = max(max_active, active)
-            try:
-                time.sleep(0.15)
-                return {
-                    "ok": True,
-                    "conversation_id": "conversation-" + name,
-                    "response_status": 200,
-                    "final_url": "https://chatgpt.com/c/conversation-" + name,
-                    "attachment_count": 0,
-                    "elapsed_ms": 150,
-                    "load_elapsed_ms": 50,
-                    "write_commit_proven": True,
-                    "write_commit_proof": "RESUME_FENCE",
-                    "canonical_committed": False,
-                    "committed_current_node": "",
-                    "stream_ended": False,
-                    "stream_terminal_observed": False,
-                    "stream_resume_present": True,
-                    "stream_resume_handoff_written": True,
-                "stream_resume_value": "resume-secret",
-                }
-            finally:
-                with monitor:
-                    active -= 1
-
-        monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
-
-    install(providers[0], "a")
-    install(providers[1], "b")
-
-    def run(provider: WKWebViewTurnProvider, prompt: str) -> None:
-        try:
-            result = provider.send_text_streaming(prompt, on_text_event=lambda event: None)
-            results.append(result.conversation_id)
-        except BaseException as error:  # pragma: no cover - surfaced below
-            errors.append(error)
-
-    threads = [
-        threading.Thread(target=run, args=(providers[0], "a")),
-        threading.Thread(target=run, args=(providers[1], "b")),
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=5)
-
-    assert errors == []
-    assert sorted(results) == ["conversation-a", "conversation-b"]
-    assert max_active == 1

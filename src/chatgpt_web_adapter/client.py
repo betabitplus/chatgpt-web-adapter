@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -25,7 +26,14 @@ from .model_detection import (
     detect_reasoning_effort_from_conversation_payload,
 )
 from .status import _status_from_payload
-from .types import AuthData, ChatConversation, ChatMetrics, ChatRequestDiagnostics, ChatResponse, MediaItem
+from .types import (
+    AuthData,
+    ChatConversation,
+    ChatMetrics,
+    ChatRequestDiagnostics,
+    ChatResponse,
+    MediaItem,
+)
 
 CHAT_REQUIREMENTS_URL = "https://chatgpt.com/backend-api/sentinel/chat-requirements"
 CHAT_BACKEND_URL = "https://chatgpt.com/backend-api/f/conversation"
@@ -926,6 +934,55 @@ class ChatGPTWebClient:
             raise
         except Exception as error:
             raise RequestError(f"ws topic stream failed: {error}") from error
+
+    def wk_transport_headers(
+        self, extra: dict[str, str | None] | None = None
+    ) -> dict[str, str]:
+        """Build authenticated headers for the WK lightweight transport boundary."""
+
+        return self._build_headers(extra)
+
+    def wk_transport_resume_state(
+        self, resume_token: str, *, conversation_id: str
+    ) -> tuple[str, dict[str, Any]]:
+        """Decode a browser-issued resume token into the WS topic state."""
+
+        state: dict[str, Any] = {"conversation_id": conversation_id}
+        self._capture_resume_token_diagnostics(resume_token, state)
+        topic_id = state.get("resume_turn_topic_id")
+        if not isinstance(topic_id, str) or not topic_id:
+            raise RequestError("resume token did not contain a WebSocket topic id")
+        return topic_id, state
+
+    def wk_transport_stream_topic(
+        self,
+        topic_id: str,
+        *,
+        websocket_url: str,
+        state: dict[str, Any],
+        on_token: Callable[[str], None] | None,
+    ) -> None:
+        """Stream one resume topic using a caller-provided Celsius WS URL."""
+
+        ws_client = copy.copy(self)
+
+        def probe_celsius() -> dict[str, Any]:
+            return {"websocket_url": websocket_url}
+
+        ws_client._probe_celsius_ws_user = probe_celsius
+        ws_client._stream_handoff_via_ws_topic(
+            topic_id,
+            state=state,
+            on_event=None,
+            on_token=on_token,
+        )
+
+    def wk_transport_upload_media_files(
+        self, media: Sequence[tuple[Any, str | None]]
+    ) -> list[dict[str, Any]]:
+        """Upload media through the source client's established authenticated path."""
+
+        return self._upload_media_files(media)
 
     def _build_proof_header(self, requirements: dict[str, Any]) -> str | None:
         proof_block = requirements.get("proofofwork")

@@ -98,6 +98,27 @@ download_authority_granted = false
 
 Two immediate independent reads are evidence of short-term identity stability, not proof that the identifier survives later sessions, regeneration, account transitions, or that it can be safely resolved into downloadable bytes.
 
+## Authenticated R2 evidence — 2026-09-10
+
+A clean exact-head authenticated run against the same saved conversation and generated text artifact performed two reads through two fresh clients and returned:
+
+```text
+first_characterization = EXPLICIT_PRODUCT_IDENTITY_CANDIDATES_OBSERVED
+second_characterization = EXPLICIT_PRODUCT_IDENTITY_CANDIDATES_OBSERVED
+first_identity_key = file_id
+second_identity_key = file_id
+first_target_record_present = true
+second_target_record_present = true
+same_explicit_identity = true
+same_identity_key = true
+short_term_identity_stability_proven = true
+characterization = SAME_EXPLICIT_IDENTITY_ACROSS_INDEPENDENT_READS
+```
+
+The raw identifier and its SHA-256 fingerprint are intentionally not copied into repository evidence. This result establishes that the same filename-anchored generated artifact exposed the same product-owned `file_id` across two independent immediate reads through fresh clients.
+
+This is sufficient to close PR13.1's short-term identity question. It is not sufficient to promote generated-artifact download support because longitudinal/session stability and an identity-bound resolution surface remain unproven.
+
 ## Relationship to PR10.1
 
 PR10.1 correctly froze generated-artifact download handoff as:
@@ -106,7 +127,7 @@ PR10.1 correctly froze generated-artifact download handoff as:
 ARTIFACT_DOWNLOAD_HANDOFF_UNSUPPORTED_WITHOUT_STABLE_PRODUCT_IDENTITY
 ```
 
-PR13.1 does not change that support status yet. R1 has now established an explicit product-owned identity candidate; R2 tests the first stability property required before any resolution-path research.
+PR13.1 does not change that support status. It has now established two narrower facts: the product exposes an explicit conversation-scoped `file_id` for the generated artifact, and that identity is stable across two independent immediate reads. Resolution-path research belongs to a separate follow-up gate.
 
 ## Running R1
 

@@ -86,9 +86,10 @@ def test_locator_policy_allows_only_known_https_origins() -> None:
     }
     assert _locator_policy("http://chatgpt.com/file")["locator_allowed"] is False
     assert _locator_policy("https://example.com/file")["locator_allowed"] is False
-    assert _locator_policy("https://user:pass@chatgpt.com/file")[
-        "locator_allowed"
-    ] is False
+    assert (
+        _locator_policy("https://user:pass@chatgpt.com/file")["locator_allowed"]
+        is False
+    )
     assert _locator_policy("https://chatgpt.com:444/file")["locator_allowed"] is False
 
 
@@ -177,8 +178,7 @@ def test_integrity_requires_exact_size_and_sha256() -> None:
     )
 
     assert (
-        report["characterization"]
-        == "IDENTITY_BOUND_ARTIFACT_BYTES_INTEGRITY_OBSERVED"
+        report["characterization"] == "IDENTITY_BOUND_ARTIFACT_BYTES_INTEGRITY_OBSERVED"
     )
     assert report["size_matches"] is True
     assert report["sha256_matches"] is True
@@ -250,8 +250,7 @@ def test_gate_proves_identity_bound_bytes_without_disk_write(monkeypatch) -> Non
     )
 
     assert (
-        report["characterization"]
-        == "IDENTITY_BOUND_ARTIFACT_BYTES_INTEGRITY_OBSERVED"
+        report["characterization"] == "IDENTITY_BOUND_ARTIFACT_BYTES_INTEGRITY_OBSERVED"
     )
     assert report["request_count"] == 3
     assert report["identity_discovery_request_count"] == 1

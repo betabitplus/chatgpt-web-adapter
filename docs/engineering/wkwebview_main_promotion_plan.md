@@ -9,7 +9,8 @@ This document is the single source of truth for turning the current lightweight 
 Related evidence:
 
 - [`../../experiments/wkwebview_authority/max_optimization_log.md`](../../experiments/wkwebview_authority/max_optimization_log.md) — performance and live experiment evidence.
-- CWA implementation branch: `experiment/wk-curl-max-optimization`.
+- Frozen CWA experiment/evidence branch: `experiment/wk-curl-max-optimization` at promotion fork point `ddf371b`. Do not rewrite or clean this branch; it is the reproducible checkpoint for the working alternative implementation and experiment history.
+- CWA pre-release hardening branch: `prerelease/wkwebview-main-hardening`. All cleanup, refactoring, parity, CI and promotion work happens here.
 - gptty integration branch: `feature/wkwebview-authority-e2e`.
 
 ## Target architecture
@@ -59,8 +60,8 @@ Required invariants:
 
 | ID | Priority | Status | Item | Required outcome |
 |---|---|---|---|---|
-| WK-MAIN-001 | P0 | OPEN | Remove turn data from process argv | Prompt, conversation identifiers where avoidable, attachment descriptors, model/profile data and other per-turn payload move to stdin or inherited/private IPC. `ps` must not expose prompt text. |
-| WK-MAIN-002 | P0 | OPEN | Remove named resume-secret handoff file | Replace `cwa-wk-resume-*` file transport with an inherited pipe/FD or unlink-after-open equivalent. Abrupt process death must not leave resume credentials on disk. |
+| WK-MAIN-001 | P0 | IN PROGRESS | Remove turn data from process argv | Prompt, conversation identifiers where avoidable, attachment descriptors, model/profile data and other per-turn payload move to stdin or inherited/private IPC. `ps` must not expose prompt text. |
+| WK-MAIN-002 | P0 | IN PROGRESS | Remove named resume-secret handoff file | Replace `cwa-wk-resume-*` file transport with an inherited pipe/FD or unlink-after-open equivalent. Abrupt process death must not leave resume credentials on disk. |
 | WK-MAIN-003 | P0 | OPEN | Refactor `wkwebview_provider.py` orchestration | Break the ~2.1k-line provider into focused components. Provider becomes orchestration rather than build/process/curl/WS/finality/attachment/legacy implementation all at once. |
 | WK-MAIN-004 | P0 | OPEN | Replace private `ChatGPTWebClient` coupling | Introduce a small typed/internal transport contract instead of reaching into `_build_headers`, `_capture_resume_token_diagnostics`, `_stream_handoff_via_ws_topic`, `_probe_celsius_ws_user`, `_upload_media_files`. |
 | WK-MAIN-005 | P0 | OPEN | Remove/isolate superseded resume implementations | Shared-WK broker and old WK resume paths must not remain interleaved with the new primary hot path. Keep only a deliberate compatibility fallback if still required. |
@@ -101,6 +102,20 @@ Required invariants:
 | WK-MAIN-036 | P2 | OPEN | Prepare clean merge history | Before final merge, squash/rebase experimental CWA steps into a small reviewable series: implementation/refactor, tests/CI/docs, default promotion. Do the same only as needed for the small gptty branch. |
 | WK-MAIN-037 | P2 | OPEN | Remove obsolete comments/names after refactor | Delete terminology that implies retained tabs/WK canonical hot path where the new implementation no longer behaves that way. |
 
+## Final repository cleanup before acceptance
+
+This is a deliberate end-of-hardening phase, not opportunistic cleanup while implementation is still moving. The frozen experiment branch keeps the research history; the pre-release branch should contain only what belongs in the eventual `main` implementation.
+
+| ID | Priority | Status | Item | Required outcome |
+|---|---|---|---|---|
+| WK-MAIN-040 | P1 | OPEN | Remove experiment-only runtime code | Delete superseded probes, experiment-only switches, unused compatibility implementations and code paths that are no longer part of the chosen production/fallback architecture. Preserve their history on `experiment/wk-curl-max-optimization`, not in future `main`. |
+| WK-MAIN-041 | P1 | OPEN | Remove experiment-only files/assets | Audit `experiments/`, temporary harnesses, generated helpers/assets, obsolete docs and package-data entries. Future `main` must not ship research-only artifacts merely because they existed on the experiment branch. Keep only evidence/docs that are intentionally part of the repository. |
+| WK-MAIN-042 | P1 | OPEN | Dead-code/import/config sweep | Run static/search review after refactoring and delete unreachable methods, unused imports, stale environment variables, obsolete constants, stale package extras and unreferenced helper assets. No compatibility flag may remain without a documented consumer and test. |
+| WK-MAIN-043 | P1 | OPEN | Public capability parity diff | Compare runtime capabilities/governance and gptty user-visible commands/options against the current production backend. Every lost capability must be implemented, explicitly routed to the supported fallback, or consciously documented as unsupported before promotion. |
+| WK-MAIN-044 | P1 | OPEN | Documentation/history cleanup | Normal architecture/release docs must describe the final design. Experiment narrative must not be required to understand production code. Remove stale claims/names and retain links to the frozen experiment branch/log only where useful as evidence. |
+| WK-MAIN-045 | P1 | OPEN | Clean installed-artifact audit | Build wheel/sdist from a clean checkout of the pre-release branch and inspect their contents/dependencies. No experiment-only file, local path, secret, temp artifact or unintended helper resource may ship. |
+| WK-MAIN-046 | P1 | OPEN | Clean-tree reproducibility | From a clean checkout with no prior helper build/cache assumptions, run the non-live acceptance suite and verify no untracked build/temp files are left behind except explicitly ignored tool output. |
+
 ## Already accepted architecture/performance evidence
 
 These items are not reasons to redesign the solution unless later evidence invalidates them.
@@ -118,15 +133,20 @@ These items are not reasons to redesign the solution unless later evidence inval
 
 ## Required acceptance gates before switching the default
 
-All P0 items and all applicable P1 parity items must be `DONE` or `LIVE PROVEN`. Then run and record all of the following on the candidate commit:
+All P0 items, applicable P1 parity items, and **all WK-MAIN-040 through WK-MAIN-046 cleanup items** must be `DONE` or `LIVE PROVEN` before this section starts. Final acceptance is intentionally run *after* repository cleanup so deleted legacy/experiment code cannot mask a regression.
+
+Run and record all of the following on the exact cleaned candidate commit:
 
 - repository engineering quality gate against `main`;
 - Ruff lint and formatter checks for changed scope;
+- dead-code/import/config sweep and explicit review of remaining WK-related environment flags;
 - full CWA test suite;
 - full downstream gptty suite against the exact CWA source/candidate artifact;
+- public capability/governance comparison against the current production backend and gptty command surface;
 - minimal-shell JavaScript syntax and offline drift fixtures;
 - native helper compile with `-Wall -Wextra -Werror`;
 - wheel/sdist build + release gate + installed-wheel WK resource/helper smoke on macOS;
+- built-artifact content audit confirming no experiment-only files or unintended resources are shipped;
 - live text new-chat exact marker;
 - live continuation exact marker/current-node advancement;
 - HIGH/DEEP profile;
@@ -139,7 +159,8 @@ All P0 items and all applicable P1 parity items must be `DONE` or `LIVE PROVEN`.
 - four-process simultaneous continuation load;
 - mixed/goal-like multi-console load;
 - no orphan `WKChatGPTAuthority`/WebKit processes after stress;
-- no prompt/credential exposure in process command lines or residual named temp files.
+- no prompt/credential exposure in process command lines or residual named temp files;
+- clean working tree after all acceptance runs, with no unexplained generated/temp artifacts.
 
 Performance regression guardrails for the current machine/environment should be compared with, not blindly hard-coded to, the accepted evidence above. Investigate any large regression before promotion.
 
@@ -150,9 +171,10 @@ Performance regression guardrails for the current machine/environment should be 
 3. **Platform/CI hardening** — WK-MAIN-006, 007, 008, 009, 012, 034.
 4. **Feature parity** — WK-MAIN-020 through 023 plus any newly discovered parity gaps.
 5. **Observability/docs/dependency ownership** — WK-MAIN-010, 011, 032, 033, 035, 037.
-6. **Full acceptance matrix and load re-run**.
-7. **History cleanup** — WK-MAIN-036.
-8. **Default promotion** — WK-MAIN-013 as a separate final change with an emergency legacy switch.
+6. **Final repository cleanup** — WK-MAIN-040 through 046. Remove experiment/legacy debris only from the pre-release branch; the frozen experiment branch remains intact.
+7. **Full acceptance matrix and load re-run on the cleaned tree**.
+8. **History cleanup** — WK-MAIN-036.
+9. **Default promotion** — WK-MAIN-013 as a separate final change with an emergency legacy switch.
 
 Do not switch the default early merely because an intermediate stage is green.
 
@@ -169,10 +191,19 @@ Append concise entries here whenever a tracker state changes. Reference task IDs
 - Audit also identified P1 parity work for Temporary Chat, explicit model selection, general files and no-stream resilience.
 - Previously completed continuation/image/Stop/tool-loop/profile/concurrency evidence is recorded above and in the optimization log.
 
+### 2026-09-10 — Pre-release hardening branch created
+
+- Froze `experiment/wk-curl-max-optimization` at `ddf371b` as the retained working/evidence checkpoint. Do not perform cleanup or history rewriting there.
+- Created `prerelease/wkwebview-main-hardening` from that checkpoint for all productionization work.
+- Added WK-MAIN-040 through WK-MAIN-046 as a mandatory final cleanup phase before acceptance testing: remove experiment-only code/files, sweep dead code/config, compare public capability parity, clean docs/history, inspect built artifacts, and prove clean-checkout reproducibility.
+- Final acceptance is now explicitly ordered after cleanup so the exact code intended for `main`, rather than a richer experiment tree, must pass all functionality and load gates.
+
 ## Rules for maintaining this tracker
 
 - Never mark an item `DONE` from code inspection alone when its acceptance criterion requires a live or installed-artifact test.
 - Add newly discovered promotion defects here before fixing them so they cannot disappear into chat history.
 - If an item is intentionally not fixed, mark it `DEFERRED` or `REJECTED` and record the reason in the progress log.
 - Keep experiment measurements in the optimization log; keep promotion decision state here.
+- Treat `experiment/wk-curl-max-optimization` as immutable evidence unless a new experiment is intentionally started on a separate experiment branch.
+- Do not mark final acceptance complete until WK-MAIN-040 through WK-MAIN-046 have been completed on the pre-release branch and the acceptance matrix has been rerun afterward.
 - Keep the final default switch separate from refactor/hardening commits so rollback remains straightforward.

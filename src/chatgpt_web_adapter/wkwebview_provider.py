@@ -1033,12 +1033,56 @@ class WKWebViewTurnProvider:
             self._terminate_observer_process(process)
         return None
 
+    def _read_conversation_payload_via_curl(
+        self,
+        conversation_id: str,
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        source_client = self._source_client
+        build_headers = getattr(source_client, "_build_headers", None) if source_client is not None else None
+        if not callable(build_headers):
+            return None
+        try:
+            from curl_cffi import requests as curl_requests
+        except ImportError:
+            return None
+
+        url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
+        headers = build_headers(
+            {
+                "accept": "application/json",
+                "referer": f"https://chatgpt.com/c/{conversation_id}",
+            }
+        )
+        try:
+            with curl_requests.Session(impersonate="safari") as session:
+                response = session.get(
+                    url,
+                    headers=headers,
+                    timeout=max(1.0, float(timeout)),
+                )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def _read_conversation_payload_uncached(
         self,
         conversation_id: str,
         *,
         timeout: float,
     ) -> dict[str, Any]:
+        if self._curl_ws_second_leg_enabled():
+            payload = self._read_conversation_payload_via_curl(
+                conversation_id,
+                timeout=timeout,
+            )
+            if isinstance(payload, dict):
+                return payload
+
         binary = self._ensure_helper()
         payload = self._run_helper(
             [

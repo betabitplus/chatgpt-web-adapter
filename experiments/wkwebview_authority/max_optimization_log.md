@@ -199,4 +199,19 @@ Final regression checkpoint after the continuation/image/cross-process gates: Ja
 
 Final cleanup removed one-off `.tmp_*` probes, generated probe `.app` bundles, the incidental untracked `uv.lock`, and local build/dist output. The retained branch surface is limited to the provider/native-helper implementation, the packaged minimal-shell JavaScript resource, dependency/package-data metadata, regression coverage, and this experiment record. A real wheel build verified that `wkwebview_helper/minimal_security_shell.js` is included in the installed package; this caught and fixed a package-data omission that source-tree tests alone would not detect. The full regression checkpoint above was repeated after the cleanup changes and remained green.
 
+### 2026-09-10 — Four-console gptty load follow-up
+
+A direct gptty load test exposed two integration tails that did not appear in the earlier provider-only benchmark: the gptty environment did not install the `curl_cffi`/`websockets` second-leg dependencies, and continuation pre-reads still used separate `--canonical-conversation` WK helpers. With the missing dependencies, four concurrent gptty processes could fall back to parallel WK observers/readers and consume roughly **~600–800 MB**.
+
+The follow-up changes make `curl-cffi==0.16.3` and `websockets==16.1.1` normal gptty runtime dependencies and prefer an authenticated Safari-impersonated `curl_cffi` canonical GET for uncached conversation pre-reads. The previous WK canonical read remains a fail-safe fallback when the curl path is unavailable or incompatible.
+
+Live acceptance after both changes:
+
+- four simultaneous continuations of existing conversations: **4/4 successful**, exact markers, **~403 MB peak RAM**, `max_phaseA=1`, `max_canonical=0`, `max_observe=0`;
+- mixed four-console load with one two-turn interactive chat plus three concurrent independent chats: all turns successful, **~423 MB peak RAM**, `max_phaseA=1`, `max_canonical=0`, `max_observe=0`;
+- the global heavy-submit gate therefore serializes only the short browser-owned protected-write phase while curl/WebSocket generation and canonical reads remain parallel;
+- four idle gptty chat processes measured about **~232 MB total** with zero WK helpers.
+
+Regression after the change: targeted WK tests **25/25**, full CWA suite **2143/2143**, and downstream gptty **286/286** against the exact CWA source tree.
+
 Current status: the minimal security shell is the strongest optimization candidate on this branch and the technical feature/performance gates are green, but it remains **opt-in only**. No merge, installed-default change, or consumer rollout has been performed. Promotion to default remains a separate policy decision.

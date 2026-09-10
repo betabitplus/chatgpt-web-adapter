@@ -192,6 +192,56 @@ def test_wkwebview_canonical_read_caches_current_node(monkeypatch) -> None:
     assert provider._cached_current_node("conversation-1") == "node-2"
 
 
+def test_wkwebview_canonical_read_prefers_curl_second_leg(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    calls: list[tuple[str, float]] = []
+
+    def fake_curl_read(conversation_id: str, *, timeout: float):
+        calls.append((conversation_id, timeout))
+        return {"current_node": "node-curl", "mapping": {"node-curl": {}}}
+
+    monkeypatch.setattr(provider, "_read_conversation_payload_via_curl", fake_curl_read)
+
+    def fail_if_wk_helper_runs():
+        raise AssertionError("canonical pre-read should not launch WK when curl succeeds")
+
+    monkeypatch.setattr(provider, "_ensure_helper", fail_if_wk_helper_runs)
+
+    payload = provider.read_conversation_payload("conversation-curl", timeout=7)
+
+    assert payload["current_node"] == "node-curl"
+    assert calls == [("conversation-curl", 7.0)]
+    assert provider._cached_current_node("conversation-curl") == "node-curl"
+
+
+def test_wkwebview_canonical_read_falls_back_to_helper_when_curl_unavailable(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_via_curl",
+        lambda conversation_id, *, timeout: None,
+    )
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    commands: list[list[str]] = []
+
+    def fake_run(command, *, timeout):
+        commands.append(list(command))
+        return _helper_payload(
+            {"current_node": "node-wk", "mapping": {"node-wk": {}}}
+        )
+
+    monkeypatch.setattr(provider, "_run_helper", fake_run)
+
+    payload = provider.read_conversation_payload("conversation-fallback", timeout=5)
+
+    assert payload["current_node"] == "node-wk"
+    assert "--canonical-conversation" in commands[0]
+
+
 def test_wkwebview_declares_revision_safe_streaming_capability() -> None:
     provider = WKWebViewTurnProvider()
 

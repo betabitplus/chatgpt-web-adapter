@@ -57,6 +57,44 @@ download_authority_granted = false
 
 The distinction matters: observing a product-owned resolver that emits a locator is not yet proof that the locator can be safely followed, that returned bytes are the expected artifact, or that the identity is longitudinally stable across later sessions.
 
+## Authenticated live evidence — 2026-09-10
+
+A clean exact-head authenticated run against the same saved conversation and generated text artifact used by PR13.1 returned:
+
+```text
+identity_discovery_characterization = EXPLICIT_PRODUCT_IDENTITY_CANDIDATES_OBSERVED
+identity_key = file_id
+target_record_present = true
+real_status_code = 200
+real_locator_field_present = true
+real_resolution_payload_recognized = true
+real_filename = cwa_pr13_1_identity_probe.txt
+real_size_bytes = 45
+control_performed = true
+control_status_code = 404
+control_locator_field_present = false
+identity_bound_resolution_surface_proven = true
+characterization = IDENTITY_BOUND_RESOLUTION_SURFACE_OBSERVED
+```
+
+The raw `file_id`, deterministic control identity, returned locator value, and raw response body are intentionally not recorded in repository evidence.
+
+The control is important: the resolver accepted the exact product-owned identity and rejected the otherwise identical request after the identity was deliberately changed. This establishes that the observed resolver is materially bound to the product identity rather than merely returning a conversation-level locator independent of `file_id`.
+
+The run also preserved all authority boundaries:
+
+```text
+identity_values_exported = false
+locator_values_exported = false
+download_attempted = false
+write_attempted = false
+artifact_bytes_proven = false
+stable_product_identity_proven = false
+download_authority_granted = false
+```
+
+This closes PR13.2's resolution-surface question positively. It does not prove safe byte retrieval, artifact integrity, longitudinal identity stability, or production download/materialization support.
+
 ## Fail-closed characterizations
 
 The gate keeps separate outcomes for:
@@ -87,15 +125,25 @@ The probe never follows a locator, downloads bytes, writes a product mutation, w
 
 PR13.1 established that one generated artifact exposed an explicit product-owned `file_id` and that the same `file_id` survived two independent immediate reads through fresh clients.
 
-PR13.2 asks only whether that product identity is accepted by a product-owned artifact resolver and rejected when the identity is deliberately changed.
+PR13.2 now establishes the next link: that exact product identity is accepted by a product-owned artifact resolver, while a deterministic nonmatching identity is rejected.
 
-Even a positive PR13.2 result does not by itself change the public frozen status:
+The proven chain is therefore:
+
+```text
+saved conversation
+  -> explicit product-owned file_id
+  -> same file_id across independent immediate reads
+  -> identity-bound product resolver
+  -> locator-bearing resolution response
+```
+
+Even this positive PR13.2 result does not by itself change the public frozen status:
 
 ```text
 ARTIFACT_DOWNLOAD_HANDOFF_UNSUPPORTED_WITHOUT_STABLE_PRODUCT_IDENTITY
 ```
 
-A later gate would still need to prove safe identity-bound byte retrieval and artifact integrity before production download/materialization can be considered.
+A later gate still needs to prove safe identity-bound byte retrieval and artifact integrity before production download/materialization can be considered.
 
 ## Running the live gate
 

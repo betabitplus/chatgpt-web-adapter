@@ -52,6 +52,7 @@ test = [
   "ruff>=0.11",
 ]
 browser = ["zendriver==0.15.3"]
+wk-curl = ["curl-cffi==0.16.3", "websockets==16.1.1"]
 
 [project.scripts]
 chatgpt-web-adapter = "chatgpt_web_adapter.cli_v02:main"
@@ -73,6 +74,7 @@ chatgpt_web_adapter = [
   "browser_native_extension/*.png",
   "wkwebview_helper/*.m",
   "wkwebview_helper/*.plist",
+  "wkwebview_helper/*.js",
 ]
 
 [tool.ruff]

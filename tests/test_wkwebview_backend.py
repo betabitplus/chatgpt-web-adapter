@@ -53,6 +53,31 @@ def _helper_payload(value: dict) -> dict:
     }
 
 
+def _final_canonical_for_prompt(prompt: str, *, assistant_text: str = "done") -> dict:
+    return {
+        "current_node": "node-final",
+        "mapping": {
+            "user-final": {
+                "parent": None,
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": [prompt]},
+                },
+            },
+            "node-final": {
+                "parent": "user-final",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "content": {"parts": [assistant_text]},
+                },
+            },
+        },
+    }
+
+
 def test_browser_authority_backend_selection_is_closed() -> None:
     assert normalize_browser_authority_backend(" chrome-native ") == (
         CHROME_NATIVE_BROWSER_AUTHORITY_BACKEND
@@ -191,10 +216,7 @@ def test_wkwebview_streaming_detaches_write_page_and_resumes_in_lightweight_cont
     )
 
     calls: list[tuple[list[str], dict[str, str] | None]] = []
-    final_canonical = {
-        "current_node": "node-final",
-        "mapping": {"node-final": {"id": "node-final"}},
-    }
+    final_canonical = _final_canonical_for_prompt("hello", assistant_text="hello world")
 
     def fake_stream(
         command,
@@ -297,6 +319,68 @@ def test_wkwebview_streaming_detaches_write_page_and_resumes_in_lightweight_cont
 
     monkeypatch.setattr(provider, "_run_helper", fail_if_helper_runs)
     assert provider.read_conversation_payload("conversation-1", timeout=5) == final_canonical
+    assert provider._cached_current_node("conversation-1") == "node-final"
+
+
+def test_wkwebview_curl_ws_finality_rejects_stale_previous_turn() -> None:
+    provider = WKWebViewTurnProvider()
+    previous = {
+        "current_node": "assistant-old",
+        "mapping": {
+            "user-old": {
+                "parent": None,
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": ["same prompt"]},
+                },
+            },
+            "assistant-old": {
+                "parent": "user-old",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "content": {"parts": ["old answer"]},
+                },
+            },
+        },
+    }
+    current = {
+        "current_node": "assistant-new",
+        "mapping": {
+            **previous["mapping"],
+            "user-new": {
+                "parent": "assistant-old",
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": ["same prompt"]},
+                },
+            },
+            "assistant-new": {
+                "parent": "user-new",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "content": {"parts": ["new answer"]},
+                },
+            },
+        },
+    }
+
+    assert provider._canonical_payload_is_final(previous) is True
+    assert provider._canonical_payload_matches_write(
+        previous,
+        text="same prompt",
+        baseline_current_node="assistant-old",
+    ) is False
+    assert provider._canonical_payload_matches_write(
+        current,
+        text="same prompt",
+        baseline_current_node="assistant-old",
+    ) is True
 
 
 def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonical(
@@ -315,7 +399,25 @@ def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonic
     )
     final_canonical = {
         "current_node": "node-final",
-        "mapping": {"node-final": {"id": "node-final"}},
+        "mapping": {
+            "user-1": {
+                "parent": None,
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": ["hello"]},
+                },
+            },
+            "node-final": {
+                "parent": "user-1",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "content": {"parts": ["done"]},
+                },
+            },
+        },
     }
     calls: list[list[str]] = []
     handoff_paths: list[Path] = []
@@ -641,7 +743,7 @@ def test_wkwebview_shared_resume_opt_in_avoids_second_helper_process(monkeypatch
     provider = WKWebViewTurnProvider()
     monkeypatch.setenv("CWA_WK_SHARED_RESUME_BROKER", "1")
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
-    final_canonical = {"current_node": "node-final", "mapping": {"node-final": {}}}
+    final_canonical = _final_canonical_for_prompt("hello", assistant_text="hello world")
 
     def fake_stream(
         command,
@@ -723,6 +825,542 @@ def test_wkwebview_shared_resume_opt_in_avoids_second_helper_process(monkeypatch
     assert fake_broker.calls[0]["offset"] == 0
 
 
+def test_wkwebview_minimal_security_shell_gate_is_narrow(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    commands: list[list[str]] = []
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        commands.append(list(command))
+        assert isinstance(extra_env, dict)
+        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
+            "resume-secret", encoding="utf-8"
+        )
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "write_commit_proof": "RESUME_FENCE",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": True,
+            "stream_terminal_observed": False,
+            "stream_resume_present": True,
+            "stream_resume_handoff_written": True,
+        }
+
+    def fake_resume(**kwargs):
+        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="ok")
+        return {
+            "ok": True,
+            "status": 200,
+            "conversation_id": "conversation-1",
+            "canonical_body_base64": base64.b64encode(
+                json.dumps(canonical).encode("utf-8")
+            ).decode("ascii"),
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fake_resume)
+
+    provider.send_text_streaming("hello", on_text_event=lambda event: None)
+    provider.send_text_streaming(
+        "hello-model",
+        model_slug="custom-model",
+        on_text_event=lambda event: None,
+    )
+
+    assert "--minimal-security-shell" in commands[0]
+    assert "--minimal-security-shell" not in commands[1]
+
+
+def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    prewrite = {
+        "current_node": "node-before",
+        "mapping": {
+            "node-before": {
+                "parent": "user-before",
+                "message": {
+                    "id": "assistant-message-before",
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["previous answer"]},
+                },
+            }
+        },
+    }
+    monkeypatch.setattr(provider, "read_conversation_payload", lambda *args, **kwargs: prewrite)
+    commands: list[list[str]] = []
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        commands.append(list(command))
+        assert isinstance(extra_env, dict)
+        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
+            "resume-secret", encoding="utf-8"
+        )
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "write_commit_proof": "RESUME_FENCE",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": False,
+            "stream_terminal_observed": False,
+            "stream_resume_present": True,
+            "stream_resume_handoff_written": True,
+        }
+
+    def fake_resume(**kwargs):
+        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="continued")
+        return {
+            "ok": True,
+            "status": 200,
+            "conversation_id": "conversation-1",
+            "canonical_body_base64": base64.b64encode(
+                json.dumps(canonical).encode("utf-8")
+            ).decode("ascii"),
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fake_resume)
+
+    with provider.require_profile("DEEP"):
+        result = provider.send_text_streaming(
+            "continue",
+            conversation="conversation-1",
+            on_text_event=lambda event: None,
+        )
+
+    assert result.conversation_id == "conversation-1"
+    assert len(commands) == 1
+    command = commands[0]
+    assert "--minimal-security-shell" in command
+    conversation_index = command.index("--minimal-conversation-id")
+    assert command[conversation_index + 1] == "conversation-1"
+    parent_index = command.index("--minimal-parent-message-id")
+    assert command[parent_index + 1] == "assistant-message-before"
+    current_index = command.index("--expected-current-node")
+    assert command[current_index + 1] == "node-before"
+
+
+def test_wkwebview_minimal_security_shell_continuation_preserves_canonical_selection(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    prewrite = {
+        "current_node": "node-before",
+        "default_model_slug": "gpt-5-6-thinking",
+        "mapping": {
+            "node-before": {
+                "message": {
+                    "id": "assistant-message-before",
+                    "author": {"role": "assistant"},
+                    "metadata": {"thinking_effort": "extended"},
+                    "content": {"parts": ["previous answer"]},
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(provider, "read_conversation_payload", lambda *args, **kwargs: prewrite)
+    commands: list[list[str]] = []
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        commands.append(list(command))
+        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
+            "resume-secret", encoding="utf-8"
+        )
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "write_commit_proof": "RESUME_FENCE",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": False,
+            "stream_terminal_observed": False,
+            "stream_resume_present": True,
+            "stream_resume_handoff_written": True,
+        }
+
+    def fake_resume(**kwargs):
+        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="continued")
+        return {
+            "ok": True,
+            "status": 200,
+            "conversation_id": "conversation-1",
+            "canonical_body_base64": base64.b64encode(
+                json.dumps(canonical).encode("utf-8")
+            ).decode("ascii"),
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fake_resume)
+
+    result = provider.send_text_streaming(
+        "continue",
+        conversation="conversation-1",
+        on_text_event=lambda event: None,
+    )
+
+    assert result.conversation_id == "conversation-1"
+    command = commands[0]
+    assert "--minimal-security-shell" in command
+    model_index = command.index("--minimal-model-slug")
+    assert command[model_index + 1] == "gpt-5-6-thinking"
+    effort_index = command.index("--minimal-thinking-effort")
+    assert command[effort_index + 1] == "extended"
+
+
+def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
+    monkeypatch, tmp_path
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    attachment = tmp_path / "red.png"
+    attachment.write_bytes(b"fake-png")
+
+    class FakeSourceClient:
+        def _upload_media_files(self, media):
+            assert len(media) == 1
+            assert Path(media[0][0]) == attachment
+            return [
+                {
+                    "file_id": "file-1",
+                    "file_name": "red.png",
+                    "file_size": 8,
+                    "mime_type": "image/png",
+                    "width": 64,
+                    "height": 64,
+                }
+            ]
+
+    provider._source_client = FakeSourceClient()
+    commands: list[list[str]] = []
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        commands.append(list(command))
+        assert isinstance(extra_env, dict)
+        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
+            "resume-secret", encoding="utf-8"
+        )
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 1,
+            "write_commit_proven": True,
+            "write_commit_proof": "RESUME_FENCE",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": False,
+            "stream_terminal_observed": False,
+            "stream_resume_present": True,
+            "stream_resume_handoff_written": True,
+        }
+
+    def fake_resume(**kwargs):
+        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="image ok")
+        return {
+            "ok": True,
+            "status": 200,
+            "conversation_id": "conversation-1",
+            "canonical_body_base64": base64.b64encode(
+                json.dumps(canonical).encode("utf-8")
+            ).decode("ascii"),
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fake_resume)
+
+    result = provider.send_text_streaming(
+        "inspect image",
+        attachment_paths=[attachment],
+        on_text_event=lambda event: None,
+    )
+
+    assert result.attachment_count == 1
+    assert len(commands) == 1
+    command = commands[0]
+    assert "--minimal-security-shell" in command
+    assert "--attach" not in command
+    count_index = command.index("--minimal-attachment-count")
+    assert command[count_index + 1] == "1"
+    encoded_index = command.index("--minimal-attachments-base64")
+    descriptors = json.loads(base64.b64decode(command[encoded_index + 1]).decode("utf-8"))
+    assert descriptors == [
+        {
+            "file_id": "file-1",
+            "file_name": "red.png",
+            "file_size": 8,
+            "mime_type": "image/png",
+            "width": 64,
+            "height": 64,
+        }
+    ]
+
+
+def test_wkwebview_minimal_security_attachment_upload_failure_falls_back_to_spa(
+    monkeypatch, tmp_path
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    attachment = tmp_path / "red.png"
+    attachment.write_bytes(b"fake-png")
+
+    class FailingSourceClient:
+        def _upload_media_files(self, media):
+            raise RuntimeError("upload unavailable")
+
+    provider._source_client = FailingSourceClient()
+    commands: list[list[str]] = []
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        commands.append(list(command))
+        assert isinstance(extra_env, dict)
+        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
+            "resume-secret", encoding="utf-8"
+        )
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 1,
+            "write_commit_proven": True,
+            "write_commit_proof": "RESUME_FENCE",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": False,
+            "stream_terminal_observed": False,
+            "stream_resume_present": True,
+            "stream_resume_handoff_written": True,
+        }
+
+    def fake_resume(**kwargs):
+        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="image ok")
+        return {
+            "ok": True,
+            "status": 200,
+            "conversation_id": "conversation-1",
+            "canonical_body_base64": base64.b64encode(
+                json.dumps(canonical).encode("utf-8")
+            ).decode("ascii"),
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fake_resume)
+
+    result = provider.send_text_streaming(
+        "inspect image",
+        attachment_paths=[attachment],
+        on_text_event=lambda event: None,
+    )
+
+    assert result.attachment_count == 1
+    command = commands[0]
+    assert "--minimal-security-shell" not in command
+    attach_index = command.index("--attach")
+    assert command[attach_index + 1] == str(attachment.resolve())
+
+
+def test_wkwebview_minimal_security_continuation_without_assistant_parent_falls_back(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    prewrite = {
+        "current_node": "user-before",
+        "mapping": {
+            "user-before": {
+                "message": {
+                    "id": "user-message-before",
+                    "author": {"role": "user"},
+                    "content": {"parts": ["unfinished"]},
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(provider, "read_conversation_payload", lambda *args, **kwargs: prewrite)
+    commands: list[list[str]] = []
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        commands.append(list(command))
+        assert isinstance(extra_env, dict)
+        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
+            "resume-secret", encoding="utf-8"
+        )
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "write_commit_proof": "RESUME_FENCE",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": False,
+            "stream_terminal_observed": False,
+            "stream_resume_present": True,
+            "stream_resume_handoff_written": True,
+        }
+
+    def fake_resume(**kwargs):
+        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="continued")
+        return {
+            "ok": True,
+            "status": 200,
+            "conversation_id": "conversation-1",
+            "canonical_body_base64": base64.b64encode(
+                json.dumps(canonical).encode("utf-8")
+            ).decode("ascii"),
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fake_resume)
+
+    result = provider.send_text_streaming(
+        "continue",
+        conversation="conversation-1",
+        on_text_event=lambda event: None,
+    )
+
+    assert result.conversation_id == "conversation-1"
+    command = commands[0]
+    assert "--minimal-security-shell" not in command
+    assert "--minimal-conversation-id" not in command
+
+
+def test_wkwebview_curl_ws_resume_runs_after_phase_one_stream_eof(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    final_canonical = _final_canonical_for_prompt("hello", assistant_text="hello world")
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        assert isinstance(extra_env, dict)
+        handoff_path = Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"])
+        handoff_path.write_text("resume-secret", encoding="utf-8")
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "final_url": "https://chatgpt.com/c/conversation-1",
+            "attachment_count": 0,
+            "elapsed_ms": 100,
+            "load_elapsed_ms": 50,
+            "write_commit_proven": True,
+            "write_commit_proof": "RESUME_FENCE",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": True,
+            "stream_terminal_observed": False,
+            "stream_resume_present": True,
+            "stream_resume_handoff_written": True,
+        }
+
+    calls: list[dict] = []
+
+    def fake_resume(**kwargs):
+        calls.append(dict(kwargs))
+        assert kwargs["resume_value"] == "resume-secret"
+        kwargs["relay_text_event"](
+            {
+                "type": "assistant_text_delta",
+                "sequence": 1,
+                "message_id": "assistant-1",
+                "delta": "world",
+            }
+        )
+        return {
+            "ok": True,
+            "status": 200,
+            "conversation_id": "conversation-1",
+            "canonical_body_base64": base64.b64encode(
+                json.dumps(final_canonical).encode("utf-8")
+            ).decode("ascii"),
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fake_resume)
+    events: list[dict] = []
+
+    result = provider.send_text_streaming("hello", on_text_event=events.append)
+
+    assert result.conversation_id == "conversation-1"
+    assert result.passive_observer_armed is False
+    assert [event["delta"] for event in events] == ["world"]
+    assert len(calls) == 1
+    assert calls[0]["conversation_id"] == "conversation-1"
+
 
 def test_wkwebview_shared_resume_serializes_heavy_phase_across_providers(monkeypatch) -> None:
     monkeypatch.setenv("CWA_WK_SHARED_RESUME_BROKER", "1")
@@ -732,10 +1370,11 @@ def test_wkwebview_shared_resume_serializes_heavy_phase_across_providers(monkeyp
     max_active = 0
     errors: list[BaseException] = []
     results: list[str] = []
-    final_canonical = {"current_node": "node-final", "mapping": {"node-final": {}}}
 
     class FakeBroker:
         def resume(self, **kwargs):
+            prompt = kwargs["conversation_id"].rsplit("-", 1)[-1]
+            final_canonical = _final_canonical_for_prompt(prompt)
             return {
                 "ok": True,
                 "status": 200,

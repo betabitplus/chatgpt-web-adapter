@@ -444,6 +444,7 @@ class WKWebViewTurnProvider:
         self._stopped_final_payloads: dict[str, dict[str, Any]] = {}
         self._shared_resume_lock = threading.Lock()
         self._shared_resume_instance: WKSystemResumeBrokerClient | None = None
+        self._source_client: Any | None = None
 
     @property
     def helper_root(self) -> Path:
@@ -457,17 +458,20 @@ class WKWebViewTurnProvider:
     def helper_binary(self) -> Path:
         return self.helper_app / "Contents" / "MacOS" / "WKChatGPTAuthority"
 
-    def _source_paths(self) -> tuple[Path, Path]:
+    def _source_paths(self) -> tuple[Path, Path, Path]:
         package_root = resources.files("chatgpt_web_adapter")
-        source = Path(str(package_root.joinpath("wkwebview_helper", "WKChatGPTAuthority.m")))
-        plist = Path(str(package_root.joinpath("wkwebview_helper", "Info.plist")))
-        return source, plist
+        helper_root = package_root.joinpath("wkwebview_helper")
+        source = Path(str(helper_root.joinpath("WKChatGPTAuthority.m")))
+        plist = Path(str(helper_root.joinpath("Info.plist")))
+        minimal_shell = Path(str(helper_root.joinpath("minimal_security_shell.js")))
+        return source, plist, minimal_shell
 
     @staticmethod
-    def _source_digest(source: Path, plist: Path) -> str:
+    def _source_digest(source: Path, plist: Path, minimal_shell: Path) -> str:
         digest = hashlib.sha256()
         digest.update(source.read_bytes())
         digest.update(plist.read_bytes())
+        digest.update(minimal_shell.read_bytes())
         return digest.hexdigest()
 
     def _ensure_helper(self) -> Path:
@@ -476,8 +480,8 @@ class WKWebViewTurnProvider:
                 "WKWEBVIEW_AUTHORITY_UNAVAILABLE: macOS is required",
                 request_stage="wkwebview_authority_build",
             )
-        source, plist = self._source_paths()
-        if not source.is_file() or not plist.is_file():
+        source, plist, minimal_shell = self._source_paths()
+        if not source.is_file() or not plist.is_file() or not minimal_shell.is_file():
             raise RequestError(
                 "WKWEBVIEW_AUTHORITY_SOURCE_MISSING",
                 request_stage="wkwebview_authority_build",
@@ -488,33 +492,50 @@ class WKWebViewTurnProvider:
                 request_stage="wkwebview_authority_build",
             )
 
-        expected = self._source_digest(source, plist)
+        expected = self._source_digest(source, plist, minimal_shell)
         stamp = self.helper_root / "source.sha256"
         with self._build_lock:
-            if self.helper_binary.is_file() and stamp.is_file():
-                try:
-                    if stamp.read_text(encoding="utf-8").strip() == expected:
-                        return self.helper_binary
-                except OSError:
-                    pass
+            self.helper_root.mkdir(parents=True, exist_ok=True)
+            lock_path = self.helper_root / ".build.lock"
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                # Another process may have completed the same build while this
+                # process waited for the OS-wide lock, so re-check under the lock.
+                if self.helper_binary.is_file() and stamp.is_file():
+                    try:
+                        if stamp.read_text(encoding="utf-8").strip() == expected:
+                            return self.helper_binary
+                    except OSError:
+                        pass
 
-            macos_dir = self.helper_app / "Contents" / "MacOS"
-            macos_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(plist, self.helper_app / "Contents" / "Info.plist")
-            command = [
-                "clang",
-                "-fobjc-arc",
-                "-framework",
-                "Cocoa",
-                "-framework",
-                "WebKit",
-                str(source),
-                "-o",
-                str(self.helper_binary),
-            ]
-            self._run_build(command)
-            self._run_build(["codesign", "--force", "--deep", "--sign", "-", str(self.helper_app)])
-            stamp.write_text(expected + "\n", encoding="utf-8")
+                macos_dir = self.helper_app / "Contents" / "MacOS"
+                resources_dir = self.helper_app / "Contents" / "Resources"
+                macos_dir.mkdir(parents=True, exist_ok=True)
+                resources_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(plist, self.helper_app / "Contents" / "Info.plist")
+                shutil.copy2(minimal_shell, resources_dir / "minimal_security_shell.js")
+                command = [
+                    "clang",
+                    "-fobjc-arc",
+                    "-framework",
+                    "Cocoa",
+                    "-framework",
+                    "WebKit",
+                    str(source),
+                    "-o",
+                    str(self.helper_binary),
+                ]
+                self._run_build(command)
+                self._run_build(
+                    ["codesign", "--force", "--deep", "--sign", "-", str(self.helper_app)]
+                )
+                stamp.write_text(expected + "\n", encoding="utf-8")
+            finally:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
         return self.helper_binary
 
     def _run_build(self, command: list[str]) -> None:
@@ -541,6 +562,16 @@ class WKWebViewTurnProvider:
     @staticmethod
     def _shared_resume_enabled() -> bool:
         value = os.environ.get("CWA_WK_SHARED_RESUME_BROKER", "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _curl_ws_second_leg_enabled() -> bool:
+        value = os.environ.get("CWA_WK_CURL_WS_SECOND_LEG", "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _minimal_security_shell_enabled() -> bool:
+        value = os.environ.get("CWA_WK_MINIMAL_SECURITY_SHELL", "").strip().lower()
         return value in {"1", "true", "yes", "on"}
 
     def _get_shared_resume_broker(self) -> WKSystemResumeBrokerClient:
@@ -611,7 +642,231 @@ class WKWebViewTurnProvider:
     def build_canonical_client(self, source_client: Any) -> Any:
         from .wkwebview_canonical import WKWebViewCanonicalClient
 
+        self._source_client = source_client
         return WKWebViewCanonicalClient(source_client, self)
+
+    @staticmethod
+    def _canonical_payload_is_final(payload: dict[str, Any]) -> bool:
+        mapping = payload.get("mapping")
+        current_node = payload.get("current_node")
+        if not isinstance(mapping, dict) or not isinstance(current_node, str) or not current_node:
+            return False
+        node = mapping.get(current_node)
+        message = node.get("message") if isinstance(node, dict) else None
+        if not isinstance(message, dict):
+            return False
+        author = message.get("author")
+        metadata = message.get("metadata")
+        finish = metadata.get("finish_details") if isinstance(metadata, dict) else None
+        role = author.get("role") if isinstance(author, dict) else None
+        if role != "assistant" or message.get("recipient") not in {None, "all"}:
+            return False
+        active = {"running", "in_progress", "pending", "queued", "started", "streaming"}
+        statuses = [
+            payload.get("async_status"),
+            payload.get("status"),
+            node.get("async_status") if isinstance(node, dict) else None,
+            node.get("status") if isinstance(node, dict) else None,
+            metadata.get("async_status") if isinstance(metadata, dict) else None,
+            metadata.get("status") if isinstance(metadata, dict) else None,
+            message.get("status"),
+        ]
+        if any(str(value or "").lower() in active for value in statuses):
+            return False
+        completed = {"completed", "complete", "finished", "done", "success", "succeeded", "finished_successfully"}
+        finish_present = (
+            isinstance(finish, dict)
+            and (
+                isinstance(finish.get("type"), str)
+                or isinstance(finish.get("reason"), str)
+            )
+        )
+        return bool(
+            finish_present
+            or message.get("end_turn") is True
+            or any(str(value or "").lower() in completed for value in statuses)
+        )
+
+    def _canonical_payload_matches_write(
+        self,
+        payload: dict[str, Any],
+        *,
+        text: str,
+        baseline_current_node: str | None,
+    ) -> bool:
+        current_node = payload.get("current_node")
+        if (
+            baseline_current_node is not None
+            and (
+                not isinstance(current_node, str)
+                or not current_node
+                or current_node == baseline_current_node
+            )
+        ):
+            return False
+        return self._current_branch_contains_user_text(
+            payload,
+            text,
+        ) and self._canonical_payload_is_final(payload)
+
+    def _resume_via_curl_ws_second_leg(
+        self,
+        *,
+        conversation_id: str,
+        resume_value: str,
+        timeout: float,
+        relay_text_event: Any,
+        text: str,
+        baseline_current_node: str | None,
+    ) -> dict[str, Any]:
+        source_client = self._source_client
+        if source_client is None:
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_SOURCE_CLIENT_MISSING",
+                request_stage="wkwebview_curl_ws_second_leg",
+            )
+        try:
+            import copy
+
+            from curl_cffi import requests as curl_requests
+        except ImportError as error:
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_DEPENDENCY_MISSING",
+                request_stage="wkwebview_curl_ws_second_leg",
+            ) from error
+
+        ws_client = copy.copy(source_client)
+        state: dict[str, Any] = {"conversation_id": conversation_id}
+        capture = getattr(ws_client, "_capture_resume_token_diagnostics", None)
+        if not callable(capture):
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_TOPIC_DECODER_MISSING",
+                request_stage="wkwebview_curl_ws_second_leg",
+            )
+        capture(resume_value, state)
+        topic_id = state.get("resume_turn_topic_id")
+        if not isinstance(topic_id, str) or not topic_id:
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_TOPIC_UNRESOLVED",
+                request_stage="wkwebview_curl_ws_second_leg",
+            )
+
+        celsius_path = "/backend-api/celsius/ws/user"
+        celsius_headers = ws_client._build_headers(
+            {
+                "accept": "*/*",
+                "referer": "https://chatgpt.com/",
+                "x-openai-target-path": celsius_path,
+                "x-openai-target-route": celsius_path,
+            }
+        )
+        with curl_requests.Session(impersonate="safari") as celsius_session:
+            celsius = celsius_session.get(
+                "https://chatgpt.com" + celsius_path,
+                headers=celsius_headers,
+                timeout=min(20.0, max(1.0, float(timeout))),
+            )
+            if celsius.status_code != 200:
+                raise RequestError(
+                    f"WKWEBVIEW_CURL_WS_CELSIUS_HTTP:{celsius.status_code}",
+                    request_stage="wkwebview_curl_ws_second_leg",
+                    status_code=celsius.status_code,
+                )
+            celsius_payload = celsius.json()
+        websocket_url = (
+            celsius_payload.get("websocket_url") if isinstance(celsius_payload, dict) else None
+        )
+        if not isinstance(websocket_url, str) or not websocket_url:
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_URL_MISSING",
+                request_stage="wkwebview_curl_ws_second_leg",
+            )
+
+        def probe_celsius() -> dict[str, Any]:
+            return {"websocket_url": websocket_url}
+
+        ws_client._probe_celsius_ws_user = probe_celsius
+        raw_sequence = 0
+
+        def on_token(value: str) -> None:
+            nonlocal raw_sequence
+            if not isinstance(value, str) or not value:
+                return
+            raw_sequence += 1
+            event: dict[str, Any] = {
+                "type": "assistant_text_delta",
+                "sequence": raw_sequence,
+                "delta": value,
+            }
+            message_id = state.get("message_id")
+            if isinstance(message_id, str) and message_id:
+                event["message_id"] = message_id
+            relay_text_event(event)
+
+        started = time.monotonic()
+        ws_stream = getattr(ws_client, "_stream_handoff_via_ws_topic", None)
+        if not callable(ws_stream):
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_STREAM_METHOD_MISSING",
+                request_stage="wkwebview_curl_ws_second_leg",
+            )
+        ws_stream(
+            topic_id,
+            state=state,
+            on_event=None,
+            on_token=on_token,
+        )
+
+        deadline = started + max(1.0, float(timeout))
+        canonical_url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
+        canonical_headers = ws_client._build_headers(
+            {
+                "accept": "application/json",
+                "referer": f"https://chatgpt.com/c/{conversation_id}",
+            }
+        )
+        last_status = 0
+        with curl_requests.Session(impersonate="safari") as canonical_session:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RequestError(
+                        f"WKWEBVIEW_CURL_WS_CANONICAL_TIMEOUT:last_status={last_status}",
+                        request_stage="wkwebview_curl_ws_second_leg",
+                    )
+                response = canonical_session.get(
+                    canonical_url,
+                    headers=canonical_headers,
+                    timeout=min(20.0, max(1.0, remaining)),
+                )
+                last_status = response.status_code
+                if response.status_code in {401, 403}:
+                    raise RequestError(
+                        f"WKWEBVIEW_CURL_WS_CANONICAL_HTTP:{response.status_code}",
+                        request_stage="wkwebview_curl_ws_second_leg",
+                        status_code=response.status_code,
+                    )
+                if response.status_code == 200:
+                    canonical_payload = response.json()
+                    if isinstance(
+                        canonical_payload, dict
+                    ) and self._canonical_payload_matches_write(
+                        canonical_payload,
+                        text=text,
+                        baseline_current_node=baseline_current_node,
+                    ):
+                        self._cache_final_payload(conversation_id, canonical_payload)
+                        return {
+                            "ok": True,
+                            "status": 200,
+                            "conversation_id": conversation_id,
+                            "canonical_completed": True,
+                            "stream_started": True,
+                            "stream_ended": True,
+                            "stream_terminal_observed": True,
+                            "ws_token_events": raw_sequence,
+                        }
+                time.sleep(min(0.5, max(0.05, remaining)))
 
     @staticmethod
     def _decode_helper_json(
@@ -673,6 +928,14 @@ class WKWebViewTurnProvider:
     def _cache_final_payload(self, conversation_id: str, payload: dict[str, Any]) -> None:
         with self._final_payload_lock:
             self._final_payload_cache[conversation_id] = payload
+        cache = getattr(self._canonical_context, "current_nodes", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._canonical_context.current_nodes = cache
+        current_node = payload.get("current_node")
+        cache[conversation_id] = (
+            current_node if isinstance(current_node, str) and current_node else None
+        )
         if self._is_client_stopped_payload(payload):
             with self._stop_final_condition:
                 self._stopped_final_payloads[conversation_id] = payload
@@ -990,6 +1253,42 @@ class WKWebViewTurnProvider:
                 raise ValueError(f"attachment_paths[{index}] must reference a regular file")
             normalized.append(str(path))
         return tuple(normalized)
+
+    def _upload_minimal_security_attachments(
+        self,
+        attachment_paths: Sequence[str],
+    ) -> tuple[dict[str, Any], ...] | None:
+        if not attachment_paths:
+            return ()
+        source_client = self._source_client
+        uploader = getattr(source_client, "_upload_media_files", None) if source_client is not None else None
+        if not callable(uploader):
+            return None
+        try:
+            uploaded = uploader(
+                [(Path(path), Path(path).name) for path in attachment_paths]
+            )
+        except Exception:
+            return None
+        if not isinstance(uploaded, list) or len(uploaded) != len(attachment_paths):
+            return None
+        descriptors: list[dict[str, Any]] = []
+        for item in uploaded:
+            if not isinstance(item, dict):
+                return None
+            file_id = item.get("file_id")
+            if not isinstance(file_id, str) or not file_id.strip():
+                return None
+            descriptor = {
+                "file_id": file_id.strip(),
+                "file_name": item.get("file_name") if isinstance(item.get("file_name"), str) else "attachment",
+                "file_size": item.get("file_size") if isinstance(item.get("file_size"), int) else None,
+                "mime_type": item.get("mime_type") if isinstance(item.get("mime_type"), str) else None,
+                "width": item.get("width") if isinstance(item.get("width"), int) else None,
+                "height": item.get("height") if isinstance(item.get("height"), int) else None,
+            }
+            descriptors.append(descriptor)
+        return tuple(descriptors)
 
     def _helper_command(
         self,
@@ -1325,6 +1624,7 @@ class WKWebViewTurnProvider:
             raise ValueError("timeout must be positive")
         conversation_id = None
         baseline_current_node = None
+        prewrite_payload: dict[str, Any] | None = None
         if conversation is not None:
             conversation_id = ConversationRef.from_any(conversation).conversation_id
             self.clear_stop_requested_for(conversation_id)
@@ -1337,11 +1637,64 @@ class WKWebViewTurnProvider:
                 value = prewrite_payload.get("current_node")
                 baseline_current_node = value if isinstance(value, str) and value else None
         attachments = self._normalize_attachment_paths(attachment_paths)
+        selected_profile = getattr(self._profile_context, "profile", None)
+        use_minimal_security_shell = (
+            on_text_event is not None
+            and self._minimal_security_shell_enabled()
+            and self._curl_ws_second_leg_enabled()
+            and model_slug is None
+        )
+        minimal_parent_message_id = None
+        minimal_model_slug = None
+        minimal_thinking_effort = None
+        minimal_attachment_descriptors: tuple[dict[str, Any], ...] = ()
+        if use_minimal_security_shell and conversation_id is not None:
+            if not isinstance(prewrite_payload, dict):
+                prewrite_payload = self.read_conversation_payload(
+                    conversation_id,
+                    timeout=min(15.0, total_timeout),
+                )
+            current_value = prewrite_payload.get("current_node")
+            baseline_current_node = (
+                current_value if isinstance(current_value, str) and current_value else None
+            )
+            mapping = (
+                prewrite_payload.get("mapping")
+                if isinstance(prewrite_payload.get("mapping"), dict)
+                else {}
+            )
+            node = mapping.get(baseline_current_node) if baseline_current_node else None
+            message = node.get("message") if isinstance(node, dict) else None
+            author = message.get("author") if isinstance(message, dict) else None
+            role = author.get("role") if isinstance(author, dict) else None
+            message_id = message.get("id") if isinstance(message, dict) else None
+            if role == "assistant" and isinstance(message_id, str) and message_id.strip():
+                minimal_parent_message_id = message_id.strip()
+            else:
+                use_minimal_security_shell = False
+            if use_minimal_security_shell and not isinstance(selected_profile, str):
+                selected_model = prewrite_payload.get("default_model_slug")
+                metadata = message.get("metadata") if isinstance(message, dict) else None
+                selected_effort = metadata.get("thinking_effort") if isinstance(metadata, dict) else None
+                if isinstance(selected_model, str) and selected_model.strip():
+                    minimal_model_slug = selected_model.strip()
+                    if isinstance(selected_effort, str) and selected_effort.strip():
+                        minimal_thinking_effort = selected_effort.strip()
+                    elif "thinking" in minimal_model_slug.lower():
+                        use_minimal_security_shell = False
+                else:
+                    use_minimal_security_shell = False
+        if use_minimal_security_shell and attachments:
+            uploaded_descriptors = self._upload_minimal_security_attachments(attachments)
+            if uploaded_descriptors is None:
+                use_minimal_security_shell = False
+            else:
+                minimal_attachment_descriptors = uploaded_descriptors
         command = self._helper_command(
             conversation_id=conversation_id,
             text=text,
             timeout=total_timeout,
-            attachment_paths=attachments,
+            attachment_paths=() if use_minimal_security_shell else attachments,
             expected_current_node=baseline_current_node,
         )
 
@@ -1377,6 +1730,33 @@ class WKWebViewTurnProvider:
                 "--observe-stream",
                 "--stream-probe-until-resume-token",
             ]
+            if use_minimal_security_shell:
+                command.append("--minimal-security-shell")
+                if conversation_id is not None and minimal_parent_message_id is not None:
+                    command += [
+                        "--minimal-conversation-id",
+                        conversation_id,
+                        "--minimal-parent-message-id",
+                        minimal_parent_message_id,
+                    ]
+                    if minimal_model_slug is not None:
+                        command += ["--minimal-model-slug", minimal_model_slug]
+                    if minimal_thinking_effort is not None:
+                        command += ["--minimal-thinking-effort", minimal_thinking_effort]
+                if minimal_attachment_descriptors:
+                    encoded_attachments = base64.b64encode(
+                        json.dumps(
+                            list(minimal_attachment_descriptors),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).decode("ascii")
+                    command += [
+                        "--minimal-attachments-base64",
+                        encoded_attachments,
+                        "--minimal-attachment-count",
+                        str(len(minimal_attachment_descriptors)),
+                    ]
         started = time.monotonic()
         resume_handoff_path: Path | None = None
         try:
@@ -1385,7 +1765,7 @@ class WKWebViewTurnProvider:
                 os.close(fd)
                 resume_handoff_path = Path(raw_handoff_path)
                 phase_timeout = total_timeout
-                if self._shared_resume_enabled():
+                if self._shared_resume_enabled() or self._curl_ws_second_leg_enabled():
                     gate_wait = max(0.001, total_timeout - (time.monotonic() - started))
                     with self._heavy_submit_gate(gate_wait):
                         phase_timeout = max(1.0, total_timeout - (time.monotonic() - started))
@@ -1470,22 +1850,32 @@ class WKWebViewTurnProvider:
                 request_stage="wkwebview_stream_finality",
                 error_prefix="WKWEBVIEW_STREAM_CANONICAL",
             )
-            self._cache_final_payload(result_conversation_id.strip(), final_payload)
-            phase_one_final_cached = True
+            if self._canonical_payload_matches_write(
+                final_payload,
+                text=text,
+                baseline_current_node=baseline_current_node,
+            ):
+                self._cache_final_payload(result_conversation_id.strip(), final_payload)
+                phase_one_final_cached = True
 
         passive_observer_armed = on_text_event is None
         if on_text_event is not None:
             resume_value = payload.pop("stream_resume_value", None)
-            phase_one_completed = phase_one_final_cached or bool(
-                payload.get("canonical_final_completed")
-            ) or bool(payload.get("stream_ended")) or bool(
-                payload.get("stream_terminal_observed")
-            )
+            phase_one_completed = phase_one_final_cached or bool(payload.get("stream_terminal_observed"))
             if not phase_one_completed:
                 if isinstance(resume_value, str) and resume_value:
                     remaining = max(1.0, total_timeout - (time.monotonic() - started))
                     try:
-                        if self._shared_resume_enabled():
+                        if self._curl_ws_second_leg_enabled():
+                            resume_payload = self._resume_via_curl_ws_second_leg(
+                                conversation_id=result_conversation_id.strip(),
+                                resume_value=resume_value,
+                                timeout=remaining,
+                                relay_text_event=make_stream_relay(),
+                                text=text,
+                                baseline_current_node=baseline_current_node,
+                            )
+                        elif self._shared_resume_enabled():
                             resume_payload = self._get_shared_resume_broker().resume(
                                 conversation_id=result_conversation_id.strip(),
                                 resume_token=resume_value,
@@ -1520,7 +1910,14 @@ class WKWebViewTurnProvider:
                                 request_stage="wkwebview_resume_finality",
                                 error_prefix="WKWEBVIEW_RESUME_CANONICAL",
                             )
-                            self._cache_final_payload(result_conversation_id.strip(), final_payload)
+                            if self._canonical_payload_matches_write(
+                                final_payload,
+                                text=text,
+                                baseline_current_node=baseline_current_node,
+                            ):
+                                self._cache_final_payload(result_conversation_id.strip(), final_payload)
+                            else:
+                                passive_observer_armed = True
                     except RequestError:
                         passive_observer_armed = True
                 else:

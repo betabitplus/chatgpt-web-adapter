@@ -137,6 +137,7 @@ static NSString *ConversationIdFromURL(NSString *urlString) {
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
     self.navigationFinished = YES;
     self.navigationFinishedAt = [NSDate timeIntervalSinceReferenceDate];
+    PrintEvent(@{@"type":@"navigation_finished"});
 }
 
 - (void)webView:(WKWebView *)webView
@@ -179,6 +180,7 @@ completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler {
             self.streamResumeToken = [body[@"token"] isKindOfClass:[NSString class]] ? body[@"token"] : nil;
             NSString *resumeConversationId = [body[@"conversation_id"] isKindOfClass:[NSString class]] ? body[@"conversation_id"] : nil;
             if (resumeConversationId.length > 0) self.streamConversationId = resumeConversationId;
+            PrintEvent(@{@"type":@"stream_resume_token_observed",@"token_present":@(self.streamResumeToken.length > 0),@"conversation_id_present":@(self.streamConversationId.length > 0)});
         } else if ([phase isEqualToString:@"text"]) {
             NSString *eventType = [body[@"type"] isKindOfClass:[NSString class]] ? body[@"type"] : @"";
             if ([eventType isEqualToString:@"assistant_text_snapshot"]
@@ -207,11 +209,13 @@ completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler {
         NSString *phase = [body[@"phase"] isKindOfClass:[NSString class]] ? body[@"phase"] : @"";
         if ([phase isEqualToString:@"request"]) {
             self.submitRequestObserved = YES;
+            PrintEvent(@{@"type":@"submit_request_observed"});
         } else if ([phase isEqualToString:@"response"]) {
             self.submitRequestObserved = YES;
             self.submitResponseObserved = YES;
             NSNumber *status = [body[@"status"] isKindOfClass:[NSNumber class]] ? body[@"status"] : @0;
             self.submitStatus = status.integerValue;
+            PrintEvent(@{@"type":@"submit_response_observed",@"status":status});
         } else if ([phase isEqualToString:@"error"]) {
             self.submitRequestObserved = YES;
             self.submitError = [body[@"error"] isKindOfClass:[NSString class]] ? body[@"error"] : @"SUBMIT_FETCH_FAILED";
@@ -813,6 +817,47 @@ static NSString *CanonicalCommitCheckScript(NSString *conversationId, NSString *
             "})()", idLiteral, promptLiteral, baselineLiteral];
 }
 
+static NSString *MinimalSecurityShellHTML(void) {
+    return @"<!doctype html><meta charset='utf-8'><title>cwa security shell</title>"
+            "<script>window.__cwaSentinelLoaded=false</script>"
+            "<script src='/backend-api/sentinel/sdk.js' onload='window.__cwaSentinelLoaded=true'></script>"
+            "<body></body>";
+}
+
+static NSString *MinimalSecurityWriteScript(
+    NSString *prompt,
+    NSString *profile,
+    NSString *conversationId,
+    NSString *parentMessageId,
+    NSString *selectedModelSlug,
+    NSString *selectedThinkingEffort,
+    NSString *attachmentsBase64
+) {
+    NSURL *resourceURL = [[NSBundle mainBundle] URLForResource:@"minimal_security_shell" withExtension:@"js"];
+    if (resourceURL == nil) return nil;
+    NSError *error = nil;
+    NSString *source = [NSString stringWithContentsOfURL:resourceURL encoding:NSUTF8StringEncoding error:&error];
+    if (source.length == 0 || error != nil) return nil;
+    NSString *promptLiteral = JSONStringLiteral(prompt ?: @"");
+    NSString *profileLiteral = JSONStringLiteral(profile ?: @"");
+    NSString *conversationLiteral = JSONStringLiteral(conversationId ?: @"");
+    NSString *parentLiteral = JSONStringLiteral(parentMessageId ?: @"");
+    NSString *modelLiteral = JSONStringLiteral(selectedModelSlug ?: @"");
+    NSString *effortLiteral = JSONStringLiteral(selectedThinkingEffort ?: @"");
+    NSString *attachmentsLiteral = JSONStringLiteral(attachmentsBase64 ?: @"");
+    return [NSString stringWithFormat:
+        @"window.__CWA_MINIMAL_PROMPT__=%@;window.__CWA_MINIMAL_PROFILE__=%@;window.__CWA_MINIMAL_CONVERSATION_ID__=%@;window.__CWA_MINIMAL_PARENT_MESSAGE_ID__=%@;window.__CWA_MINIMAL_SELECTED_MODEL_SLUG__=%@;window.__CWA_MINIMAL_SELECTED_THINKING_EFFORT__=%@;window.__CWA_MINIMAL_ATTACHMENTS_BASE64__=%@;\n%@",
+        promptLiteral,
+        profileLiteral,
+        conversationLiteral,
+        parentLiteral,
+        modelLiteral,
+        effortLiteral,
+        attachmentsLiteral,
+        source
+    ];
+}
+
 static NSString *CatalogEndpoint(NSString *catalog, NSInteger offset, NSInteger limit, BOOL archived, BOOL starred) {
     if ([catalog isEqualToString:@"models"]) {
         return @"/backend-api/models?history_and_training_disabled=false";
@@ -844,6 +889,12 @@ int main(int argc, const char *argv[]) {
         NSString *prompt64 = ArgValue(args, @"--prompt-base64", @"");
         NSString *prompt = DecodeBase64(prompt64);
         NSString *profile = [ArgValue(args, @"--profile", @"") uppercaseString];
+        NSString *minimalConversationId = ArgValue(args, @"--minimal-conversation-id", @"");
+        NSString *minimalParentMessageId = ArgValue(args, @"--minimal-parent-message-id", @"");
+        NSString *minimalModelSlug = ArgValue(args, @"--minimal-model-slug", @"");
+        NSString *minimalThinkingEffort = ArgValue(args, @"--minimal-thinking-effort", @"");
+        NSString *minimalAttachmentsBase64 = ArgValue(args, @"--minimal-attachments-base64", @"");
+        NSInteger minimalAttachmentCount = [ArgValue(args, @"--minimal-attachment-count", @"0") integerValue];
         NSString *expectedCurrentNode = ArgValue(args, @"--expected-current-node", @"");
         NSString *canonicalConversation = ArgValue(args, @"--canonical-conversation", @"");
         BOOL canonicalOnly = canonicalConversation.length > 0;
@@ -876,6 +927,7 @@ int main(int argc, const char *argv[]) {
         BOOL observeStream = HasArg(args, @"--observe-stream");
         BOOL streamProbeUntilEnd = HasArg(args, @"--stream-probe-until-end");
         BOOL streamProbeUntilResumeToken = HasArg(args, @"--stream-probe-until-resume-token");
+        BOOL minimalSecurityShell = HasArg(args, @"--minimal-security-shell");
         BOOL readOnly = canonicalOnly || catalogOnly || observeOnly || resumeOnly || stopOnly;
         NSInteger operationModeCount = (canonicalOnly ? 1 : 0) + (catalogOnly ? 1 : 0) + (observeOnly ? 1 : 0) + (resumeOnly ? 1 : 0) + (domObserveOnly ? 1 : 0) + (stopOnly ? 1 : 0);
         if (operationModeCount > 1) {
@@ -897,6 +949,21 @@ int main(int argc, const char *argv[]) {
         if (!stopOnly && !readOnly && !domObserveOnly && prompt == nil) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_PROMPT_BASE64_INVALID"});
             return 2;
+        }
+        if (minimalSecurityShell && (
+            readOnly || domObserveOnly || attachments.count > 0
+            || !observeSubmit || !observeStream || !streamProbeUntilResumeToken
+        )) {
+            PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_MINIMAL_SECURITY_MODE_UNSUPPORTED"});
+            return 30;
+        }
+        if (minimalSecurityShell && ((minimalConversationId.length > 0) != (minimalParentMessageId.length > 0))) {
+            PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_MINIMAL_SECURITY_CONTINUATION_IDENTITY_INCOMPLETE"});
+            return 35;
+        }
+        if (minimalSecurityShell && (minimalAttachmentCount < 0 || (minimalAttachmentCount > 0 && minimalAttachmentsBase64.length == 0))) {
+            PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_MINIMAL_SECURITY_ATTACHMENT_DESCRIPTOR_INVALID"});
+            return 36;
         }
 
         [NSApplication sharedApplication];
@@ -939,9 +1006,116 @@ int main(int argc, const char *argv[]) {
         webView.UIDelegate = delegate;
 
         NSTimeInterval started = [NSDate timeIntervalSinceReferenceDate];
-        [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:urlString]]];
+        NSURLRequest *initialRequest = [NSURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+        if (minimalSecurityShell) {
+            [webView loadSimulatedRequest:initialRequest responseHTMLString:MinimalSecurityShellHTML()];
+        } else {
+            [webView loadRequest:initialRequest];
+        }
         NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
         NSDictionary *readySnapshot = nil;
+
+        if (minimalSecurityShell) {
+            while (!delegate.navigationFinished && [deadline timeIntervalSinceNow] > 0) RunLoopFor(0.05);
+            if (!delegate.navigationFinished) {
+                PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_MINIMAL_SECURITY_LOAD_TIMEOUT"});
+                return 31;
+            }
+            NSString *minimalScript = MinimalSecurityWriteScript(
+                prompt,
+                profile,
+                minimalConversationId,
+                minimalParentMessageId,
+                minimalModelSlug,
+                minimalThinkingEffort,
+                minimalAttachmentsBase64
+            );
+            if (minimalScript.length == 0) {
+                PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_MINIMAL_SECURITY_SCRIPT_MISSING"});
+                return 32;
+            }
+            delegate.canonicalDone = NO;
+            delegate.canonicalResult = nil;
+            EvaluateSync(webView, minimalScript, 2.0, nil);
+            BOOL identityPrinted = NO;
+            while ([deadline timeIntervalSinceNow] > 0) {
+                RunLoopFor(0.05);
+                NSDictionary *launch = delegate.canonicalResult;
+                if (delegate.canonicalDone && [launch isKindOfClass:[NSDictionary class]] && ![launch[@"ok"] boolValue]) {
+                    PrintResult(@{
+                        @"ok":@NO,
+                        @"error":@"WKWEBVIEW_MINIMAL_SECURITY_WRITE_FAILED",
+                        @"detail":[launch[@"error"] isKindOfClass:[NSString class]] ? launch[@"error"] : @"",
+                        @"stage":[launch[@"stage"] isKindOfClass:[NSString class]] ? launch[@"stage"] : @"",
+                        @"status":[launch[@"status"] isKindOfClass:[NSNumber class]] ? launch[@"status"] : @0
+                    });
+                    return 33;
+                }
+                if (!identityPrinted && delegate.streamConversationId.length > 0) {
+                    PrintEvent(@{
+                        @"type":@"write_identity_resolved",
+                        @"conversation_id":delegate.streamConversationId,
+                        @"submit_response_observed":@(delegate.submitResponseObserved),
+                        @"submit_response_status":@(delegate.submitStatus)
+                    });
+                    identityPrinted = YES;
+                }
+                BOOL responseOK = (delegate.streamResponseObserved && delegate.streamStatus >= 200 && delegate.streamStatus < 300)
+                    || (delegate.submitResponseObserved && delegate.submitStatus >= 200 && delegate.submitStatus < 300);
+                if (responseOK && delegate.streamResumeToken.length > 0 && delegate.streamConversationId.length > 0) break;
+            }
+            BOOL responseOK = (delegate.streamResponseObserved && delegate.streamStatus >= 200 && delegate.streamStatus < 300)
+                || (delegate.submitResponseObserved && delegate.submitStatus >= 200 && delegate.submitStatus < 300);
+            if (!responseOK || delegate.streamResumeToken.length == 0 || delegate.streamConversationId.length == 0) {
+                PrintResult(@{
+                    @"ok":@NO,
+                    @"error":@"WKWEBVIEW_MINIMAL_SECURITY_RESUME_FENCE_MISSING",
+                    @"submit_response_status":@(delegate.submitStatus),
+                    @"stream_response_status":@(delegate.streamStatus),
+                    @"resume_token_present":@(delegate.streamResumeToken.length > 0),
+                    @"conversation_id_present":@(delegate.streamConversationId.length > 0)
+                });
+                return 34;
+            }
+            BOOL resumeHandoffWritten = NO;
+            if (resumeHandoffFile.length > 0) {
+                resumeHandoffWritten = [delegate.streamResumeToken writeToFile:resumeHandoffFile atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            }
+            NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - started;
+            NSTimeInterval loadElapsed = delegate.navigationFinishedAt > 0 ? delegate.navigationFinishedAt - started : 0;
+            PrintResult(@{
+                @"ok":@YES,
+                @"conversation_id":delegate.streamConversationId,
+                @"response_status":@(delegate.streamResponseObserved ? delegate.streamStatus : delegate.submitStatus),
+                @"submit_request_observed":@(delegate.submitRequestObserved),
+                @"submit_response_observed":@(delegate.submitResponseObserved),
+                @"submit_response_status":@(delegate.submitStatus),
+                @"stream_response_observed":@(delegate.streamResponseObserved),
+                @"stream_response_status":@(delegate.streamStatus),
+                @"elapsed_ms":@((NSInteger)llround(elapsed * 1000.0)),
+                @"load_elapsed_ms":@((NSInteger)llround(MAX(0, loadElapsed) * 1000.0)),
+                @"attachment_count":@(MAX(0, minimalAttachmentCount)),
+                @"profile":profile ?: @"",
+                @"write_commit_proven":@YES,
+                @"write_commit_proof":@"RESUME_FENCE",
+                @"canonical_committed":@NO,
+                @"canonical_final_completed":@NO,
+                @"canonical_body_base64":@"",
+                @"committed_current_node":@"",
+                @"stream_started":@(delegate.streamStarted),
+                @"stream_ended":@(delegate.streamEnded),
+                @"stream_terminal_observed":@(delegate.streamTerminalObserved),
+                @"stream_resume_present":@YES,
+                @"stream_resume_handoff_written":@(resumeHandoffWritten),
+                @"stream_handoff_observed":@(delegate.streamHandoffObserved),
+                @"stream_topic_id":delegate.streamTopicId ?: @"",
+                @"turn_exchange_id":delegate.streamTurnExchangeId ?: @"",
+                @"stream_conversation_id":delegate.streamConversationId,
+                @"minimal_security_shell":@YES,
+                @"bundle_id":@"local.gptty.webkit-authority"
+            });
+            return 0;
+        }
 
         if (readOnly) {
             while (!delegate.navigationFinished && [deadline timeIntervalSinceNow] > 0) {
@@ -1225,6 +1399,7 @@ int main(int argc, const char *argv[]) {
             PrintResult(@{@"ok":@NO,@"error":detail,@"final_url":webView.URL.absoluteString ?: @""});
             return 8;
         }
+        PrintEvent(@{@"type":@"composer_ready"});
 
         NSInteger baselineAssistantCount = [[EvaluateSync(webView, AssistantCountScript(), 1.0, nil) description] integerValue];
         if (attachments.count > 0) {
@@ -1254,10 +1429,13 @@ int main(int argc, const char *argv[]) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_COMPOSER_FILL_FAILED"});
             return 11;
         }
+        PrintEvent(@{@"type":@"composer_filled"});
         NSDate *sendReadyDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(5.0, MAX(0.1, [deadline timeIntervalSinceNow]))];
         BOOL sendReady = NO;
+        NSDictionary *lastSendSnapshot = nil;
         while ([sendReadyDeadline timeIntervalSinceNow] > 0) {
             NSDictionary *snapshot = ParseJSONResult(EvaluateSync(webView, ReadinessScript(), 1.0, nil));
+            if (snapshot) lastSendSnapshot = snapshot;
             if (snapshot && [snapshot[@"send"] boolValue]) {
                 sendReady = YES;
                 break;
@@ -1265,9 +1443,17 @@ int main(int argc, const char *argv[]) {
             RunLoopFor(0.1);
         }
         if (!sendReady) {
-            PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_SEND_CONTROL_NOT_READY"});
+            NSString *bodyTail = [lastSendSnapshot[@"bodyTail"] isKindOfClass:[NSString class]] ? lastSendSnapshot[@"bodyTail"] : @"";
+            NSString *bodyTailLower = bodyTail.lowercaseString;
+            BOOL rateLimited = [bodyTailLower containsString:@"too many requests"]
+                && [bodyTailLower containsString:@"temporarily limited access to your conversations"];
+            PrintResult(@{
+                @"ok":@NO,
+                @"error":rateLimited ? @"WKWEBVIEW_CHATGPT_RATE_LIMITED" : @"WKWEBVIEW_SEND_CONTROL_NOT_READY"
+            });
             return 12;
         }
+        PrintEvent(@{@"type":@"send_ready"});
         BOOL sendClicked = NO;
         NSDate *sendClickDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(5.0, MAX(0.1, [deadline timeIntervalSinceNow]))];
         while (!sendClicked && [sendClickDeadline timeIntervalSinceNow] > 0) {
@@ -1286,6 +1472,7 @@ int main(int argc, const char *argv[]) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_SEND_CONTROL_CLICK_FAILED"});
             return 12;
         }
+        PrintEvent(@{@"type":@"send_action_completed"});
 
         NSString *inputConversationId = ConversationIdFromURL(urlString);
         NSString *resolvedConversationId = inputConversationId;

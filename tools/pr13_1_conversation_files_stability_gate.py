@@ -6,14 +6,14 @@ import json
 import subprocess
 from typing import Any, Callable
 
-from chatgpt_web_adapter import ChatGPTWebClient
-
 from pr13_1_conversation_files_identity_probe import (
     _conversation_id,
     _safe_filename,
     probe_conversation_files,
 )
 from pr13_1_conversation_files_live_gate import conversation_id_from_selector
+
+from chatgpt_web_adapter import ChatGPTWebClient
 
 STABILITY_SCHEMA = "CWA_PR13_1_CONVERSATION_FILES_STABILITY_GATE_V1"
 
@@ -32,7 +32,9 @@ def _identity_fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _target_record(report: dict[str, Any], expected_filename: str) -> dict[str, Any] | None:
+def _target_record(
+    report: dict[str, Any], expected_filename: str
+) -> dict[str, Any] | None:
     records = report.get("records")
     if not isinstance(records, list):
         return None

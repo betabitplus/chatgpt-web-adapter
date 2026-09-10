@@ -22,9 +22,7 @@ def conversation_id_from_selector(value: str) -> str:
 
     parts = [part for part in parsed.path.split("/") if part]
     candidates = [
-        parts[index + 1]
-        for index, part in enumerate(parts[:-1])
-        if part == "c"
+        parts[index + 1] for index, part in enumerate(parts[:-1]) if part == "c"
     ]
     if len(candidates) != 1:
         raise ValueError("CHATGPT_CONVERSATION_URL_REQUIRED")

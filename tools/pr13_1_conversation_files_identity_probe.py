@@ -194,7 +194,9 @@ def summarize_files_payload(payload: Any) -> dict[str, Any]:
             identities.append(identity)
 
     unique_identity_count = len(set(identities))
-    all_records_have_identity = bool(raw_records) and len(identities) == len(raw_records)
+    all_records_have_identity = bool(raw_records) and len(identities) == len(
+        raw_records
+    )
     identities_unique = bool(identities) and unique_identity_count == len(identities)
 
     if not raw_records:

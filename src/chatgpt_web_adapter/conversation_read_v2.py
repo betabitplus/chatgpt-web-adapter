@@ -338,7 +338,9 @@ def get_messages_v2(
     ref = ConversationRef.from_any(url_or_id)
     if limit is None:
         payload = full_reader(ref.conversation_id)
-        return _legacy_get_messages(_FixedConversationPayloadReader(payload), ref, **kwargs)
+        return _legacy_get_messages(
+            _FixedConversationPayloadReader(payload), ref, **kwargs
+        )
 
     latest_reader = getattr(self, "_get_conversation_payload", None)
     if not callable(latest_reader):

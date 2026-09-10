@@ -12,12 +12,17 @@ from .browser_native_client import (
     set_browser_native_turn_provider as _set_browser_native_turn_provider,
 )
 from .browserless_request_guards import gate_browserless_poll_deadline
+from .conversation_read_v2 import (
+    get_messages_v2 as _get_messages_v2,
+)
+from .conversation_read_v2 import (
+    read_conversation_payload_v2 as _read_conversation_payload_v2,
+)
 from .conversation_send import send_to_conversation as _send_to_conversation
 from .diagnostic_metrics import (
     send_with_expanded_metrics as _send_with_expanded_metrics,
 )
 from .export import export_conversation as _export_conversation
-from .messages import get_messages as _get_messages
 from .model_registry import (
     DEFAULT_MODEL as DEFAULT_MODEL,
 )
@@ -105,6 +110,21 @@ CHAT_FILES_URL = _core.CHAT_FILES_URL
 CELSIUS_WS_USER_URL = _core.CELSIUS_WS_USER_URL
 
 
+def _conversation_endpoint_override_active() -> bool:
+    """Preserve the historical endpoint-override compatibility seam.
+
+    PR12.3 deliberately kept endpoint constants patchable from this public module.
+    A consumer that replaces either conversation endpoint is therefore opting into
+    that historical contract; do not silently reinterpret its mock/server as the
+    newer plural item endpoint.
+    """
+
+    return (
+        CHAT_CONVERSATION_URL != _core.CHAT_CONVERSATION_URL
+        or CHAT_CONVERSATIONS_URL != _core.CHAT_CONVERSATIONS_URL
+    )
+
+
 def _remap_legacy_endpoint(url: str) -> str:
     for historical, current in (
         (_core.CHAT_REQUIREMENTS_URL, CHAT_REQUIREMENTS_URL),
@@ -183,6 +203,34 @@ class ChatGPTWebClient(_core.ChatGPTWebClient):
             follow_redirects=follow_redirects,
         )
 
+    def _get_conversation_payload(self, conversation_id: str) -> dict[str, Any]:
+        if _conversation_endpoint_override_active():
+            return _core.ChatGPTWebClient._get_conversation_payload(
+                self,
+                conversation_id,
+            )
+        return _read_conversation_payload_v2(
+            self,
+            conversation_id,
+            current_base_url=CHAT_CONVERSATIONS_URL,
+            legacy_url_template=CHAT_CONVERSATION_URL,
+            include_all_pages=False,
+        )
+
+    def _get_full_conversation_payload(self, conversation_id: str) -> dict[str, Any]:
+        if _conversation_endpoint_override_active():
+            return _core.ChatGPTWebClient._get_conversation_payload(
+                self,
+                conversation_id,
+            )
+        return _read_conversation_payload_v2(
+            self,
+            conversation_id,
+            current_base_url=CHAT_CONVERSATIONS_URL,
+            legacy_url_template=CHAT_CONVERSATION_URL,
+            include_all_pages=True,
+        )
+
     _get_ready_requirements = _gate_prepared_get_ready_requirements(
         _gate_get_ready_requirements(_core.ChatGPTWebClient._get_ready_requirements)
     )
@@ -208,7 +256,7 @@ class ChatGPTWebClient(_core.ChatGPTWebClient):
     )
     attach_conversation = _attach_conversation
     export_conversation = _export_conversation
-    get_messages = _get_messages
+    get_messages = _get_messages_v2
     get_pending_approval = _get_pending_approval
     get_required_action = _get_required_action
     get_status = _get_status

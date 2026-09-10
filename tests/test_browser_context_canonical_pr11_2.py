@@ -14,7 +14,9 @@ from chatgpt_web_adapter.browser_context_canonical import (
     _CanonicalReadChunkCollector,
 )
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeTurnProvider
-from chatgpt_web_adapter.browser_owned_product_transport import BrowserOwnedProductTransport
+from chatgpt_web_adapter.browser_owned_product_transport import (
+    BrowserOwnedProductTransport,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSION = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
@@ -65,13 +67,16 @@ def test_chunk_collector_reassembles_exact_sha256_sealed_bytes() -> None:
             }
         )
 
-    assert collector.finish(
-        {
-            "chunkCount": 2,
-            "totalBytes": len(body),
-            "sha256": digest,
-        }
-    ) == body
+    assert (
+        collector.finish(
+            {
+                "chunkCount": 2,
+                "totalBytes": len(body),
+                "sha256": digest,
+            }
+        )
+        == body
+    )
 
 
 def test_chunk_collector_rejects_integrity_mismatch() -> None:
@@ -127,10 +132,14 @@ def test_browser_context_client_owns_terminal_ack_contract(tmp_path) -> None:
     assert not callable(getattr(provider, "complete_canonical_readback", None))
 
 
-def test_browser_context_client_keeps_python_status_interpreter(tmp_path, monkeypatch) -> None:
+def test_browser_context_client_keeps_python_status_interpreter(
+    tmp_path, monkeypatch
+) -> None:
     provider = BrowserNativeTurnProvider(state_dir=tmp_path)
     client = BrowserContextCanonicalClient(object(), provider)
-    monkeypatch.setattr(client.transport, "read_conversation", lambda _conversation: _payload())
+    monkeypatch.setattr(
+        client.transport, "read_conversation", lambda _conversation: _payload()
+    )
 
     status = client.get_status("conversation-1")
 
@@ -180,7 +189,9 @@ def test_custom_provider_preserves_legacy_canonical_client_contract() -> None:
 
 
 def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -> None:
-    source = (EXTENSION / "service_worker_canonical_read.js").read_text(encoding="utf-8")
+    source = (EXTENSION / "service_worker_canonical_read_v2.js").read_text(
+        encoding="utf-8"
+    )
     read = (EXTENSION / "service_worker_runtime_read.js").read_text(encoding="utf-8")
     runtime = (EXTENSION / "service_worker_runtime.js").read_text(encoding="utf-8")
     bootstrap = (
@@ -199,18 +210,28 @@ def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -
     assert bootstrap.rstrip().endswith('importScripts("service_worker_runtime.js");')
     assert connector.rstrip().endswith("};")
     citations = 'importScripts("service_worker_product_source_citations_pr9_3.js");'
-    canonical = 'importScripts("service_worker_canonical_read.js");'
+    canonical = 'importScripts("service_worker_canonical_read_v2.js");'
     assert read.index(citations) < read.index(canonical)
-    assert runtime.index('importScripts("service_worker_runtime_write.js");') < runtime.index(
-        'importScripts("service_worker_runtime_read.js");'
+    assert runtime.index(
+        'importScripts("service_worker_runtime_write.js");'
+    ) < runtime.index('importScripts("service_worker_runtime_read.js");')
+    assert (
+        'importScripts("service_worker_temporary_chat_route_reopen_probe.js")'
+        not in source
     )
-    assert 'importScripts("service_worker_temporary_chat_route_reopen_probe.js")' not in source
 
     assert 'credentials: "include"' in source
     assert "response.arrayBuffer()" in source
     assert 'crypto.subtle.digest("SHA-256", bytes)' in source
     assert "CWA_CANONICAL_CHUNK_BASE64_CHARS = 600_000" in source
-    assert 'response.status === 404' in source
+    assert "/backend-api/conversations/" in source
+    assert 'url.searchParams.set("include_has_versions", "true")' in source
+    assert 'url.searchParams.set("num_turns", String(currentNumTurns))' in source
+    assert 'url.searchParams.set("before", before)' in source
+    assert "includeAllPages" in source
+    assert "/backend-api/conversation/" in source
+    assert "first.status !== 404" in source
+    assert "response.status === 404" in source
     assert '"CANONICAL_READ_AUTHENTICATION_REQUIRED"' in source
     assert '"CANONICAL_READ_ACCESS_CHALLENGED"' in source
     assert "document.cookie" not in source

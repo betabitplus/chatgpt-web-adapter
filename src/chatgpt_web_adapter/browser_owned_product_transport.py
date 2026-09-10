@@ -8,7 +8,10 @@ from .browser_authority_lease import (
     BrowserAuthorityPolicy,
     resolve_browser_authority_policy,
 )
-from .browser_context_canonical import BrowserContextCanonicalClient
+from .browser_context_canonical import (
+    BrowserContextCanonicalClient as _LegacyBrowserContextCanonicalClient,
+)
+from .browser_context_canonical_v2 import BrowserContextCanonicalClientV2
 from .browser_native_provider import BrowserNativeTurnProvider
 from .browser_owned_submission_lifecycle import BrowserOwnedSubmissionLifecycle
 from .browser_owned_write_runtime import BrowserOwnedProductWriteRuntime
@@ -49,9 +52,9 @@ class BrowserOwnedProductTransport(_core.BrowserOwnedProductTransport):
         )
         self.canonical_client = (
             source_canonical
-            if isinstance(source_canonical, BrowserContextCanonicalClient)
+            if isinstance(source_canonical, _LegacyBrowserContextCanonicalClient)
             or not self._browser_context_canonical_enabled
-            else BrowserContextCanonicalClient(source_canonical, self.provider)
+            else BrowserContextCanonicalClientV2(source_canonical, self.provider)
         )
         self._model_profile_selection_supported = callable(
             getattr(self.provider, "require_profile", None)

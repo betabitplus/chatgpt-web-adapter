@@ -224,7 +224,7 @@ def test_current_endpoint_paginates_with_before_cursor() -> None:
     assert first.path == "/backend-api/conversations/conversation-1"
     assert parse_qs(first.query) == {
         "include_has_versions": ["true"],
-        "num_turns": ["100"],
+        "num_turns": ["20"],
     }
     assert parse_qs(second.query)["before"] == ["cursor-2"]
 
@@ -266,9 +266,7 @@ def test_current_non_404_failure_never_falls_back_to_legacy(status: int) -> None
     assert len(client.urls) == 1
 
 
-def test_message_limit_uses_latest_page_but_unbounded_history_uses_full_reader() -> (
-    None
-):
+def test_message_limit_uses_latest_page_when_it_already_satisfies_limit() -> None:
     class _Reader:
         def __init__(self):
             self.latest_reads = 0
@@ -276,7 +274,10 @@ def test_message_limit_uses_latest_page_but_unbounded_history_uses_full_reader()
 
         def _get_conversation_payload(self, _conversation_id: str):
             self.latest_reads += 1
-            return _legacy_payload("u3", "a4")
+            return {
+                **_legacy_payload("u3", "a4"),
+                "page_info": {"has_previous_page": True},
+            }
 
         def _get_full_conversation_payload(self, _conversation_id: str):
             self.full_reads += 1
@@ -294,6 +295,30 @@ def test_message_limit_uses_latest_page_but_unbounded_history_uses_full_reader()
 
     empty = get_messages_v2(reader, "conversation-1", limit=0)
     assert empty == []
+    assert (reader.latest_reads, reader.full_reads) == (1, 1)
+
+
+def test_message_limit_uses_full_reader_when_latest_page_is_insufficient() -> None:
+    class _Reader:
+        def __init__(self):
+            self.latest_reads = 0
+            self.full_reads = 0
+
+        def _get_conversation_payload(self, _conversation_id: str):
+            self.latest_reads += 1
+            return {
+                **_legacy_payload("u3", "a4"),
+                "page_info": {"has_previous_page": True},
+            }
+
+        def _get_full_conversation_payload(self, _conversation_id: str):
+            self.full_reads += 1
+            return _legacy_payload("u1", "a2", "u3", "a4")
+
+    reader = _Reader()
+    messages = get_messages_v2(reader, "conversation-1", limit=3)
+
+    assert [message.message_id for message in messages] == ["a2", "u3", "a4"]
     assert (reader.latest_reads, reader.full_reads) == (1, 1)
 
 

@@ -1,6 +1,7 @@
 const _cwaCanonicalPriorOnNativeMessage = onNativeMessage;
 const CWA_CANONICAL_CHUNK_BASE64_CHARS = 600_000;
-const CWA_CANONICAL_CURRENT_NUM_TURNS = 100;
+// Product-observed server query hint. It is not a message-count guarantee.
+const CWA_CANONICAL_CURRENT_NUM_TURNS = 20;
 const CWA_CANONICAL_MAX_PAGES = 100;
 
 function _cwaCanonicalConversationId(value) {

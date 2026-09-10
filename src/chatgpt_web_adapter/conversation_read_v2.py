@@ -8,7 +8,10 @@ from .exceptions import RequestError
 from .messages import get_messages as _legacy_get_messages
 from .types import ChatConversation, ConversationRef
 
-CURRENT_CONVERSATION_NUM_TURNS = 100
+# Product-observed server query hint. This is not a client-side message-count
+# guarantee: a live long-chat response returned far more than 20 messages while
+# still requiring this smaller value to avoid an upstream HTTP 500.
+CURRENT_CONVERSATION_NUM_TURNS = 20
 MAX_CANONICAL_CONVERSATION_PAGES = 100
 
 
@@ -183,6 +186,11 @@ def _page_cursor(payload: dict[str, Any]) -> str | None:
     return cursor
 
 
+def _has_previous_page(payload: dict[str, Any]) -> bool:
+    page_info = payload.get("page_info")
+    return isinstance(page_info, dict) and page_info.get("has_previous_page") is True
+
+
 def _current_conversation_url(
     base_url: str,
     conversation_id: str,
@@ -297,9 +305,9 @@ def read_conversation_payload_v2(
 
 @dataclass
 class _FixedConversationPayloadReader:
-    payload: dict[str, Any]
+    payload: Any
 
-    def _get_conversation_payload(self, _conversation_id: str) -> dict[str, Any]:
+    def _get_conversation_payload(self, _conversation_id: str) -> Any:
         return self.payload
 
 
@@ -308,7 +316,7 @@ def get_messages_v2(
     url_or_id: ConversationRef | ChatConversation | dict[str, Any] | str,
     **kwargs: Any,
 ):
-    """Use full pagination only when a requested history can exceed one page."""
+    """Use one bounded page when sufficient; paginate only when history requires it."""
 
     # Preserve the long-standing injected-reader seam. Tests and integrations may
     # replace ``_get_conversation_payload`` on one client instance with an exact
@@ -318,16 +326,36 @@ def get_messages_v2(
         return _legacy_get_messages(self, url_or_id, **kwargs)
 
     limit = kwargs.get("limit")
-    if limit is not None:
-        if isinstance(limit, bool) or not isinstance(limit, int):
-            return _legacy_get_messages(self, url_or_id, **kwargs)
-        if limit <= CURRENT_CONVERSATION_NUM_TURNS:
-            return _legacy_get_messages(self, url_or_id, **kwargs)
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+    ):
+        return _legacy_get_messages(self, url_or_id, **kwargs)
 
     full_reader = getattr(self, "_get_full_conversation_payload", None)
     if not callable(full_reader):
         return _legacy_get_messages(self, url_or_id, **kwargs)
 
     ref = ConversationRef.from_any(url_or_id)
+    if limit is None:
+        payload = full_reader(ref.conversation_id)
+        return _legacy_get_messages(_FixedConversationPayloadReader(payload), ref, **kwargs)
+
+    latest_reader = getattr(self, "_get_conversation_payload", None)
+    if not callable(latest_reader):
+        return _legacy_get_messages(self, ref, **kwargs)
+
+    latest_payload = latest_reader(ref.conversation_id)
+    latest_messages = _legacy_get_messages(
+        _FixedConversationPayloadReader(latest_payload),
+        ref,
+        **kwargs,
+    )
+    if (
+        len(latest_messages) >= limit
+        or not isinstance(latest_payload, dict)
+        or not _has_previous_page(latest_payload)
+    ):
+        return latest_messages
+
     payload = full_reader(ref.conversation_id)
     return _legacy_get_messages(_FixedConversationPayloadReader(payload), ref, **kwargs)

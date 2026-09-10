@@ -360,7 +360,9 @@ def test_absolute_finalize_expiry_clamps_relative_ttl() -> None:
 
     bundle = acquire_finalized_sentinel_bundle(client)
 
-    assert 20 <= bundle.expires_monotonic - bundle.acquired_monotonic <= 25
+    ttl = bundle.expires_monotonic - bundle.acquired_monotonic
+    assert 20 <= ttl
+    assert ttl <= 25 or ttl == pytest.approx(25, abs=1e-9)
 
 
 def test_finalize_failure_does_not_cache_or_restore_provider_evidence() -> None:

@@ -105,6 +105,59 @@ write_attempted = false
 
 The distinction matters: proving that bytes can be fetched and match a known fixture does not yet define a safe public API, destination policy, overwrite semantics, retry authority, or longitudinal identity guarantee.
 
+## Authenticated live result — 2026-09-10
+
+A clean exact-head run against the same saved conversation and generated text fixture used by PR13.1 and PR13.2 returned:
+
+```text
+head_matches = true
+tracked_clean = true
+identity_discovery_characterization = EXPLICIT_PRODUCT_IDENTITY_CANDIDATES_OBSERVED
+identity_key = file_id
+target_record_present = true
+resolution_status_code = 200
+resolution_locator_field_present = true
+resolution_locator_key = download_url
+locator_origin_class = CHATGPT_SAME_ORIGIN
+locator_fetch_status_code = 200
+observed_size_bytes = 45
+expected_size_bytes = 45
+size_matches = true
+observed_sha256 = d0bb354d72fad3715f5348740d75dd644435165f68034f54f7974c834cbe9f1d
+expected_sha256 = d0bb354d72fad3715f5348740d75dd644435165f68034f54f7974c834cbe9f1d
+sha256_matches = true
+artifact_bytes_proven = true
+artifact_integrity_proven = true
+identity_bound_byte_retrieval_proven = true
+characterization = IDENTITY_BOUND_ARTIFACT_BYTES_INTEGRITY_OBSERVED
+```
+
+Request accounting remained bounded and explicit:
+
+```text
+request_count = 3
+identity_discovery_request_count = 1
+resolution_request_count = 1
+locator_fetch_request_count = 1
+```
+
+The raw `file_id`, resolver locator, signed locator query, resolver response body and artifact bytes were not copied into repository evidence. The probe performed no artifact disk write, no materialization, no product write, and granted no download authority.
+
+This live result closes PR13.3's byte-retrieval question positively: the exact product-owned identity discovered from the conversation resolved to a same-origin product locator whose returned bytes exactly matched the independently known fixture by both size and SHA-256.
+
+The proven chain is now:
+
+```text
+saved conversation
+  -> explicit product-owned file_id
+  -> same file_id across independent immediate reads
+  -> identity-bound product resolver
+  -> locator-bearing resolution response
+  -> locator byte fetch
+  -> exact byte-count match
+  -> exact SHA-256 match
+```
+
 ## Privacy boundary
 
 The final report never exports:
@@ -136,13 +189,13 @@ There is no endpoint fallback and no locator-origin fallback.
 
 ## Relationship to the frozen PR10.1 status
 
-Even a positive PR13.3 result does not directly modify:
+The positive PR13.3 result removes the uncertainty around identity-bound byte retrieval and artifact integrity, but does not directly modify:
 
 ```text
 ARTIFACT_DOWNLOAD_HANDOFF_UNSUPPORTED_WITHOUT_STABLE_PRODUCT_IDENTITY
 ```
 
-PR13.3 would remove the separate uncertainty around identity-bound byte retrieval and integrity. A later promotion step can then decide whether the accumulated PR13.1–PR13.3 evidence is sufficient to revise the product capability contract, or whether one longitudinal identity gate is still required first.
+The remaining question is no longer whether generated artifact bytes are reachable or whether the resolver is identity-bound. It is whether the product-owned identity has enough longitudinal/session stability, and whether CWA has a sufficiently governed destination/overwrite/retry contract, to promote this evidence into a public production handoff.
 
 ## Running the live gate
 

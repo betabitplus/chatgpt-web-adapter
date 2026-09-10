@@ -45,9 +45,7 @@ def test_probe_performs_exactly_one_get_and_exports_no_locator_values() -> None:
     assert len(client.calls) == 1
     method, url, payload, headers = client.calls[0]
     assert method == "GET"
-    assert url == (
-        "https://chatgpt.com/backend-api/conversations/conversation-1/files"
-    )
+    assert url == ("https://chatgpt.com/backend-api/conversations/conversation-1/files")
     assert payload is None
     assert headers["accept"] == "application/json"
     assert report["request_count"] == 1

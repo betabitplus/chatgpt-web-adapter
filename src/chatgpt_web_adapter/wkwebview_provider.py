@@ -8,11 +8,11 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -35,6 +35,13 @@ _HELPER_BUNDLE_ID = "local.gptty.webkit-authority"
 _HELPER_DIRNAME = "wkwebview-authority"
 _RESULT_PREFIX = "WK_RESULT "
 _EVENT_PREFIX = "WK_EVENT "
+
+
+@dataclass
+class _WKHelperInvocation:
+    command: list[str]
+    request: dict[str, Any]
+    capture_resume: bool = False
 
 
 class _WKSharedResumeState:
@@ -968,20 +975,21 @@ class WKWebViewTurnProvider:
         if total_timeout <= 0:
             return None
         binary = self._ensure_helper()
-        command = [
-            str(binary),
-            "--observe-conversation",
-            conversation_id,
-            "--poll-interval",
-            "3.000",
-            "--timeout",
-            f"{total_timeout:.3f}",
-        ]
+        invocation = _WKHelperInvocation(
+            command=[str(binary), "--timeout", f"{total_timeout:.3f}"],
+            request={
+                "observe_conversation": conversation_id,
+                "poll_interval": 3.0,
+                "timeout": total_timeout,
+            },
+        )
+        command, request_input = self._helper_subprocess_input(invocation)
         env = os.environ.copy()
         env.setdefault("NSUnbufferedIO", "YES")
         try:
             process = subprocess.Popen(
                 command,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -993,6 +1001,12 @@ class WKWebViewTurnProvider:
                 f"WKWEBVIEW_STOP_OBSERVER_LAUNCH_FAILED: {error}",
                 request_stage="wkwebview_stop_generation",
             ) from error
+        assert process.stdin is not None
+        try:
+            process.stdin.write(request_input or "{}")
+            process.stdin.close()
+        except OSError:
+            pass
 
         deadline = time.monotonic() + total_timeout
         try:
@@ -1085,13 +1099,13 @@ class WKWebViewTurnProvider:
 
         binary = self._ensure_helper()
         payload = self._run_helper(
-            [
-                str(binary),
-                "--canonical-conversation",
-                conversation_id,
-                "--timeout",
-                f"{timeout:.3f}",
-            ],
+            _WKHelperInvocation(
+                command=[str(binary), "--timeout", f"{timeout:.3f}"],
+                request={
+                    "canonical_conversation": conversation_id,
+                    "timeout": float(timeout),
+                },
+            ),
             timeout=timeout,
         )
         return self._decode_helper_json(
@@ -1343,34 +1357,60 @@ class WKWebViewTurnProvider:
         attachment_paths: Sequence[str] = (),
         expected_current_node: str | None = None,
         stop_only: bool = False,
-    ) -> list[str]:
+    ) -> _WKHelperInvocation:
         binary = self._ensure_helper()
         url = (
             f"https://chatgpt.com/c/{conversation_id}"
             if conversation_id
             else "https://chatgpt.com/"
         )
-        command = [str(binary), "--url", url, "--timeout", f"{timeout:.3f}"]
+        request: dict[str, Any] = {
+            "url": url,
+            "timeout": float(timeout),
+        }
         if text is not None:
-            encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
-            command += ["--prompt-base64", encoded]
+            request["prompt"] = text
         if isinstance(expected_current_node, str) and expected_current_node.strip():
-            command += ["--expected-current-node", expected_current_node.strip()]
-        for path in attachment_paths:
-            command += ["--attach", path]
+            request["expected_current_node"] = expected_current_node.strip()
+        if attachment_paths:
+            request["attachments"] = list(attachment_paths)
         profile = getattr(self._profile_context, "profile", None)
         if isinstance(profile, str):
-            command += ["--profile", PROFILE_TO_PRODUCT_MODE[profile]]
+            request["profile"] = PROFILE_TO_PRODUCT_MODE[profile]
         if stop_only:
-            command.append("--stop-only")
-        return command
+            request["stop_only"] = True
+        return _WKHelperInvocation(
+            command=[str(binary), "--timeout", f"{timeout:.3f}"],
+            request=request,
+        )
 
-    def _run_helper(self, command: list[str], *, timeout: float) -> dict[str, Any]:
+    @staticmethod
+    def _helper_subprocess_input(
+        invocation: list[str] | _WKHelperInvocation,
+    ) -> tuple[list[str], str | None]:
+        if isinstance(invocation, _WKHelperInvocation):
+            command = [*invocation.command, "--request-stdin"]
+            request_input = json.dumps(
+                invocation.request,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            return command, request_input
+        return list(invocation), None
+
+    def _run_helper(
+        self,
+        invocation: list[str] | _WKHelperInvocation,
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
         env = os.environ.copy()
         env.setdefault("NSUnbufferedIO", "YES")
+        command, request_input = self._helper_subprocess_input(invocation)
         try:
             completed = subprocess.run(
                 command,
+                input=request_input,
                 capture_output=True,
                 text=True,
                 timeout=max(1.0, timeout + 5.0),
@@ -1413,7 +1453,7 @@ class WKWebViewTurnProvider:
 
     def _run_helper_streaming(
         self,
-        command: list[str],
+        invocation: list[str] | _WKHelperInvocation,
         *,
         timeout: float,
         on_text_event: Any,
@@ -1428,20 +1468,45 @@ class WKWebViewTurnProvider:
         env.setdefault("NSUnbufferedIO", "YES")
         if extra_env:
             env.update(extra_env)
+        command, request_input = self._helper_subprocess_input(invocation)
+        resume_read_fd: int | None = None
+        resume_write_fd: int | None = None
+        pass_fds: tuple[int, ...] = ()
+        if isinstance(invocation, _WKHelperInvocation) and invocation.capture_resume:
+            resume_read_fd, resume_write_fd = os.pipe()
+            os.set_inheritable(resume_write_fd, True)
+            command += ["--resume-handoff-fd", str(resume_write_fd)]
+            pass_fds = (resume_write_fd,)
         try:
             process = subprocess.Popen(
                 command,
+                stdin=subprocess.PIPE if request_input is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
                 env=env,
+                pass_fds=pass_fds,
             )
         except OSError as error:
+            if resume_read_fd is not None:
+                os.close(resume_read_fd)
+            if resume_write_fd is not None:
+                os.close(resume_write_fd)
             raise RequestError(
                 f"WKWEBVIEW_AUTHORITY_LAUNCH_FAILED: {error}",
                 request_stage="wkwebview_authority_turn",
             ) from error
+        if resume_write_fd is not None:
+            os.close(resume_write_fd)
+            resume_write_fd = None
+        if request_input is not None:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(request_input)
+                process.stdin.close()
+            except OSError:
+                pass
 
         deadline = time.monotonic() + max(1.0, timeout + 5.0)
         payload: dict[str, Any] | None = None
@@ -1490,6 +1555,23 @@ class WKWebViewTurnProvider:
         finally:
             if process.poll() is None:
                 self._terminate_observer_process(process)
+
+        resume_value = ""
+        if resume_read_fd is not None:
+            try:
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(resume_read_fd, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                resume_value = b"".join(chunks).decode("utf-8").strip()
+            except (OSError, UnicodeDecodeError):
+                resume_value = ""
+            finally:
+                os.close(resume_read_fd)
+        if payload is not None and resume_value:
+            payload["stream_resume_value"] = resume_value
 
         if payload is None:
             detail = "no helper result"
@@ -1548,20 +1630,21 @@ class WKWebViewTurnProvider:
             raise ValueError("timeout must be positive")
 
         binary = self._ensure_helper()
-        command = [
-            str(binary),
-            "--observe-conversation",
-            ref.conversation_id,
-            "--poll-interval",
-            "1.000",
-            "--timeout",
-            f"{total_timeout:.3f}",
-        ]
+        invocation = _WKHelperInvocation(
+            command=[str(binary), "--timeout", f"{total_timeout:.3f}"],
+            request={
+                "observe_conversation": ref.conversation_id,
+                "poll_interval": 1.0,
+                "timeout": total_timeout,
+            },
+        )
+        command, request_input = self._helper_subprocess_input(invocation)
         env = os.environ.copy()
         env.setdefault("NSUnbufferedIO", "YES")
         try:
             process = subprocess.Popen(
                 command,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1573,6 +1656,12 @@ class WKWebViewTurnProvider:
                 f"WKWEBVIEW_CANONICAL_OBSERVER_LAUNCH_FAILED: {error}",
                 request_stage="browser_native_observe_turn",
             ) from error
+        assert process.stdin is not None
+        try:
+            process.stdin.write(request_input or "{}")
+            process.stdin.close()
+        except OSError:
+            pass
 
         deadline = time.monotonic() + total_timeout
         last_message_id: str | None = None
@@ -1734,7 +1823,7 @@ class WKWebViewTurnProvider:
                 use_minimal_security_shell = False
             else:
                 minimal_attachment_descriptors = uploaded_descriptors
-        command = self._helper_command(
+        invocation = self._helper_command(
             conversation_id=conversation_id,
             text=text,
             timeout=total_timeout,
@@ -1769,76 +1858,47 @@ class WKWebViewTurnProvider:
             return relay
 
         if on_text_event is not None:
-            command += [
+            invocation.command += [
                 "--observe-submit",
                 "--observe-stream",
                 "--stream-probe-until-resume-token",
             ]
+            invocation.capture_resume = True
             if use_minimal_security_shell:
-                command.append("--minimal-security-shell")
+                invocation.command.append("--minimal-security-shell")
                 if conversation_id is not None and minimal_parent_message_id is not None:
-                    command += [
-                        "--minimal-conversation-id",
-                        conversation_id,
-                        "--minimal-parent-message-id",
-                        minimal_parent_message_id,
-                    ]
+                    invocation.request["minimal_conversation_id"] = conversation_id
+                    invocation.request["minimal_parent_message_id"] = minimal_parent_message_id
                     if minimal_model_slug is not None:
-                        command += ["--minimal-model-slug", minimal_model_slug]
+                        invocation.request["minimal_model_slug"] = minimal_model_slug
                     if minimal_thinking_effort is not None:
-                        command += ["--minimal-thinking-effort", minimal_thinking_effort]
+                        invocation.request["minimal_thinking_effort"] = minimal_thinking_effort
                 if minimal_attachment_descriptors:
-                    encoded_attachments = base64.b64encode(
-                        json.dumps(
-                            list(minimal_attachment_descriptors),
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    ).decode("ascii")
-                    command += [
-                        "--minimal-attachments-base64",
-                        encoded_attachments,
-                        "--minimal-attachment-count",
-                        str(len(minimal_attachment_descriptors)),
-                    ]
+                    invocation.request["minimal_attachments"] = list(
+                        minimal_attachment_descriptors
+                    )
         started = time.monotonic()
-        resume_handoff_path: Path | None = None
-        try:
-            if on_text_event is not None:
-                fd, raw_handoff_path = tempfile.mkstemp(prefix="cwa-wk-resume-")
-                os.close(fd)
-                resume_handoff_path = Path(raw_handoff_path)
-                phase_timeout = total_timeout
-                if self._shared_resume_enabled() or self._curl_ws_second_leg_enabled():
-                    gate_wait = max(0.001, total_timeout - (time.monotonic() - started))
-                    with self._heavy_submit_gate(gate_wait):
-                        phase_timeout = max(1.0, total_timeout - (time.monotonic() - started))
-                        payload = self._run_helper_streaming(
-                            command,
-                            timeout=phase_timeout,
-                            on_text_event=make_stream_relay(),
-                            on_lifecycle_event=on_write_identity,
-                            extra_env={"CWA_WK_RESUME_HANDOFF_FILE": str(resume_handoff_path)},
-                        )
-                else:
+        if on_text_event is not None:
+            phase_timeout = total_timeout
+            if self._shared_resume_enabled() or self._curl_ws_second_leg_enabled():
+                gate_wait = max(0.001, total_timeout - (time.monotonic() - started))
+                with self._heavy_submit_gate(gate_wait):
+                    phase_timeout = max(1.0, total_timeout - (time.monotonic() - started))
                     payload = self._run_helper_streaming(
-                        command,
+                        invocation,
                         timeout=phase_timeout,
                         on_text_event=make_stream_relay(),
                         on_lifecycle_event=on_write_identity,
-                        extra_env={"CWA_WK_RESUME_HANDOFF_FILE": str(resume_handoff_path)},
                     )
-                try:
-                    resume_value = resume_handoff_path.read_text(encoding="utf-8").strip()
-                except OSError:
-                    resume_value = ""
-                if resume_value:
-                    payload["stream_resume_value"] = resume_value
             else:
-                payload = self._run_helper(command, timeout=total_timeout)
-        finally:
-            if resume_handoff_path is not None:
-                resume_handoff_path.unlink(missing_ok=True)
+                payload = self._run_helper_streaming(
+                    invocation,
+                    timeout=phase_timeout,
+                    on_text_event=make_stream_relay(),
+                    on_lifecycle_event=on_write_identity,
+                )
+        else:
+            payload = self._run_helper(invocation, timeout=total_timeout)
         result_conversation_id = payload.get("conversation_id")
         if not isinstance(result_conversation_id, str) or not result_conversation_id.strip():
             raise RequestError(
@@ -1928,21 +1988,24 @@ class WKWebViewTurnProvider:
                                 on_text_event=make_stream_relay(),
                             )
                         else:
-                            resume_command = [
-                                str(self._ensure_helper()),
-                                "--resume-conversation",
-                                result_conversation_id.strip(),
-                                "--resume-offset",
-                                "0",
-                                "--observe-stream",
-                                "--timeout",
-                                f"{remaining:.3f}",
-                            ]
+                            resume_invocation = _WKHelperInvocation(
+                                command=[
+                                    str(self._ensure_helper()),
+                                    "--observe-stream",
+                                    "--timeout",
+                                    f"{remaining:.3f}",
+                                ],
+                                request={
+                                    "resume_conversation": result_conversation_id.strip(),
+                                    "resume_offset": 0,
+                                    "resume_value": resume_value,
+                                    "timeout": remaining,
+                                },
+                            )
                             resume_payload = self._run_helper_streaming(
-                                resume_command,
+                                resume_invocation,
                                 timeout=remaining,
                                 on_text_event=make_stream_relay(),
-                                extra_env={"CWA_WK_RESUME_VALUE": resume_value},
                             )
                         encoded_final = resume_payload.get("canonical_body_base64")
                         if isinstance(encoded_final, str) and encoded_final:

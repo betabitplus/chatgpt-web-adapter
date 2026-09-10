@@ -1,6 +1,8 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
+#include <fcntl.h>
 #include <math.h>
+#include <unistd.h>
 
 static NSString * const WKResultPrefix = @"WK_RESULT ";
 
@@ -23,6 +25,70 @@ static NSArray<NSString *> *ArgValues(NSArray<NSString *> *args, NSString *name)
 
 static BOOL HasArg(NSArray<NSString *> *args, NSString *name) {
     return [args containsObject:name];
+}
+
+static NSDictionary *ReadRequestEnvelope(void) {
+    NSData *data = [[NSFileHandle fileHandleWithStandardInput] readDataToEndOfFile];
+    if (data.length == 0) return @{};
+    id parsed = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    return [parsed isKindOfClass:[NSDictionary class]] ? parsed : nil;
+}
+
+static NSString *RequestString(NSDictionary *request, NSString *key, NSString *fallback) {
+    id value = request[key];
+    return [value isKindOfClass:[NSString class]] ? value : fallback;
+}
+
+static BOOL RequestBool(NSDictionary *request, NSString *key, BOOL fallback) {
+    id value = request[key];
+    return [value isKindOfClass:[NSNumber class]] ? [value boolValue] : fallback;
+}
+
+static NSInteger RequestInteger(NSDictionary *request, NSString *key, NSInteger fallback) {
+    id value = request[key];
+    return [value isKindOfClass:[NSNumber class]] ? [value integerValue] : fallback;
+}
+
+static double RequestDouble(NSDictionary *request, NSString *key, double fallback) {
+    id value = request[key];
+    return [value isKindOfClass:[NSNumber class]] ? [value doubleValue] : fallback;
+}
+
+static NSArray<NSString *> *RequestStringArray(
+    NSDictionary *request,
+    NSString *key,
+    NSArray<NSString *> *fallback
+) {
+    id value = request[key];
+    if (![value isKindOfClass:[NSArray class]]) return fallback;
+    NSMutableArray<NSString *> *items = [NSMutableArray array];
+    for (id item in (NSArray *)value) {
+        if (![item isKindOfClass:[NSString class]]) return fallback;
+        [items addObject:item];
+    }
+    return items;
+}
+
+static NSString *Base64JSONValue(id value) {
+    if (value == nil || value == [NSNull null]) return @"";
+    if (![NSJSONSerialization isValidJSONObject:value]) return nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:value options:0 error:nil];
+    return data != nil ? [data base64EncodedStringWithOptions:0] : nil;
+}
+
+static BOOL WriteUTF8ToFD(NSString *value, int fd) {
+    if (fd < 0 || value.length == 0) return NO;
+    NSData *data = [value dataUsingEncoding:NSUTF8StringEncoding];
+    if (data.length == 0) return NO;
+    const uint8_t *bytes = data.bytes;
+    NSUInteger remaining = data.length;
+    while (remaining > 0) {
+        ssize_t written = write(fd, bytes, remaining);
+        if (written <= 0) return NO;
+        bytes += written;
+        remaining -= (NSUInteger)written;
+    }
+    return YES;
 }
 
 static NSString *DecodeBase64(NSString *value) {
@@ -883,51 +949,67 @@ static BOOL ModeMatches(NSDictionary *snapshot, NSString *requested) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        (void)argc;
+        (void)argv;
         NSArray<NSString *> *args = [[NSProcessInfo processInfo] arguments];
         if (HasArg(args, @"--resume-broker")) return RunResumeBroker();
-        NSString *urlString = ArgValue(args, @"--url", @"https://chatgpt.com/");
+
+        BOOL requestFromStdin = HasArg(args, @"--request-stdin");
+        NSDictionary *request = requestFromStdin ? ReadRequestEnvelope() : @{};
+        if (request == nil) {
+            PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_REQUEST_ENVELOPE_INVALID"});
+            return 40;
+        }
+
+        NSString *urlString = RequestString(request, @"url", ArgValue(args, @"--url", @"https://chatgpt.com/"));
         NSString *prompt64 = ArgValue(args, @"--prompt-base64", @"");
-        NSString *prompt = DecodeBase64(prompt64);
-        NSString *profile = [ArgValue(args, @"--profile", @"") uppercaseString];
-        NSString *minimalConversationId = ArgValue(args, @"--minimal-conversation-id", @"");
-        NSString *minimalParentMessageId = ArgValue(args, @"--minimal-parent-message-id", @"");
-        NSString *minimalModelSlug = ArgValue(args, @"--minimal-model-slug", @"");
-        NSString *minimalThinkingEffort = ArgValue(args, @"--minimal-thinking-effort", @"");
-        NSString *minimalAttachmentsBase64 = ArgValue(args, @"--minimal-attachments-base64", @"");
-        NSInteger minimalAttachmentCount = [ArgValue(args, @"--minimal-attachment-count", @"0") integerValue];
-        NSString *expectedCurrentNode = ArgValue(args, @"--expected-current-node", @"");
-        NSString *canonicalConversation = ArgValue(args, @"--canonical-conversation", @"");
+        NSString *prompt = RequestString(request, @"prompt", DecodeBase64(prompt64));
+        NSString *profile = [RequestString(request, @"profile", ArgValue(args, @"--profile", @"")) uppercaseString];
+        NSString *minimalConversationId = RequestString(request, @"minimal_conversation_id", ArgValue(args, @"--minimal-conversation-id", @""));
+        NSString *minimalParentMessageId = RequestString(request, @"minimal_parent_message_id", ArgValue(args, @"--minimal-parent-message-id", @""));
+        NSString *minimalModelSlug = RequestString(request, @"minimal_model_slug", ArgValue(args, @"--minimal-model-slug", @""));
+        NSString *minimalThinkingEffort = RequestString(request, @"minimal_thinking_effort", ArgValue(args, @"--minimal-thinking-effort", @""));
+        id requestedMinimalAttachments = request[@"minimal_attachments"];
+        NSString *minimalAttachmentsBase64 = [requestedMinimalAttachments isKindOfClass:[NSArray class]]
+            ? Base64JSONValue(requestedMinimalAttachments)
+            : ArgValue(args, @"--minimal-attachments-base64", @"");
+        NSInteger minimalAttachmentCount = [requestedMinimalAttachments isKindOfClass:[NSArray class]]
+            ? (NSInteger)[(NSArray *)requestedMinimalAttachments count]
+            : RequestInteger(request, @"minimal_attachment_count", [ArgValue(args, @"--minimal-attachment-count", @"0") integerValue]);
+        NSString *expectedCurrentNode = RequestString(request, @"expected_current_node", ArgValue(args, @"--expected-current-node", @""));
+        NSString *canonicalConversation = RequestString(request, @"canonical_conversation", ArgValue(args, @"--canonical-conversation", @""));
         BOOL canonicalOnly = canonicalConversation.length > 0;
-        NSString *resumeConversation = ArgValue(args, @"--resume-conversation", @"");
+        NSString *resumeConversation = RequestString(request, @"resume_conversation", ArgValue(args, @"--resume-conversation", @""));
         BOOL resumeOnly = resumeConversation.length > 0;
-        NSString *resumeValue = [[[NSProcessInfo processInfo] environment][@"CWA_WK_RESUME_VALUE"] isKindOfClass:[NSString class]]
-            ? [[NSProcessInfo processInfo] environment][@"CWA_WK_RESUME_VALUE"]
-            : ArgValue(args, @"--resume-value", @"");
-        NSString *resumeHandoffFile = [[[NSProcessInfo processInfo] environment][@"CWA_WK_RESUME_HANDOFF_FILE"] isKindOfClass:[NSString class]]
-            ? [[NSProcessInfo processInfo] environment][@"CWA_WK_RESUME_HANDOFF_FILE"]
-            : @"";
-        NSInteger resumeOffset = [ArgValue(args, @"--resume-offset", @"0") integerValue];
-        NSString *observeConversation = ArgValue(args, @"--observe-conversation", @"");
+        NSString *legacyResumeValue = ArgValue(args, @"--resume-value", @"");
+        NSString *resumeValue = RequestString(request, @"resume_value", legacyResumeValue);
+        int resumeHandoffFD = [ArgValue(args, @"--resume-handoff-fd", @"-1") intValue];
+        if (resumeHandoffFD >= 0) {
+            int flags = fcntl(resumeHandoffFD, F_GETFD);
+            if (flags >= 0) (void)fcntl(resumeHandoffFD, F_SETFD, flags | FD_CLOEXEC);
+        }
+        NSInteger resumeOffset = RequestInteger(request, @"resume_offset", [ArgValue(args, @"--resume-offset", @"0") integerValue]);
+        NSString *observeConversation = RequestString(request, @"observe_conversation", ArgValue(args, @"--observe-conversation", @""));
         BOOL observeOnly = observeConversation.length > 0;
-        NSString *domObserveConversation = ArgValue(args, @"--dom-observe-conversation", @"");
+        NSString *domObserveConversation = RequestString(request, @"dom_observe_conversation", ArgValue(args, @"--dom-observe-conversation", @""));
         BOOL domObserveOnly = domObserveConversation.length > 0;
-        NSTimeInterval observerPollInterval = [ArgValue(args, @"--poll-interval", @"1.0") doubleValue];
-        NSString *catalog = [ArgValue(args, @"--catalog", @"") lowercaseString];
+        NSTimeInterval observerPollInterval = RequestDouble(request, @"poll_interval", [ArgValue(args, @"--poll-interval", @"1.0") doubleValue]);
+        NSString *catalog = [RequestString(request, @"catalog", ArgValue(args, @"--catalog", @"")) lowercaseString];
         BOOL catalogOnly = catalog.length > 0;
-        NSInteger catalogOffset = [ArgValue(args, @"--offset", @"0") integerValue];
-        NSInteger catalogLimit = [ArgValue(args, @"--limit", @"100") integerValue];
-        BOOL catalogArchived = HasArg(args, @"--archived");
-        BOOL catalogStarred = HasArg(args, @"--starred");
-        NSArray<NSString *> *attachments = ArgValues(args, @"--attach");
-        NSTimeInterval timeout = [ArgValue(args, @"--timeout", @"150") doubleValue];
-        BOOL stopOnly = HasArg(args, @"--stop-only");
+        NSInteger catalogOffset = RequestInteger(request, @"offset", [ArgValue(args, @"--offset", @"0") integerValue]);
+        NSInteger catalogLimit = RequestInteger(request, @"limit", [ArgValue(args, @"--limit", @"100") integerValue]);
+        BOOL catalogArchived = RequestBool(request, @"archived", HasArg(args, @"--archived"));
+        BOOL catalogStarred = RequestBool(request, @"starred", HasArg(args, @"--starred"));
+        NSArray<NSString *> *attachments = RequestStringArray(request, @"attachments", ArgValues(args, @"--attach"));
+        NSTimeInterval timeout = RequestDouble(request, @"timeout", [ArgValue(args, @"--timeout", @"150") doubleValue]);
+        BOOL stopOnly = RequestBool(request, @"stop_only", HasArg(args, @"--stop-only"));
         NSString *stopConversation = stopOnly ? ConversationIdFromURL(urlString) : @"";
-        BOOL visible = HasArg(args, @"--visible");
-        BOOL observeSubmit = HasArg(args, @"--observe-submit");
-        BOOL observeStream = HasArg(args, @"--observe-stream");
-        BOOL streamProbeUntilEnd = HasArg(args, @"--stream-probe-until-end");
-        BOOL streamProbeUntilResumeToken = HasArg(args, @"--stream-probe-until-resume-token");
-        BOOL minimalSecurityShell = HasArg(args, @"--minimal-security-shell");
+        BOOL visible = RequestBool(request, @"visible", HasArg(args, @"--visible"));
+        BOOL observeSubmit = RequestBool(request, @"observe_submit", HasArg(args, @"--observe-submit"));
+        BOOL observeStream = RequestBool(request, @"observe_stream", HasArg(args, @"--observe-stream"));
+        BOOL streamProbeUntilEnd = RequestBool(request, @"stream_probe_until_end", HasArg(args, @"--stream-probe-until-end"));
+        BOOL streamProbeUntilResumeToken = RequestBool(request, @"stream_probe_until_resume_token", HasArg(args, @"--stream-probe-until-resume-token"));
+        BOOL minimalSecurityShell = RequestBool(request, @"minimal_security_shell", HasArg(args, @"--minimal-security-shell"));
         BOOL readOnly = canonicalOnly || catalogOnly || observeOnly || resumeOnly || stopOnly;
         NSInteger operationModeCount = (canonicalOnly ? 1 : 0) + (catalogOnly ? 1 : 0) + (observeOnly ? 1 : 0) + (resumeOnly ? 1 : 0) + (domObserveOnly ? 1 : 0) + (stopOnly ? 1 : 0);
         if (operationModeCount > 1) {
@@ -1078,8 +1160,10 @@ int main(int argc, const char *argv[]) {
                 return 34;
             }
             BOOL resumeHandoffWritten = NO;
-            if (resumeHandoffFile.length > 0) {
-                resumeHandoffWritten = [delegate.streamResumeToken writeToFile:resumeHandoffFile atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            if (resumeHandoffFD >= 0) {
+                resumeHandoffWritten = WriteUTF8ToFD(delegate.streamResumeToken, resumeHandoffFD);
+                close(resumeHandoffFD);
+                resumeHandoffFD = -1;
             }
             NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - started;
             NSTimeInterval loadElapsed = delegate.navigationFinishedAt > 0 ? delegate.navigationFinishedAt - started : 0;
@@ -1415,7 +1499,7 @@ int main(int argc, const char *argv[]) {
                     ? ParseJSONResult(EvaluateSync(webView, injectScript, 8.0, nil))
                     : nil;
                 NSInteger injectedCount = [injected[@"count"] respondsToSelector:@selector(integerValue)] ? [injected[@"count"] integerValue] : 0;
-                if (![injected[@"ok"] boolValue] || injectedCount != attachments.count) {
+                if (![injected[@"ok"] boolValue] || injectedCount != (NSInteger)attachments.count) {
                     NSString *reason = [injected[@"reason"] isKindOfClass:[NSString class]] ? injected[@"reason"] : @"count_mismatch";
                     PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_FILE_INJECTION_FAILED",@"detail":reason});
                     return 10;
@@ -1643,11 +1727,10 @@ int main(int argc, const char *argv[]) {
         NSData *heavyFinalBodyData = [heavyFinalCanonicalBody dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
         NSString *heavyFinalBodyBase64 = [heavyFinalBodyData base64EncodedStringWithOptions:0] ?: @"";
         BOOL resumeHandoffWritten = NO;
-        if (delegate.streamResumeToken.length > 0 && resumeHandoffFile.length > 0) {
-            resumeHandoffWritten = [delegate.streamResumeToken writeToFile:resumeHandoffFile
-                                                                 atomically:NO
-                                                                   encoding:NSUTF8StringEncoding
-                                                                      error:nil];
+        if (delegate.streamResumeToken.length > 0 && resumeHandoffFD >= 0) {
+            resumeHandoffWritten = WriteUTF8ToFD(delegate.streamResumeToken, resumeHandoffFD);
+            close(resumeHandoffFD);
+            resumeHandoffFD = -1;
         }
         NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - started;
         NSTimeInterval loadElapsed = delegate.navigationFinishedAt > 0 ? delegate.navigationFinishedAt - started : 0;

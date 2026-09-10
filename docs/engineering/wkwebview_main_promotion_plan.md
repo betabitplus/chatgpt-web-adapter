@@ -60,15 +60,15 @@ Required invariants:
 
 | ID | Priority | Status | Item | Required outcome |
 |---|---|---|---|---|
-| WK-MAIN-001 | P0 | IN PROGRESS | Remove turn data from process argv | Prompt, conversation identifiers where avoidable, attachment descriptors, model/profile data and other per-turn payload move to stdin or inherited/private IPC. `ps` must not expose prompt text. |
-| WK-MAIN-002 | P0 | IN PROGRESS | Remove named resume-secret handoff file | Replace `cwa-wk-resume-*` file transport with an inherited pipe/FD or unlink-after-open equivalent. Abrupt process death must not leave resume credentials on disk. |
+| WK-MAIN-001 | P0 | LIVE PROVEN | Remove turn data from process argv | Prompt, conversation identifiers where avoidable, attachment descriptors, model/profile data and other per-turn payload move to stdin or inherited/private IPC. `ps` must not expose prompt text. |
+| WK-MAIN-002 | P0 | LIVE PROVEN | Remove named resume-secret handoff file | Replace `cwa-wk-resume-*` file transport with an inherited pipe/FD or unlink-after-open equivalent. Abrupt process death must not leave resume credentials on disk. |
 | WK-MAIN-003 | P0 | OPEN | Refactor `wkwebview_provider.py` orchestration | Break the ~2.1k-line provider into focused components. Provider becomes orchestration rather than build/process/curl/WS/finality/attachment/legacy implementation all at once. |
 | WK-MAIN-004 | P0 | OPEN | Replace private `ChatGPTWebClient` coupling | Introduce a small typed/internal transport contract instead of reaching into `_build_headers`, `_capture_resume_token_diagnostics`, `_stream_handoff_via_ws_topic`, `_probe_celsius_ws_user`, `_upload_media_files`. |
 | WK-MAIN-005 | P0 | OPEN | Remove/isolate superseded resume implementations | Shared-WK broker and old WK resume paths must not remain interleaved with the new primary hot path. Keep only a deliberate compatibility fallback if still required. |
 | WK-MAIN-006 | P0 | OPEN | Add macOS availability contract | Explicitly require macOS 12+ for the minimal WK path because `loadSimulatedRequest:responseHTMLString:` is macOS 12+. Older macOS/non-Darwin must use the existing supported backend. |
 | WK-MAIN-007 | P0 | OPEN | Add macOS CI/release coverage | Add `macos-latest` coverage for helper build, strict native warnings, minimal-shell JS syntax, targeted WK tests and installed-wheel helper/resource smoke. |
 | WK-MAIN-008 | P0 | OPEN | Make branch pass repository quality gate | `uv run python tools/engineering_quality_gate.py --base-ref main` must pass. Apply/accept Ruff formatting policy for the branch delta. |
-| WK-MAIN-009 | P0 | OPEN | Native helper warning-clean | `clang -Wall -Wextra -Werror` must pass; currently unused `main` args and signed/unsigned attachment-count comparison are known failures. |
+| WK-MAIN-009 | P0 | DONE | Native helper warning-clean | `clang -Wall -Wextra -Werror` passes after cleaning the `main` parameter and attachment-count warning paths. |
 | WK-MAIN-010 | P0 | OPEN | Correct canonical transport provenance | Hot-path canonical reads are now curl, not WK. Rename stale `WKWEBVIEW_CONTEXT_CANONICAL_HTTP` semantics/docs and expose the actual transport/fallback used. |
 | WK-MAIN-011 | P0 | OPEN | Add lightweight transport/fallback observability | Record transport selection, fallback reason, Phase-A gate wait and relevant timing without secrets. Do not silently turn important curl/auth failures into an unexplained heavy WK fallback. |
 | WK-MAIN-012 | P0 | OPEN | Stabilize minimal-shell upstream-drift tests | Add sanitized offline fixtures for at least two known `conversation-small-*` layouts/deploys and test integrity helper/initializer discovery without live product access. |
@@ -197,6 +197,16 @@ Append concise entries here whenever a tracker state changes. Reference task IDs
 - Created `prerelease/wkwebview-main-hardening` from that checkpoint for all productionization work.
 - Added WK-MAIN-040 through WK-MAIN-046 as a mandatory final cleanup phase before acceptance testing: remove experiment-only code/files, sweep dead code/config, compare public capability parity, clean docs/history, inspect built artifacts, and prove clean-checkout reproducibility.
 - Final acceptance is now explicitly ordered after cleanup so the exact code intended for `main`, rather than a richer experiment tree, must pass all functionality and load gates.
+
+### 2026-09-10 — Private helper IPC hardening
+
+- `WK-MAIN-001` is live-proven: turn payload now travels through a JSON stdin envelope instead of process argv. The live gptty/WK run completed exactly and the actual helper application process did not expose the marker/prompt in its command line.
+- `WK-MAIN-002` is live-proven: resume credentials now return through an anonymous inherited pipe/FD. The legacy named `cwa-wk-resume-*` handoff and `CWA_WK_RESUME_*` environment transports were removed from the pre-release source; live verification created zero new named resume files.
+- Canonical/observer conversation identifiers were also moved off argv onto the stdin envelope so compatibility fallback modes respect the same privacy boundary.
+- Added a real subprocess IPC regression test in addition to provider mocks. Targeted WK suite is 26/26 green.
+- `WK-MAIN-009` is done: the native helper compiles cleanly with `clang -Wall -Wextra -Werror`.
+- Full CWA regression is 2144/2144 green using `uv run python -m pytest -q`; downstream gptty is 286/286 green against the exact pre-release source.
+- Local `uv run pytest` resolved a stale console-script/import path from another checkout; module invocation (`uv run python -m pytest`) is the reproducible repo-root test command and successfully collects/runs the release tests from this workspace.
 
 ## Rules for maintaining this tracker
 

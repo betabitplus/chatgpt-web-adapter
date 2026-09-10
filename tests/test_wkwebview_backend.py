@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -30,6 +31,16 @@ from chatgpt_web_adapter.wkwebview_provider import (
     _WKSharedResumeBroker,
 )
 from chatgpt_web_adapter.wkwebview_shared_broker import WKSystemResumeBrokerClient
+
+
+def _invocation_argv(invocation) -> list[str]:
+    command = getattr(invocation, "command", invocation)
+    return list(command)
+
+
+def _invocation_request(invocation) -> dict:
+    request = getattr(invocation, "request", {})
+    return dict(request) if isinstance(request, dict) else {}
 
 
 class _Client:
@@ -138,7 +149,7 @@ def test_wkwebview_catalog_read_uses_helper_and_decodes_json(monkeypatch) -> Non
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
 
     def fake_run(command, *, timeout):
-        commands.append(list(command))
+        commands.append(_invocation_argv(command))
         return _helper_payload({"items": [{"id": "conversation-1"}], "total": 1})
 
     monkeypatch.setattr(provider, "_run_helper", fake_run)
@@ -172,7 +183,58 @@ def test_wkwebview_continuation_command_fences_canonical_parent(monkeypatch) -> 
         expected_current_node="node-7",
     )
 
-    assert command[command.index("--expected-current-node") + 1] == "node-7"
+    assert _invocation_request(command)["expected_current_node"] == "node-7"
+    assert "hello" not in _invocation_argv(command)
+    assert "conversation-1" not in _invocation_argv(command)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="anonymous helper FD handoff is POSIX-only")
+def test_wkwebview_helper_runner_uses_stdin_and_anonymous_resume_fd(
+    monkeypatch, tmp_path
+) -> None:
+    helper = tmp_path / "fake-wk-helper"
+    helper.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+request = json.load(sys.stdin)
+fd_index = sys.argv.index("--resume-handoff-fd") + 1
+fd = int(sys.argv[fd_index])
+os.write(fd, b"resume-secret")
+os.close(fd)
+print("WK_RESULT " + json.dumps({
+    "ok": True,
+    "request_prompt": request.get("prompt"),
+    "request_url": request.get("url"),
+    "argv_contains_prompt": request.get("prompt") in sys.argv,
+    "argv_contains_url": request.get("url") in sys.argv,
+}))
+""",
+        encoding="utf-8",
+    )
+    helper.chmod(0o700)
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: helper)
+    invocation = provider._helper_command(
+        conversation_id="conversation-private",
+        text="prompt-private",
+        timeout=5,
+    )
+    invocation.capture_resume = True
+
+    payload = provider._run_helper_streaming(
+        invocation,
+        timeout=5,
+        on_text_event=lambda event: None,
+    )
+
+    assert payload["request_prompt"] == "prompt-private"
+    assert payload["request_url"].endswith("/c/conversation-private")
+    assert payload["argv_contains_prompt"] is False
+    assert payload["argv_contains_url"] is False
+    assert payload["stream_resume_value"] == "resume-secret"
 
 
 def test_wkwebview_canonical_read_caches_current_node(monkeypatch) -> None:
@@ -227,9 +289,11 @@ def test_wkwebview_canonical_read_falls_back_to_helper_when_curl_unavailable(
     )
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     commands: list[list[str]] = []
+    requests: list[dict] = []
 
     def fake_run(command, *, timeout):
-        commands.append(list(command))
+        commands.append(_invocation_argv(command))
+        requests.append(_invocation_request(command))
         return _helper_payload(
             {"current_node": "node-wk", "mapping": {"node-wk": {}}}
         )
@@ -239,7 +303,8 @@ def test_wkwebview_canonical_read_falls_back_to_helper_when_curl_unavailable(
     payload = provider.read_conversation_payload("conversation-fallback", timeout=5)
 
     assert payload["current_node"] == "node-wk"
-    assert "--canonical-conversation" in commands[0]
+    assert requests[0]["canonical_conversation"] == "conversation-fallback"
+    assert "conversation-fallback" not in commands[0]
 
 
 def test_wkwebview_declares_revision_safe_streaming_capability() -> None:
@@ -265,7 +330,7 @@ def test_wkwebview_streaming_detaches_write_page_and_resumes_in_lightweight_cont
         fail_if_duplicate_commit_check_runs,
     )
 
-    calls: list[tuple[list[str], dict[str, str] | None]] = []
+    calls: list[tuple[list[str], dict]] = []
     final_canonical = _final_canonical_for_prompt("hello", assistant_text="hello world")
 
     def fake_stream(
@@ -276,14 +341,9 @@ def test_wkwebview_streaming_detaches_write_page_and_resumes_in_lightweight_cont
         on_lifecycle_event=None,
         extra_env=None,
     ):
-        calls.append((list(command), dict(extra_env) if extra_env else None))
-        if "--resume-conversation" not in command:
+        calls.append((_invocation_argv(command), _invocation_request(command)))
+        if "resume_conversation" not in _invocation_request(command):
             assert callable(on_lifecycle_event)
-            assert isinstance(extra_env, dict)
-            handoff_path = Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"])
-            assert handoff_path.exists()
-            assert handoff_path.stat().st_mode & 0o777 == 0o600
-            handoff_path.write_text("resume-secret", encoding="utf-8")
             on_lifecycle_event(
                 {
                     "type": "write_identity_resolved",
@@ -314,10 +374,11 @@ def test_wkwebview_streaming_detaches_write_page_and_resumes_in_lightweight_cont
                 "stream_terminal_observed": False,
                 "stream_resume_present": True,
                 "stream_resume_handoff_written": True,
+                "stream_resume_value": "resume-secret",
             }
 
-        assert extra_env == {"CWA_WK_RESUME_VALUE": "resume-secret"}
-        assert "resume-secret" not in command
+        assert _invocation_request(command)["resume_value"] == "resume-secret"
+        assert "resume-secret" not in _invocation_argv(command)
         on_text_event(
             {
                 "type": "assistant_text_delta",
@@ -353,15 +414,14 @@ def test_wkwebview_streaming_detaches_write_page_and_resumes_in_lightweight_cont
     assert [event["delta"] for event in events] == ["hello ", "world"]
     assert result.conversation_id == "conversation-1"
     assert result.passive_observer_armed is False
-    first_command, first_env = calls[0]
-    assert isinstance(first_env, dict)
-    assert set(first_env) == {"CWA_WK_RESUME_HANDOFF_FILE"}
-    assert not Path(first_env["CWA_WK_RESUME_HANDOFF_FILE"]).exists()
+    first_command, first_request = calls[0]
+    assert first_request["prompt"] == "hello"
+    assert "hello" not in first_command
     assert "--stream-probe-until-resume-token" in first_command
     assert "--stream-probe-until-end" not in first_command
-    second_command, second_env = calls[1]
-    assert second_env == {"CWA_WK_RESUME_VALUE": "resume-secret"}
-    assert second_command[second_command.index("--resume-offset") + 1] == "0"
+    second_command, second_request = calls[1]
+    assert second_request["resume_value"] == "resume-secret"
+    assert second_request["resume_offset"] == 0
     assert "--resume-value" not in second_command
 
     def fail_if_helper_runs(*args, **kwargs):
@@ -470,7 +530,6 @@ def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonic
         },
     }
     calls: list[list[str]] = []
-    handoff_paths: list[Path] = []
 
     def fake_stream(
         command,
@@ -480,13 +539,8 @@ def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonic
         on_lifecycle_event=None,
         extra_env=None,
     ):
-        calls.append(list(command))
-        assert "--resume-conversation" not in command
-        assert isinstance(extra_env, dict)
-        handoff_path = Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"])
-        handoff_paths.append(handoff_path)
-        assert handoff_path.exists()
-        assert handoff_path.stat().st_mode & 0o777 == 0o600
+        calls.append(_invocation_argv(command))
+        assert "--resume-conversation" not in _invocation_argv(command)
         on_text_event(
             {
                 "type": "assistant_text_snapshot",
@@ -523,8 +577,6 @@ def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonic
     result = provider.send_text_streaming("hello", on_text_event=events.append)
 
     assert len(calls) == 1
-    assert len(handoff_paths) == 1
-    assert not handoff_paths[0].exists()
     assert result.passive_observer_armed is False
     assert events[0]["text"] == "done"
 
@@ -803,10 +855,7 @@ def test_wkwebview_shared_resume_opt_in_avoids_second_helper_process(monkeypatch
         on_lifecycle_event=None,
         extra_env=None,
     ):
-        assert "--resume-conversation" not in command
-        assert isinstance(extra_env, dict)
-        handoff_path = Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"])
-        handoff_path.write_text("resume-secret", encoding="utf-8")
+        assert "--resume-conversation" not in _invocation_argv(command)
         on_text_event(
             {
                 "type": "assistant_text_delta",
@@ -831,6 +880,7 @@ def test_wkwebview_shared_resume_opt_in_avoids_second_helper_process(monkeypatch
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
+                "stream_resume_value": "resume-secret",
         }
 
     class FakeBroker:
@@ -890,11 +940,7 @@ def test_wkwebview_minimal_security_shell_gate_is_narrow(monkeypatch) -> None:
         on_lifecycle_event=None,
         extra_env=None,
     ):
-        commands.append(list(command))
-        assert isinstance(extra_env, dict)
-        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
-            "resume-secret", encoding="utf-8"
-        )
+        commands.append(_invocation_argv(command))
         return {
             "ok": True,
             "conversation_id": "conversation-1",
@@ -908,6 +954,7 @@ def test_wkwebview_minimal_security_shell_gate_is_narrow(monkeypatch) -> None:
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
+                "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
@@ -955,6 +1002,7 @@ def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(mon
     }
     monkeypatch.setattr(provider, "read_conversation_payload", lambda *args, **kwargs: prewrite)
     commands: list[list[str]] = []
+    requests: list[dict] = []
 
     def fake_stream(
         command,
@@ -964,11 +1012,8 @@ def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(mon
         on_lifecycle_event=None,
         extra_env=None,
     ):
-        commands.append(list(command))
-        assert isinstance(extra_env, dict)
-        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
-            "resume-secret", encoding="utf-8"
-        )
+        commands.append(_invocation_argv(command))
+        requests.append(_invocation_request(command))
         return {
             "ok": True,
             "conversation_id": "conversation-1",
@@ -982,6 +1027,7 @@ def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(mon
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
+                "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
@@ -1009,12 +1055,12 @@ def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(mon
     assert len(commands) == 1
     command = commands[0]
     assert "--minimal-security-shell" in command
-    conversation_index = command.index("--minimal-conversation-id")
-    assert command[conversation_index + 1] == "conversation-1"
-    parent_index = command.index("--minimal-parent-message-id")
-    assert command[parent_index + 1] == "assistant-message-before"
-    current_index = command.index("--expected-current-node")
-    assert command[current_index + 1] == "node-before"
+    request = requests[0]
+    assert request["minimal_conversation_id"] == "conversation-1"
+    assert request["minimal_parent_message_id"] == "assistant-message-before"
+    assert request["expected_current_node"] == "node-before"
+    assert "conversation-1" not in command
+    assert "assistant-message-before" not in command
 
 
 def test_wkwebview_minimal_security_shell_continuation_preserves_canonical_selection(
@@ -1040,6 +1086,7 @@ def test_wkwebview_minimal_security_shell_continuation_preserves_canonical_selec
     }
     monkeypatch.setattr(provider, "read_conversation_payload", lambda *args, **kwargs: prewrite)
     commands: list[list[str]] = []
+    requests: list[dict] = []
 
     def fake_stream(
         command,
@@ -1049,10 +1096,8 @@ def test_wkwebview_minimal_security_shell_continuation_preserves_canonical_selec
         on_lifecycle_event=None,
         extra_env=None,
     ):
-        commands.append(list(command))
-        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
-            "resume-secret", encoding="utf-8"
-        )
+        commands.append(_invocation_argv(command))
+        requests.append(_invocation_request(command))
         return {
             "ok": True,
             "conversation_id": "conversation-1",
@@ -1066,6 +1111,7 @@ def test_wkwebview_minimal_security_shell_continuation_preserves_canonical_selec
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
+                "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
@@ -1091,10 +1137,11 @@ def test_wkwebview_minimal_security_shell_continuation_preserves_canonical_selec
     assert result.conversation_id == "conversation-1"
     command = commands[0]
     assert "--minimal-security-shell" in command
-    model_index = command.index("--minimal-model-slug")
-    assert command[model_index + 1] == "gpt-5-6-thinking"
-    effort_index = command.index("--minimal-thinking-effort")
-    assert command[effort_index + 1] == "extended"
+    request = requests[0]
+    assert request["minimal_model_slug"] == "gpt-5-6-thinking"
+    assert request["minimal_thinking_effort"] == "extended"
+    assert "gpt-5-6-thinking" not in command
+    assert "extended" not in command
 
 
 def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
@@ -1124,6 +1171,7 @@ def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
 
     provider._source_client = FakeSourceClient()
     commands: list[list[str]] = []
+    requests: list[dict] = []
 
     def fake_stream(
         command,
@@ -1133,11 +1181,8 @@ def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
         on_lifecycle_event=None,
         extra_env=None,
     ):
-        commands.append(list(command))
-        assert isinstance(extra_env, dict)
-        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
-            "resume-secret", encoding="utf-8"
-        )
+        commands.append(_invocation_argv(command))
+        requests.append(_invocation_request(command))
         return {
             "ok": True,
             "conversation_id": "conversation-1",
@@ -1151,6 +1196,7 @@ def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
+                "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
@@ -1178,10 +1224,7 @@ def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
     command = commands[0]
     assert "--minimal-security-shell" in command
     assert "--attach" not in command
-    count_index = command.index("--minimal-attachment-count")
-    assert command[count_index + 1] == "1"
-    encoded_index = command.index("--minimal-attachments-base64")
-    descriptors = json.loads(base64.b64decode(command[encoded_index + 1]).decode("utf-8"))
+    descriptors = requests[0]["minimal_attachments"]
     assert descriptors == [
         {
             "file_id": "file-1",
@@ -1210,6 +1253,7 @@ def test_wkwebview_minimal_security_attachment_upload_failure_falls_back_to_spa(
 
     provider._source_client = FailingSourceClient()
     commands: list[list[str]] = []
+    requests: list[dict] = []
 
     def fake_stream(
         command,
@@ -1219,11 +1263,8 @@ def test_wkwebview_minimal_security_attachment_upload_failure_falls_back_to_spa(
         on_lifecycle_event=None,
         extra_env=None,
     ):
-        commands.append(list(command))
-        assert isinstance(extra_env, dict)
-        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
-            "resume-secret", encoding="utf-8"
-        )
+        commands.append(_invocation_argv(command))
+        requests.append(_invocation_request(command))
         return {
             "ok": True,
             "conversation_id": "conversation-1",
@@ -1237,6 +1278,7 @@ def test_wkwebview_minimal_security_attachment_upload_failure_falls_back_to_spa(
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
+                "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
@@ -1262,8 +1304,8 @@ def test_wkwebview_minimal_security_attachment_upload_failure_falls_back_to_spa(
     assert result.attachment_count == 1
     command = commands[0]
     assert "--minimal-security-shell" not in command
-    attach_index = command.index("--attach")
-    assert command[attach_index + 1] == str(attachment.resolve())
+    assert requests[0]["attachments"] == [str(attachment.resolve())]
+    assert str(attachment.resolve()) not in command
 
 
 def test_wkwebview_minimal_security_continuation_without_assistant_parent_falls_back(
@@ -1296,11 +1338,7 @@ def test_wkwebview_minimal_security_continuation_without_assistant_parent_falls_
         on_lifecycle_event=None,
         extra_env=None,
     ):
-        commands.append(list(command))
-        assert isinstance(extra_env, dict)
-        Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"]).write_text(
-            "resume-secret", encoding="utf-8"
-        )
+        commands.append(_invocation_argv(command))
         return {
             "ok": True,
             "conversation_id": "conversation-1",
@@ -1314,6 +1352,7 @@ def test_wkwebview_minimal_security_continuation_without_assistant_parent_falls_
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
+                "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
@@ -1356,9 +1395,6 @@ def test_wkwebview_curl_ws_resume_runs_after_phase_one_stream_eof(monkeypatch) -
         on_lifecycle_event=None,
         extra_env=None,
     ):
-        assert isinstance(extra_env, dict)
-        handoff_path = Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"])
-        handoff_path.write_text("resume-secret", encoding="utf-8")
         return {
             "ok": True,
             "conversation_id": "conversation-1",
@@ -1375,6 +1411,7 @@ def test_wkwebview_curl_ws_resume_runs_after_phase_one_stream_eof(monkeypatch) -
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
+                "stream_resume_value": "resume-secret",
         }
 
     calls: list[dict] = []
@@ -1449,14 +1486,11 @@ def test_wkwebview_shared_resume_serializes_heavy_phase_across_providers(monkeyp
             extra_env=None,
         ):
             nonlocal active, max_active
-            assert isinstance(extra_env, dict)
-            handoff = Path(extra_env["CWA_WK_RESUME_HANDOFF_FILE"])
             with monitor:
                 active += 1
                 max_active = max(max_active, active)
             try:
                 time.sleep(0.15)
-                handoff.write_text("resume-" + name, encoding="utf-8")
                 return {
                     "ok": True,
                     "conversation_id": "conversation-" + name,
@@ -1473,6 +1507,7 @@ def test_wkwebview_shared_resume_serializes_heavy_phase_across_providers(monkeyp
                     "stream_terminal_observed": False,
                     "stream_resume_present": True,
                     "stream_resume_handoff_written": True,
+                "stream_resume_value": "resume-secret",
                 }
             finally:
                 with monitor:

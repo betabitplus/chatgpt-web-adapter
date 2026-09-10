@@ -199,9 +199,7 @@ def characterize_integrity(
     size_matches = observed_size == expected_size
     sha256_matches = observed_sha256 == expected_sha256
     proven = (
-        byte_report.get("bytes_observed") is True
-        and size_matches
-        and sha256_matches
+        byte_report.get("bytes_observed") is True and size_matches and sha256_matches
     )
     return {
         "locator_origin_class": byte_report.get("locator_origin_class"),

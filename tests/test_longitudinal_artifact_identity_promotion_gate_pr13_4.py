@@ -62,7 +62,9 @@ def _discovery(*, identity: str = FILE_ID, identity_key: str = "file_id") -> dic
     }
 
 
-def _patch_positive_network(monkeypatch, *, body_sha256: str = EXPECTED_ARTIFACT_SHA256):
+def _patch_positive_network(
+    monkeypatch, *, body_sha256: str = EXPECTED_ARTIFACT_SHA256
+):
     calls: list[str] = []
 
     def fake_discovery(client, conversation_id):
@@ -72,7 +74,9 @@ def _patch_positive_network(monkeypatch, *, body_sha256: str = EXPECTED_ARTIFACT
     def fake_resolver(client, *, conversation_id, file_id):
         calls.append("resolve")
         assert file_id == FILE_ID
-        return 200, {"download_url": "https://chatgpt.com/backend-api/estuary/content?sig=secret"}
+        return 200, {
+            "download_url": "https://chatgpt.com/backend-api/estuary/content?sig=secret"
+        }
 
     def fake_locator(client, *, conversation_id, locator):
         calls.append("bytes")
@@ -113,7 +117,9 @@ def test_positive_gate_promotes_bounded_stable_identity(monkeypatch) -> None:
     )
 
     assert calls == ["discover", "resolve", "bytes"]
-    assert report["characterization"] == "LONGITUDINAL_ARTIFACT_IDENTITY_PROMOTION_PROVEN"
+    assert (
+        report["characterization"] == "LONGITUDINAL_ARTIFACT_IDENTITY_PROMOTION_PROVEN"
+    )
     assert report["baseline_age_requirement_met"] is True
     assert report["baseline_age_seconds"] >= MIN_LONGITUDINAL_AGE_SECONDS
     assert report["identity_fingerprint_matches"] is True
@@ -206,7 +212,9 @@ def test_fingerprint_mismatch_stops_before_resolution(monkeypatch) -> None:
     monkeypatch.setattr(
         gate_mod,
         "_resolver_payload",
-        lambda *args, **kwargs: pytest.fail("resolver must not run after identity mismatch"),
+        lambda *args, **kwargs: pytest.fail(
+            "resolver must not run after identity mismatch"
+        ),
     )
 
     report = run_promotion_gate(

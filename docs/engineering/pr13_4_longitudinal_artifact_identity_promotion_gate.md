@@ -99,6 +99,78 @@ write_attempted = false
 
 The meaning is intentionally bounded: the known generated artifact has preserved the same product-owned identity across a multi-hour interval and that same identity still resolves to the same exact artifact. PR13.4 does not claim indefinite retention across arbitrary months, account migrations, deletion, expiry or product lifecycle changes.
 
+## Authenticated live result — 2026-09-10
+
+A clean exact-head run against the same saved conversation and generated text artifact used by PR13.1–PR13.3 returned:
+
+```text
+head_matches = true
+tracked_clean = true
+baseline_age_requirement_met = true
+baseline_age_seconds = 19553
+minimum_longitudinal_age_seconds = 14400
+identity_discovery_characterization = EXPLICIT_PRODUCT_IDENTITY_CANDIDATES_OBSERVED
+identity_key = file_id
+identity_fingerprint_matches = true
+target_record_present = true
+resolution_status_code = 200
+resolution_locator_field_present = true
+resolution_locator_key = download_url
+locator_origin_class = CHATGPT_SAME_ORIGIN
+locator_fetch_status_code = 200
+observed_size_bytes = 45
+expected_size_bytes = 45
+size_matches = true
+observed_artifact_sha256 = d0bb354d72fad3715f5348740d75dd644435165f68034f54f7974c834cbe9f1d
+expected_artifact_sha256 = d0bb354d72fad3715f5348740d75dd644435165f68034f54f7974c834cbe9f1d
+sha256_matches = true
+artifact_bytes_proven = true
+artifact_integrity_proven = true
+identity_bound_byte_retrieval_proven = true
+longitudinal_identity_stability_proven = true
+stable_product_identity_proven = true
+stability_scope = KNOWN_GENERATED_ARTIFACT_ACROSS_AT_LEAST_4H
+characterization = LONGITUDINAL_ARTIFACT_IDENTITY_PROMOTION_PROVEN
+```
+
+Request accounting remained bounded at exactly three reads through one fresh client: one identity discovery, one resolution request and one locator byte fetch.
+
+The private baseline fingerprint, current raw `file_id`, locator/signed query, resolver response body and artifact bytes are intentionally not copied into repository evidence.
+
+The gate also preserved the authority boundary:
+
+```text
+indefinite_identity_stability_proven = false
+download_authority_granted = false
+production_handoff_promoted = false
+artifact_disk_write_attempted = false
+materialization_attempted = false
+write_attempted = false
+identity_values_exported = false
+locator_values_exported = false
+artifact_bytes_exported = false
+```
+
+## Result
+
+PR13.4 closes the longitudinal identity blocker positively for the bounded scope represented by this known generated artifact. The accumulated evidence chain is now:
+
+```text
+saved conversation
+  -> explicit product-owned file_id
+  -> same file_id across independent immediate reads
+  -> same file_id fingerprint after at least 4 hours
+  -> identity-bound product resolver
+  -> locator-bearing resolution response
+  -> locator byte fetch
+  -> exact byte-count match
+  -> exact SHA-256 match
+```
+
+Within that scope, `stable_product_identity_proven = true` is now supported by authenticated product evidence rather than inferred from short-term reads.
+
+This does not claim indefinite retention or survival across deletion, account migration, lifecycle expiry or future product changes. Those are operational lifecycle questions, not blockers for promoting the proven generated-artifact handoff path into a governed production contract.
+
 ## Failure boundaries
 
 The gate stops without resolver/byte requests if the longitudinal interval is too short, git evidence ancestry is invalid, the current target has no explicit identity, the identity key changed, or the current identity fingerprint differs from the R2 baseline.
@@ -107,11 +179,11 @@ A matching identity is still insufficient if current resolver or byte integrity 
 
 ## Relationship to production handoff
 
-A positive PR13.4 result would close the specific empirical blocker named by PR10.1: lack of stable product-owned generated-artifact identity.
+The positive PR13.4 result closes the specific empirical blocker named by PR10.1: lack of stable product-owned generated-artifact identity.
 
-It still would not itself add a public download API or local materialization behavior. The next milestone should be a production design/promotion PR defining governed destination selection, overwrite policy, atomic materialization, retry authority, integrity verification and failure semantics.
+It still does not itself add a public download API or local materialization behavior. The next milestone should be a production design/promotion PR defining governed destination selection, overwrite policy, atomic materialization, retry authority, integrity verification and failure semantics.
 
-In other words, after a positive PR13.4 the research series should stop expanding sideways. The next work should be the governed production artifact handoff.
+In other words, the PR13 research series should stop here. The next work should be the governed production artifact handoff.
 
 ## Running
 

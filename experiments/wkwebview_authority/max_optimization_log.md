@@ -215,3 +215,5 @@ Live acceptance after both changes:
 Regression after the change: targeted WK tests **25/25**, full CWA suite **2143/2143**, and downstream gptty **286/286** against the exact CWA source tree.
 
 Current status: the minimal security shell is the strongest optimization candidate on this branch and the technical feature/performance gates are green, but it remains **opt-in only**. No merge, installed-default change, or consumer rollout has been performed. Promotion to default remains a separate policy decision.
+
+Main-promotion blockers, cleanup work, acceptance gates, and progress are tracked in [`docs/engineering/wkwebview_main_promotion_plan.md`](../../docs/engineering/wkwebview_main_promotion_plan.md). Treat that file as the canonical promotion tracker; keep this log focused on experiment evidence and measurements.

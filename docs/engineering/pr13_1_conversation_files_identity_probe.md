@@ -12,9 +12,9 @@ that is materially stronger than PR10.1's point-in-time generated-artifact obser
 
 This is a characterization experiment, not a production capability promotion.
 
-## Boundaries
+## R1 boundaries
 
-The probe performs exactly one authenticated GET for one caller-supplied saved-conversation identity.
+The R1 identity probe performs exactly one authenticated GET for one caller-supplied saved-conversation identity.
 
 It does not:
 
@@ -29,7 +29,7 @@ It does not:
 
 The report may export only bounded identity/metadata candidates such as an opaque explicit ID, basename-like filename, MIME type, non-negative size, and booleans describing whether conversation/message identity fields or locator fields were present.
 
-## Characterizations
+## R1 characterizations
 
 The probe distinguishes:
 
@@ -44,18 +44,59 @@ The probe distinguishes:
 - `DUPLICATE_EXPLICIT_IDENTITY_CANDIDATE_OBSERVED` — explicit identities are not unique within the response;
 - `EXPLICIT_PRODUCT_IDENTITY_CANDIDATES_OBSERVED` — every file record exposes a safe explicit identity candidate and candidates are unique within that one response.
 
-## What a positive result means
+## Authenticated R1 evidence — 2026-09-10
 
-`EXPLICIT_PRODUCT_IDENTITY_CANDIDATES_OBSERVED` is stronger evidence than a DOM-adjacent label or an inferred filename because the candidate originates from a conversation-scoped product response field.
+A clean exact-head authenticated run against a saved ChatGPT conversation containing one generated text artifact returned HTTP 200 and:
 
-It still does **not** prove that the identifier is stable across independent reads, sessions, regenerated artifacts, or account transitions. Therefore every PR13.1 report keeps:
+```text
+collection_key = items
+record_count = 1
+explicit_identity_key = file_id
+filename_key = file_name
+media_type_key = mime_type
+media_type = text/plain
+locator_field_present = false
+conversation_id_field_present = false
+message_id_field_present = false
+characterization = EXPLICIT_PRODUCT_IDENTITY_CANDIDATES_OBSERVED
+```
+
+The observed opaque identifier value is intentionally not recorded in repository evidence. The result establishes that the product endpoint exposes an explicit conversation-scoped `file_id` candidate for the generated artifact. It does not establish longitudinal stability or resolution/download semantics.
+
+## R2 — independent short-term stability
+
+R2 performs exactly two read-only authenticated requests through two fresh `ChatGPTWebClient` instances. A caller-supplied expected filename is used only as an anchor to select exactly one record from each response; filename equality is never treated as identity.
+
+R2 requires:
+
+- exactly one filename-anchored target in each read;
+- an explicit identity field in both reads;
+- the same explicit identity value in both reads;
+- the same identity key in both reads.
+
+The raw identity value is not exported by R2. The report contains only SHA-256 fingerprints plus equality booleans and identity-key names.
+
+A positive R2 characterization is:
+
+```text
+SAME_EXPLICIT_IDENTITY_ACROSS_INDEPENDENT_READS
+```
+
+and may set:
+
+```text
+short_term_identity_stability_proven = true
+```
+
+R2 deliberately continues to keep:
 
 ```text
 stable_product_identity_proven = false
+resolution_surface_proven = false
 download_authority_granted = false
 ```
 
-A later promotion gate would require at least independent repeated observation of the same artifact identity plus a browser-owned resolution path bound to that identity. Neither is part of PR13.1.
+Two immediate independent reads are evidence of short-term identity stability, not proof that the identifier survives later sessions, regeneration, account transitions, or that it can be safely resolved into downloadable bytes.
 
 ## Relationship to PR10.1
 
@@ -65,16 +106,25 @@ PR10.1 correctly froze generated-artifact download handoff as:
 ARTIFACT_DOWNLOAD_HANDOFF_UNSUPPORTED_WITHOUT_STABLE_PRODUCT_IDENTITY
 ```
 
-PR13.1 does not change that support status. It only tests whether a newer product endpoint supplies a stronger identity primitive worth investigating.
+PR13.1 does not change that support status yet. R1 has now established an explicit product-owned identity candidate; R2 tests the first stability property required before any resolution-path research.
 
-## Running the probe
+## Running R1
 
 From an exact clean checkout with an authenticated CWA session available:
 
 ```bash
-python tools/pr13_1_conversation_files_identity_probe.py \
-  --conversation-id <conversation-id> \
+python tools/pr13_1_conversation_files_live_gate.py \
+  --conversation "https://chatgpt.com/c/<conversation-id>" \
   --expected-head <exact-head-sha>
 ```
 
-The tool emits one sanitized JSON report. A completed characterization is not equivalent to capability support.
+## Running R2
+
+```bash
+python tools/pr13_1_conversation_files_stability_gate.py \
+  --conversation "https://chatgpt.com/c/<conversation-id>" \
+  --expected-filename cwa_pr13_1_identity_probe.txt \
+  --expected-head <exact-head-sha>
+```
+
+Both gates are characterization tools. Neither grants artifact resolution, download, filesystem-write, retry, or overwrite authority.

@@ -49,7 +49,15 @@ def test_resolution_payload_exports_presence_not_locator_value() -> None:
 
 def test_resolution_request_uses_exact_generated_file_identity_surface() -> None:
     client = _Client(
-        [(200, {"download_url": "https://example.invalid/signed", "file_name": "x.txt"})]
+        [
+            (
+                200,
+                {
+                    "download_url": "https://example.invalid/signed",
+                    "file_name": "x.txt",
+                },
+            )
+        ]
     )
 
     report = probe_resolution_request(
@@ -129,7 +137,9 @@ def test_pair_treats_server_error_control_as_inconclusive() -> None:
     assert report["identity_bound_resolution_surface_proven"] is False
 
 
-def test_gate_derives_file_id_then_resolves_real_and_negative_control(monkeypatch) -> None:
+def test_gate_derives_file_id_then_resolves_real_and_negative_control(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(
         probe_mod,
         "_git_output",

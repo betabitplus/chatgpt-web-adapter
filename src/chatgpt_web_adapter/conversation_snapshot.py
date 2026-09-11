@@ -98,6 +98,15 @@ def render_snapshot_context(messages: list[ChatMessage]) -> str:
     return _CONTEXT_SEPARATOR.join(blocks) + "\n"
 
 
+def _snapshot_payload(client: Any, conversation_id: str) -> Any:
+    """Prefer complete history while preserving legacy lightweight-client compatibility."""
+
+    full_reader = getattr(client, "_get_full_conversation_payload", None)
+    if callable(full_reader):
+        return full_reader(conversation_id)
+    return client._get_conversation_payload(conversation_id)
+
+
 def snapshot_conversation(
     client: Any,
     conversation: ConversationRef | ChatConversation | dict[str, Any] | str,
@@ -151,7 +160,7 @@ def snapshot_conversation(
     raw_text: str | None = None
     if raw_payload_path is not None:
         ref = ConversationRef.from_any(conversation)
-        raw_payload = client._get_conversation_payload(ref.conversation_id)
+        raw_payload = _snapshot_payload(client, ref.conversation_id)
         raw_text = json.dumps(raw_payload, ensure_ascii=False, indent=2) + "\n"
 
     context_path.write_text(context_text, encoding="utf-8", newline="\n")

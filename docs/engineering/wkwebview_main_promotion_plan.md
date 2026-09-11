@@ -1,17 +1,27 @@
-# WKWebView Lightweight Authority — Main Promotion Plan
+# WKWebView Lightweight Authority — Promotion Plan (Closed)
 
-_Status: ACTIVE · macOS 12+ source default promoted in pre-release, not yet released_
+_Status: CLOSED · engineering work complete; Chrome remains stable main, WK retained as tested alternative_
 _Last audit: 2026-09-11_
-_Canonical tracker for promotion work: this file_
+_Canonical tracker for the completed WK hardening/promotion investigation: this file_
 
-This document is the single source of truth for turning the current lightweight WKWebView authority experiment into the primary macOS browser-authority implementation. Do not reconstruct promotion status from chat history or the optimization experiment log; update this file whenever a promotion item is completed, changed, rejected, or newly discovered.
+This document started as the single source of truth for promoting the lightweight WKWebView authority experiment into the primary macOS browser-authority implementation. The engineering work was completed and live-proven, but the final product decision on 2026-09-11 was to keep the proven Chrome browser-native implementation as stable `main` and retain the optimized WK implementation as a separate, fully tested alternative. The default-promotion and public-release steps are therefore superseded, not unfinished.
 
 Related evidence:
 
 - Performance/live experiment evidence is retained on frozen branch `experiment/wk-curl-max-optimization` at `experiments/wkwebview_authority/max_optimization_log.md`; the pre-release branch intentionally does not retain the experiment harness/files.
 - Frozen CWA experiment/evidence branch: `experiment/wk-curl-max-optimization` at promotion fork point `ddf371b`. Do not rewrite or clean this branch; it is the reproducible checkpoint for the working alternative implementation and experiment history.
-- CWA pre-release hardening branch: `prerelease/wkwebview-main-hardening`. All cleanup, refactoring, parity, CI and promotion work happens here.
+- Historical CWA pre-release hardening branch: `prerelease/wkwebview-main-hardening`.
+- Final tested WK alternative: `integration/upstream-wkwebview-0.3.1` at `1e4e972fa2f219e2363456e78bebc7f3ca00b7b5`.
+- Stable Chrome main: `main` / `origin/main` at `524f400c74da6fdf8ff3aa2ab22cc497b8b69168`.
 - gptty integration branch: `feature/wkwebview-authority-e2e`.
+
+## Final disposition — 2026-09-11
+
+- **Stable/default implementation:** Chrome browser-native stays on `main` at `524f400`. It was rechecked from a clean checkout with full CWA regression (2115/2115), downstream gptty (289/289), and a real authenticated browser-owned turn returning exact `CWA_CHROME_MAIN_LIVE_AUTH_OK_20260911` with HTTP 200, canonical readback and observed model `gpt-5-6-thinking`.
+- **Alternative implementation:** optimized WK stays on `integration/upstream-wkwebview-0.3.1` at `1e4e972`. Final integration verification passed full CWA 2252/2252, downstream gptty 289/289, quality/JS/native/package/install gates, live Stop/Temporary/exact-model/file/image coverage, and the four-process new/continuation/mixed load matrix with globally serialized Phase A and lightweight curl/WebSocket finality.
+- **Historical evidence:** experiment and prerelease branches are retained. In particular `experiment/wk-curl-max-optimization` remains immutable evidence and must not be cleaned or rewritten.
+- **Release/default promotion:** canceled by product decision. `WK-MAIN-013`, `WK-MAIN-014` and `WK-MAIN-015` are `SUPERSEDED`; there is no remaining requirement to make WK the implicit macOS default or publish the staged WK CWA/gptty releases.
+- **Upstream boundary:** no write interaction with the foreign `kymuco/chatgpt-web-adapter` repository is part of this plan. The user's fork may retain and publish its own branches/checkpoints as needed.
 
 ## Target architecture
 
@@ -47,7 +57,7 @@ Required invariants:
 - canonical current-node/write matching remains final authority;
 - failure paths fail closed or use an explicitly documented compatibility fallback;
 - secrets, prompts, and protected credentials do not appear in stdout, logs, process argv, or persistent temp files;
-- the primary macOS path must be installable from the built wheel, not only runnable from a source checkout.
+- the WK alternative must be installable from the built wheel, not only runnable from a source checkout.
 
 ## Status legend
 
@@ -57,8 +67,9 @@ Required invariants:
 - `LIVE PROVEN` — exercised successfully against the real product path.
 - `DEFERRED` — intentionally postponed with a documented reason.
 - `REJECTED` — investigated and intentionally not adopted.
+- `SUPERSEDED` — implementation/work was completed or staged, but the original product/release objective was explicitly replaced by the final dual-backend decision; no action remains.
 
-## Promotion blockers
+## Promotion work (closed)
 
 | ID | Priority | Status | Item | Required outcome |
 |---|---|---|---|---|
@@ -74,9 +85,9 @@ Required invariants:
 | WK-MAIN-010 | P0 | LIVE PROVEN | Correct canonical transport provenance | Canonical plane is now transport-neutral `WKWEBVIEW_CANONICAL_READ`; actual reads report `curl_cffi`, `wkwebview`, or `cache` separately. A live continuation reported `canonical_read_transport=curl_cffi` while preserving conversation identity. |
 | WK-MAIN-011 | P0 | LIVE PROVEN | Add lightweight transport/fallback observability | Existing browser-owned provenance reports canonical read transport/fallback, Phase-A implementation/gate wait/elapsed time and Phase-B implementation/fallback/elapsed time. Normal lightweight turns report `curl_cffi_websocket`, already-terminal Phase A reports `phase_one_terminal`, and the accepted-write identity recovery added by `WK-MAIN-016` reports the distinct `canonical_message_id_recovery` path instead of being hidden as a generic terminal turn. Fallback reasons remain bounded safe codes rather than arbitrary exception text. |
 | WK-MAIN-012 | P0 | DONE | Stabilize minimal-shell upstream-drift tests | Two sanitized known `conversation-small-*` layout fixtures now exercise the exact production helper/initializer/export discovery in direct and aggressively chunked streaming modes. The fixtures exposed and now guard a premature partial-export-alias bug; live minimal-shell protected write passed after the fix. |
-| WK-MAIN-013 | P0 | LIVE PROVEN | Promote the primary macOS browser-authority backend | The pre-release source now resolves the implicit browser-owned backend to `wkwebview` on identifiable macOS >=12 and keeps `chrome-native` on older/unknown macOS and non-Darwin hosts; an explicit backend selection still overrides the default. The WK backend itself remains lightweight-by-default, with `CWA_WK_FORCE_LEGACY=1` only changing its internal topology to full-page/direct-WK. Live source-only evidence on 2026-09-11, with no explicit backend argument, returned exact `WK_FINAL_IMPLICIT_DEFAULT_OK_20260911` with `default_backend=wkwebview` and provider `WKWebViewTurnProvider`. This is a pre-release source promotion only: stable/global installed tooling and public packages remain unchanged until `WK-MAIN-036`, `045/046`, and `014` complete. |
-| WK-MAIN-014 | P0 | READY | Make the promoted runtime distributable as a new package version | CWA is finalized locally at `0.3.1` with changelog date `2026-09-11`. Exact clean candidate `d274c25` passed `WK-MAIN-045/046`; the dated release metadata then passed fresh wheel+sdist build, `twine check`, installed-wheel smoke (`wk_helper_build=true`) and strict release gate with `--tag v0.3.1`. `v0.3.0` remains the latest public release until publication. Final `DONE` requires publishing `v0.3.1`/PyPI and post-publish verification of the public install. |
-| WK-MAIN-015 | P0 | STAGED | Make the downstream gptty rollout distributable without accepting old CWA | gptty is staged at `0.1.2` while dated `0.1.1` remains historical. Its wheel+sdist pass `twine check`; an isolated explicit install with CWA 0.3.1 passes `pip check` and `GPTTY_WK_INSTALLED_SMOKE_OK`. Installing the same gptty 0.1.2 wheel from current `>=0.3.0,<0.4.0` metadata resolves public CWA 0.3.0 and the WK smoke correctly fails because that release lacks the CWA-owned Darwin transport dependencies. gptty publishing is release-tag-only, requires a dated 0.1.2 changelog, blocks on macOS installed-WK smoke, and explicitly requires `chatgpt-web-adapter>=0.3.1,<0.4.0`. Final `DONE` is sequenced after CWA 0.3.1 is public: raise the floor, replace the temporary pre-release-branch CI checkout with public CWA 0.3.1 coverage, rerun downstream clean/package gates, publish 0.1.2, then verify the public install. |
+| WK-MAIN-013 | P0 | SUPERSEDED | Promote the primary macOS browser-authority backend | The pre-release selector promotion was implemented and live-proven (`WK_FINAL_IMPLICIT_DEFAULT_OK_20260911`), but it is intentionally not the final stable policy. Stable `main` remains Chrome browser-native; WK is retained as an explicitly selected alternative on the integration branch. No promotion action remains. |
+| WK-MAIN-014 | P0 | SUPERSEDED | Make the promoted runtime distributable as a new package version | The WK candidate was made release-ready locally: 0.3.1 artifacts, `twine check`, release gate and installed-wheel smoke all passed. Public WK promotion/release is intentionally canceled by the final dual-backend decision, so publication/post-publish verification is no longer an acceptance requirement. |
+| WK-MAIN-015 | P0 | SUPERSEDED | Make the downstream gptty rollout distributable without accepting old CWA | The gptty 0.1.2 WK rollout was staged and package/install-smoke proven. The corresponding public dependency-floor and release transition is intentionally canceled with the WK default/public-release decision. No rollout action remains. |
 | WK-MAIN-016 | P0 | DONE | Recover an HTTP-accepted protected write that misses the resume fence without replaying it | The minimal shell emits its unique client user-message id before submit. After a successful product response, missing resume/terminal evidence is given only a bounded grace period; the WK helper then releases the heavy-submit gate with an explicit recovery state instead of waiting for the whole turn timeout or retrying the write. CWA performs read-only `curl_cffi` recent-catalog/canonical lookup, requires the exact client message id plus prompt, waits for canonical finality and caches that payload. Unit coverage proves no second write/WS resume occurs. The real pre-fix stalled marker was independently found in canonical history, confirming the accepted-write failure mode; post-fix four-process mixed load is 4/4 exact with `max_phaseA=1` and no fallback. |
 
 ## Feature-parity work
@@ -137,9 +148,9 @@ These items are not reasons to redesign the solution unless later evidence inval
 | WK-EVID-008 | DONE | Historical experiment evidence: gptty temporarily carried the lightweight transport dependencies while the topology was being proven. This ownership was superseded by `WK-MAIN-032`; the release candidate now correctly makes CWA the Darwin curl/WebSocket dependency owner. |
 | WK-EVID-009 | DONE | A real pre-fix mixed-load turn returned HTTP acceptance but never emitted a resume fence; its exact prompt marker was later found in canonical history, proving that replay would have duplicated an accepted write. `WK-MAIN-016` now handles this state through bounded read-only client-message-id recovery and exposes it distinctly as `canonical_message_id_recovery`. |
 
-## Required acceptance gates before release
+## Acceptance gates for the alternative candidate
 
-All P0 items, applicable P1 parity items, and **all WK-MAIN-040 through WK-MAIN-046 cleanup items** must be `DONE` or `LIVE PROVEN` before this section starts. Final acceptance is intentionally run *after* repository cleanup so deleted legacy/experiment code cannot mask a regression.
+These gates were used to prove that the WK implementation was production-quality before the final policy decision. They were completed for the candidate and remain evidence for the alternative implementation; they no longer imply a public release or default promotion.
 
 Run and record all of the following on the exact cleaned candidate commit:
 
@@ -181,9 +192,9 @@ Performance regression guardrails for the current machine/environment should be 
 7. **Default promotion + dirty-tree live rehearsal** — WK-MAIN-013 is already live-proven in the pre-release source; rerun the functionality/load matrix without publishing or changing the stable/global install.
 8. **History/checkpoint cleanup** — WK-MAIN-036 reconstructs the intended logical commit boundaries once a safe commit/rebase primitive is available.
 9. **Exact clean post-selector acceptance** — WK-MAIN-045 and 046 from the committed candidate, including fresh artifacts and installed-wheel smoke.
-10. **Release sequencing** — WK-MAIN-014 publishes/verifies CWA 0.3.1, then the gptty floor/public-CWA transition completes WK-MAIN-015.
+10. **Release sequencing — SUPERSEDED** — the staged CWA/gptty publication path was intentionally canceled when Chrome was retained as stable main and WK was retained as an alternative.
 
-The source selector is already promoted; do not treat dirty-tree success as permission to publish before the clean committed-candidate gates are satisfied.
+Steps 1-9 are complete as engineering/acceptance work. Step 10 is intentionally superseded. The plan therefore has no remaining open implementation, validation, promotion or release action.
 
 ## Progress log
 
@@ -304,14 +315,20 @@ Append concise entries here whenever a tracker state changes. Reference task IDs
 - The source selector is now live: identifiable macOS >=12 resolves implicit browser-owned runtime assembly to `wkwebview`, while older/unknown macOS and non-Darwin hosts retain `chrome-native`; explicit backend selection still overrides this. Live no-argument proof returned `WK_FINAL_IMPLICIT_DEFAULT_OK_20260911` with `default_backend=wkwebview` and `WKWebViewTurnProvider`. This has not been published or installed into the user's stable/global CLI.
 - Terminal Git was explicitly authorized later on 2026-09-11. The candidate was checkpointed at `d05d521`, then lock-pinned Ruff 0.16.6 exposed and normalized 12 formatting-only files in `d274c25`. A detached clean checkout of `d274c25` then passed `WK-MAIN-045/046` in full, including CWA 2188/2188, gptty 289/289 against that exact source, quality/native/JS/docs gates, clean tracked tree, fresh artifacts, release gate and installed-wheel smoke.
 
+### 2026-09-11 — Final upstream-integration verification and plan closure
+
+- The final WK alternative was integrated with the newer upstream architecture on `integration/upstream-wkwebview-0.3.1` and fixed at `1e4e972fa2f219e2363456e78bebc7f3ca00b7b5`. Integration defects found during live work were fixed, including the lost WK lightweight source-client contract and the early-Stop/canonical-poll race.
+- Final exact-source verification is green: CWA 2252/2252, downstream gptty 289/289, engineering quality gate PASS, packaged JavaScript PASS, strict native compile PASS, fresh wheel/sdist + `twine check` + release gate + installed-wheel smoke PASS.
+- Final live WK evidence is green for Stop, Temporary Chat, exact `gpt-5-6-thinking` selection, representative text-file upload/readback and image understanding. Four-process new, continuation and mixed gates were 4/4 exact with `max_phaseA=1`, lightweight curl/WebSocket transport and no fallback in the final runs. A final post-closure manual turn also returned exact `WK_ALTERNATIVE_FINAL_CONFIRM_OK_20260911` with HTTP 200, `phase_a_transport=wkwebview_minimal_security_shell`, `phase_b_transport=curl_cffi_websocket` and no Phase-B fallback.
+- Stable Chrome `main` was restored to `524f400c74da6fdf8ff3aa2ab22cc497b8b69168` locally and on `origin/main`, then independently rechecked: CWA 2115/2115, downstream gptty 289/289, and an authenticated live browser-native turn returned exact `CWA_CHROME_MAIN_LIVE_AUTH_OK_20260911` with HTTP 200 and canonical completion.
+- Final product decision: keep Chrome as stable/default `main`; keep the optimized WK solution as a separate tested alternative. No historical experiment/prerelease branches are deleted or rewritten. `WK-MAIN-013/014/015` are therefore `SUPERSEDED`, and this tracker is closed with no remaining action item.
+
 ## Rules for maintaining this tracker
 
 - Never mark an item `DONE` from code inspection alone when its acceptance criterion requires a live or installed-artifact test.
-- Add newly discovered promotion defects here before fixing them so they cannot disappear into chat history.
-- If an item is intentionally not fixed, mark it `DEFERRED` or `REJECTED` and record the reason in the progress log.
-- Keep experiment measurements in the optimization log; keep promotion decision state here.
-- Treat `experiment/wk-curl-max-optimization` as immutable evidence unless a new experiment is intentionally started on a separate experiment branch.
-- Do not mark final acceptance complete until `WK-MAIN-013` through `WK-MAIN-015` and `WK-MAIN-040` through `WK-MAIN-046` have reached their final states in the required sequence, with the post-switch acceptance matrix rerun from the exact clean candidate afterward.
-- When `WK-MAIN-036` reconstructs the dirty pre-release history, keep the already-applied macOS default-selector promotion in its own logical commit so rollback remains straightforward.
-- Target CWA history when a safe commit/rebase primitive is available: (1) production WK refactor/hardening + experiment cleanup, (2) 0.3.1 release staging/gates, (3) isolated macOS default-selector promotion, (4) dated 0.3.1 release finalization only after post-switch clean acceptance.
-- Target gptty history: (1) CWA-owned dependency/integration CI, (2) 0.1.2 release staging/publish gates, then after public CWA 0.3.1 (3) dependency-floor/public-CWA CI transition and release finalization. Squash incidental formatter/fixup commits into their owning logical boundary rather than preserving experiment chronology.
+- This tracker is closed. Reopen it only if the product decision changes and WK promotion/public release is intentionally resumed.
+- Keep experiment measurements in the optimization log; keep the final dual-backend decision and any future reversal here.
+- Treat `experiment/wk-curl-max-optimization` and the other historical experiment branches as retained evidence; do not delete, clean or rewrite them as part of normal maintenance.
+- Stable `main` remains the Chrome browser-native line unless a new explicit promotion decision is recorded first.
+- The final WK alternative remains on `integration/upstream-wkwebview-0.3.1`; future WK fixes should start from that tested line or a new descendant branch, not by rewriting historical checkpoints.
+- Do not create issues, pull requests, comments, reviews, pushes or other write interactions against the foreign `kymuco/chatgpt-web-adapter` repository without explicit user approval.

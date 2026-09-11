@@ -95,6 +95,36 @@ def test_snapshot_filters_internal_assistant_messages_and_auto_numbers(tmp_path:
     assert client.payload_calls == ["conversation-1"]
 
 
+def test_snapshot_prefers_full_history_payload_reader_when_available(tmp_path: Path) -> None:
+    class _FullHistorySnapshotClient(_SnapshotClient):
+        def __init__(self) -> None:
+            super().__init__([], {"scope": "single"})
+            self.full_payload_calls = []
+
+        def _get_full_conversation_payload(self, conversation_id: str):
+            self.full_payload_calls.append(conversation_id)
+            return {
+                "conversation_id": conversation_id,
+                "scope": "full",
+                "mapping": {"message-1": {"id": "message-1"}},
+            }
+
+    client = _FullHistorySnapshotClient()
+
+    result = snapshot_conversation(
+        client,
+        "conversation-1",
+        output_dir=tmp_path,
+        name="project",
+    )
+
+    raw_payload = json.loads(result.raw_payload_path.read_text(encoding="utf-8"))
+    assert raw_payload["scope"] == "full"
+    assert len(raw_payload["mapping"]) == 1
+    assert client.full_payload_calls == ["conversation-1"]
+    assert client.payload_calls == []
+
+
 def test_snapshot_context_only_skips_raw_payload_request(tmp_path: Path) -> None:
     client = _SnapshotClient(
         [ChatMessage(role="user", text="Hello")],

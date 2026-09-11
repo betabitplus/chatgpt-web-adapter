@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chatgpt-web-adapter"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local Python SDK and CLI bridge for an existing ordinary ChatGPT web session."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,7 +34,10 @@ classifiers = [
   "Operating System :: OS Independent",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = []
+dependencies = [
+  "curl-cffi==0.16.3; sys_platform == 'darwin'",
+  "websockets==16.1.1; sys_platform == 'darwin'",
+]
 
 [project.urls]
 Homepage = "https://github.com/kymuco/chatgpt-web-adapter"
@@ -71,6 +74,9 @@ chatgpt_web_adapter = [
   "browser_native_extension/*.html",
   "browser_native_extension/*.css",
   "browser_native_extension/*.png",
+  "wkwebview_helper/*.m",
+  "wkwebview_helper/*.plist",
+  "wkwebview_helper/*.js",
 ]
 
 [tool.ruff]

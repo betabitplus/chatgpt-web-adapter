@@ -320,6 +320,23 @@ def _model_profile_override_kwargs(
     return {"model_profile": model_profile}
 
 
+def _model_slug_override_kwargs(
+    write_transport: ProductWriteTransport,
+    *,
+    model: str | None,
+) -> dict[str, Any]:
+    if model is None:
+        return {}
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("model must be a non-empty model slug or None")
+    governance = dict(write_transport.governance())
+    if governance.get("model_slug_product_runtime_selection_supported") is not True:
+        raise ValueError(
+            "model selection is unavailable for the selected write transport"
+        )
+    return {"model_slug": model.strip()}
+
+
 def _assemble_default_write_transport(
     client: CanonicalConversationClient,
     *,
@@ -449,8 +466,11 @@ class ChatGPTProductRuntime:
         browser_authority_policy: str | None = None,
         browser_authority_ttl_ms: int | None = None,
         model_profile: str | None = None,
+        model: str | None = None,
         media: Sequence[MediaItem] | None = None,
     ) -> ChatResponse:
+        if model_profile is not None and model is not None:
+            raise ValueError("model_profile and model are mutually exclusive")
         mode, mode_kwargs = _conversation_mode_override_kwargs(
             self.write_transport,
             conversation_mode=conversation_mode,
@@ -465,6 +485,9 @@ class ChatGPTProductRuntime:
                 self.write_transport,
                 model_profile=model_profile,
             )
+        )
+        transport_kwargs.update(
+            _model_slug_override_kwargs(self.write_transport, model=model)
         )
         transport_kwargs.update(mode_kwargs)
         with _rich_input_scope(
@@ -495,6 +518,7 @@ class ChatGPTProductRuntime:
         browser_authority_policy: str | None = None,
         browser_authority_ttl_ms: int | None = None,
         model_profile: str | None = None,
+        model: str | None = None,
         media: Sequence[MediaItem] | None = None,
     ) -> ChatResponse:
         return self.send_text(
@@ -508,6 +532,7 @@ class ChatGPTProductRuntime:
             browser_authority_policy=browser_authority_policy,
             browser_authority_ttl_ms=browser_authority_ttl_ms,
             model_profile=model_profile,
+            model=model,
             media=media,
         )
 
@@ -524,8 +549,11 @@ class ChatGPTProductRuntime:
         browser_authority_policy: str | None = None,
         browser_authority_ttl_ms: int | None = None,
         model_profile: str | None = None,
+        model: str | None = None,
         media: Sequence[MediaItem] | None = None,
     ) -> ProductRuntimeExecution:
+        if model_profile is not None and model is not None:
+            raise ValueError("model_profile and model are mutually exclusive")
         mode, mode_kwargs = _conversation_mode_override_kwargs(
             self.write_transport,
             conversation_mode=conversation_mode,
@@ -540,6 +568,9 @@ class ChatGPTProductRuntime:
                 self.write_transport,
                 model_profile=model_profile,
             )
+        )
+        transport_kwargs.update(
+            _model_slug_override_kwargs(self.write_transport, model=model)
         )
         transport_kwargs.update(mode_kwargs)
 

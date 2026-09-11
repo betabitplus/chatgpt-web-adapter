@@ -93,7 +93,9 @@ class _PolicyTransport:
         return governance
 
 
-def test_direct_runtime_assembly_forwards_browser_authority_runtime_default(monkeypatch):
+def test_direct_runtime_assembly_forwards_browser_authority_runtime_default(
+    monkeypatch,
+):
     captured = {}
     transport = _PolicyTransport()
 
@@ -102,7 +104,9 @@ def test_direct_runtime_assembly_forwards_browser_authority_runtime_default(monk
         captured.update(kwargs)
         return transport
 
-    monkeypatch.setattr(product_runtime, "_assemble_default_write_transport", fake_assemble)
+    monkeypatch.setattr(
+        product_runtime, "_assemble_default_write_transport", fake_assemble
+    )
     canonical = _Canonical()
 
     runtime = ChatGPTProductRuntime(
@@ -130,7 +134,9 @@ def test_default_runtime_assembly_keeps_legacy_call_shape_without_policy(monkeyp
         captured.update(kwargs)
         return transport
 
-    monkeypatch.setattr(product_runtime, "_assemble_default_write_transport", fake_assemble)
+    monkeypatch.setattr(
+        product_runtime, "_assemble_default_write_transport", fake_assemble
+    )
     canonical = _Canonical()
 
     ChatGPTProductRuntime(canonical)
@@ -142,7 +148,9 @@ def test_default_runtime_assembly_keeps_legacy_call_shape_without_policy(monkeyp
     }
 
 
-def test_assemble_product_runtime_forwards_runtime_default_to_owned_assembly(monkeypatch):
+def test_assemble_product_runtime_forwards_runtime_default_to_owned_assembly(
+    monkeypatch,
+):
     captured = {}
     transport = _PolicyTransport()
 
@@ -151,11 +159,14 @@ def test_assemble_product_runtime_forwards_runtime_default_to_owned_assembly(mon
         captured.update(kwargs)
         return transport
 
-    monkeypatch.setattr(product_runtime, "_assemble_default_write_transport", fake_assemble)
+    monkeypatch.setattr(
+        product_runtime, "_assemble_default_write_transport", fake_assemble
+    )
     canonical = _Canonical()
 
     runtime = assemble_product_runtime(
         client=canonical,
+        browser_authority_backend="chrome-native",
         browser_authority_policy="TURN_SCOPED",
         browser_authority_ttl_ms=0,
     )
@@ -187,7 +198,9 @@ def test_injected_transport_rejects_browser_authority_runtime_defaults() -> None
     assert transport.send_calls == []
 
 
-def test_assemble_with_injected_transport_rejects_browser_authority_runtime_defaults() -> None:
+def test_assemble_with_injected_transport_rejects_browser_authority_runtime_defaults() -> (
+    None
+):
     transport = _PolicyTransport()
 
     with pytest.raises(
@@ -204,7 +217,9 @@ def test_assemble_with_injected_transport_rejects_browser_authority_runtime_defa
     assert transport.send_calls == []
 
 
-def test_per_turn_send_text_forwards_turn_scoped_policy_when_transport_opts_in() -> None:
+def test_per_turn_send_text_forwards_turn_scoped_policy_when_transport_opts_in() -> (
+    None
+):
     transport = _PolicyTransport()
     runtime = ChatGPTProductRuntime(_Canonical(), write_transport=transport)
 
@@ -312,25 +327,40 @@ def test_temporary_mode_denial_precedes_browser_authority_override_dispatch() ->
     assert transport.send_calls == []
 
 
-def test_product_runtime_governance_keeps_policy_resource_scoped_and_browser_opaque() -> None:
+def test_product_runtime_governance_keeps_policy_resource_scoped_and_browser_opaque() -> (
+    None
+):
     runtime = ChatGPTProductRuntime(_Canonical(), write_transport=_PolicyTransport())
 
     governance = runtime.governance()
 
     assert governance["browser_authority_policy_high_level_surface"] is True
     assert governance["browser_authority_selected_transport_policy_support"] is True
-    assert governance["browser_authority_policy_override_requires_transport_support"] is True
-    assert governance["browser_authority_policy_contract_scope"] == "RESOURCE_LIFECYCLE_ONLY"
+    assert (
+        governance["browser_authority_policy_override_requires_transport_support"]
+        is True
+    )
+    assert (
+        governance["browser_authority_policy_contract_scope"]
+        == "RESOURCE_LIFECYCLE_ONLY"
+    )
     assert governance["browser_authority_policy_changes_conversation_identity"] is False
     assert governance["browser_authority_policy_changes_conversation_mode"] is False
     assert governance["browser_authority_policy_changes_canonical_finality"] is False
     assert governance["browser_authority_policy_recreates_temporary_lifecycle"] is False
     assert governance["browser_authority_policy_exposes_browser_mechanics"] is False
-    assert governance["browser_authority_runtime_tab_identity_required_by_caller"] is False
-    assert governance["browser_authority_native_messaging_details_required_by_caller"] is False
+    assert (
+        governance["browser_authority_runtime_tab_identity_required_by_caller"] is False
+    )
+    assert (
+        governance["browser_authority_native_messaging_details_required_by_caller"]
+        is False
+    )
 
 
-def test_browser_owned_transport_passes_runtime_defaults_to_lower_runtime(monkeypatch) -> None:
+def test_browser_owned_transport_passes_runtime_defaults_to_lower_runtime(
+    monkeypatch,
+) -> None:
     captured = {}
 
     class FakeLowerRuntime:
@@ -368,15 +398,25 @@ def test_browser_owned_transport_passes_runtime_defaults_to_lower_runtime(monkey
     }
     governance = transport.governance()
     assert governance["browser_authority_product_runtime_policy_supported"] is True
-    assert governance["browser_authority_effective_runtime_default_policy"] == "IDLE_TTL"
+    assert (
+        governance["browser_authority_effective_runtime_default_policy"] == "IDLE_TTL"
+    )
     assert governance["browser_authority_effective_runtime_default_ttl_ms"] == 5000
-    assert governance["browser_authority_runtime_default_policy_source"] == "RUNTIME_DEFAULT"
+    assert (
+        governance["browser_authority_runtime_default_policy_source"]
+        == "RUNTIME_DEFAULT"
+    )
     assert governance["browser_authority_configured_runtime_ttl_ms"] == 5000
     assert governance["browser_authority_policy_exposes_runtime_tab_identity"] is False
-    assert governance["browser_authority_policy_requires_native_messaging_details"] is False
+    assert (
+        governance["browser_authority_policy_requires_native_messaging_details"]
+        is False
+    )
 
 
-def test_browser_owned_transport_default_remains_persistent_and_constructor_shape_stable(monkeypatch) -> None:
+def test_browser_owned_transport_default_remains_persistent_and_constructor_shape_stable(
+    monkeypatch,
+) -> None:
     captured = {}
 
     class FakeLowerRuntime:
@@ -410,7 +450,12 @@ def test_browser_owned_transport_default_remains_persistent_and_constructor_shap
     }
     governance = transport.governance()
     assert governance["browser_authority_default_policy"] == "PERSISTENT"
-    assert governance["browser_authority_effective_runtime_default_policy"] == "PERSISTENT"
+    assert (
+        governance["browser_authority_effective_runtime_default_policy"] == "PERSISTENT"
+    )
     assert governance["browser_authority_effective_runtime_default_ttl_ms"] is None
-    assert governance["browser_authority_runtime_default_policy_source"] == "TRANSPORT_DEFAULT"
+    assert (
+        governance["browser_authority_runtime_default_policy_source"]
+        == "TRANSPORT_DEFAULT"
+    )
     assert governance["browser_authority_configured_runtime_ttl_ms"] is None

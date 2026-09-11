@@ -46,13 +46,15 @@ class _BrokerHandler(socketserver.BaseRequestHandler):
                 request,
                 event_sink=emit_event
                 if request.get("streamTextObservations") is True
-                or operation == "canonical_read"
+                or operation in {"canonical_read", "catalog_read", "observe_turn"}
                 else None,
             )
         except Exception as error:
             response = {
                 "protocol": PROTOCOL_VERSION,
-                "request_id": request.get("request_id") if isinstance(request, dict) else None,
+                "request_id": request.get("request_id")
+                if isinstance(request, dict)
+                else None,
                 "ok": False,
                 "error": f"BROWSER_NATIVE_BROKER_ERROR:{error}",
             }
@@ -72,6 +74,8 @@ class BrowserNativeBroker:
         self.descriptor_path = bridge_descriptor_path(self.state_dir)
         self.token = secrets.token_urlsafe(32)
         self.pending: dict[str, queue.Queue[dict[str, Any]]] = {}
+        self.pending_requests: dict[str, dict[str, Any]] = {}
+        self.stopped_observe_leases: dict[str, str | None] = {}
         self.pending_lock = threading.Lock()
         self.write_lock = threading.Lock()
         # Browser writes, canonical reads, and runtime-tab disposal share one
@@ -128,6 +132,8 @@ class BrowserNativeBroker:
         with self.pending_lock:
             queues = list(self.pending.values())
             self.pending.clear()
+            self.pending_requests.clear()
+            self.stopped_observe_leases.clear()
         for waiter in queues:
             waiter.put(
                 {
@@ -163,6 +169,28 @@ class BrowserNativeBroker:
             self._authority_reserved_lease_id = lease_id
             self._authority_reservation_timer = timer
         timer.start()
+
+    def _refresh_authority_reservation(self, lease_id: str) -> bool:
+        timer = threading.Timer(
+            AUTHORITY_READBACK_RESERVATION_SECONDS,
+            self._expire_authority_reservation,
+            args=(lease_id,),
+        )
+        timer.daemon = True
+        with self._authority_reservation_guard:
+            if self._authority_reserved_lease_id != lease_id:
+                return False
+            previous = self._authority_reservation_timer
+            self._authority_reservation_timer = timer
+            if previous is not None:
+                previous.cancel()
+        timer.start()
+        return True
+
+    def _authority_reservation_matches(self, lease_id: str) -> bool:
+        with self._authority_reservation_guard:
+            reserved = self._authority_reserved_lease_id
+            return reserved is not None and secrets.compare_digest(lease_id, reserved)
 
     def _claim_authority_lane(self, operation: str, lease_id: str | None) -> bool:
         with self._authority_reservation_guard:
@@ -213,6 +241,68 @@ class BrowserNativeBroker:
                     timer.cancel()
         if had_reservation and release_lane:
             self.turn_lock.release()
+
+    def _active_turn_lease_for_stop(self) -> str | None:
+        with self.pending_lock:
+            for request in self.pending_requests.values():
+                if request.get("type") != "turn":
+                    continue
+                lease_id = self._request_lease_id(request)
+                if lease_id is not None:
+                    return lease_id
+        with self._authority_reservation_guard:
+            reserved = self._authority_reserved_lease_id
+        return reserved if isinstance(reserved, str) and reserved else None
+
+    def _wake_observe_turn_after_stop(
+        self, conversation_id: str | None, lease_id: str | None
+    ) -> None:
+        if not isinstance(lease_id, str) or not lease_id:
+            return
+        normalized = (
+            conversation_id.strip()
+            if isinstance(conversation_id, str) and conversation_id.strip()
+            else None
+        )
+        deliveries: list[tuple[queue.Queue[dict[str, Any]], dict[str, Any]]] = []
+        with self.pending_lock:
+            self.stopped_observe_leases[lease_id] = normalized
+            for request_id, request in self.pending_requests.items():
+                if request.get("type") != "observe_turn":
+                    continue
+                if self._request_lease_id(request) != lease_id:
+                    continue
+                expected = request.get("conversationId")
+                if (
+                    normalized is not None
+                    and isinstance(expected, str)
+                    and expected.strip()
+                    and expected.strip() != normalized
+                ):
+                    continue
+                waiter = self.pending.get(request_id)
+                if waiter is None:
+                    continue
+                deliveries.append(
+                    (
+                        waiter,
+                        {
+                            "protocol": PROTOCOL_VERSION,
+                            "type": "observe_turn_result",
+                            "request_id": request_id,
+                            "ok": True,
+                            "conversationId": normalized or expected,
+                            "turnExchangeId": request.get("turnExchangeId"),
+                            "messageId": None,
+                            "finishReason": "stopped",
+                            "source": "explicit_stop_broker",
+                        },
+                    )
+                )
+            if deliveries:
+                self.stopped_observe_leases.pop(lease_id, None)
+        for waiter, message in deliveries:
+            waiter.put_nowait(message)
 
     @staticmethod
     def _ui_liveness_base(
@@ -297,11 +387,7 @@ class BrowserNativeBroker:
         waiter: queue.Queue[dict[str, Any]] = queue.Queue()
         with self.pending_lock:
             self.pending[request_id] = waiter
-        forwarded = {
-            key: value
-            for key, value in request.items()
-            if key != "token"
-        }
+        forwarded = {key: value for key, value in request.items() if key != "token"}
         try:
             with self.write_lock:
                 write_native_message(sys.stdout.buffer, forwarded)
@@ -352,24 +438,146 @@ class BrowserNativeBroker:
             # PR11.5 does not acquire turn_lock. If the authority lane is active,
             # the handler returns UNKNOWN before touching the extension/debugger.
             return self._handle_ui_liveness_request(request, base)
+        if operation == "stop_generation":
+            # Stop is intentionally out-of-band: it must be able to reach the
+            # runtime tab while the normal turn owns the authority lane.
+            if not self.extension_connected:
+                return {
+                    **base,
+                    "ok": False,
+                    "error": "BROWSER_NATIVE_EXTENSION_NOT_CONNECTED",
+                }
+            timeout_ms = request.get("timeoutMs")
+            timeout = max(1.0, float(timeout_ms or 10_000) / 1000.0)
+            stop_lease_id = self._active_turn_lease_for_stop()
+            waiter: queue.Queue[dict[str, Any]] = queue.Queue()
+            with self.pending_lock:
+                self.pending[request_id] = waiter
+            forwarded = {key: value for key, value in request.items() if key != "token"}
+            try:
+                with self.write_lock:
+                    write_native_message(sys.stdout.buffer, forwarded)
+                try:
+                    response = waiter.get(timeout=timeout + 2.0)
+                    if response.get("ok") is True and response.get("stopped") is True:
+                        stop_lease_id = (
+                            stop_lease_id or self._active_turn_lease_for_stop()
+                        )
+                        self._wake_observe_turn_after_stop(
+                            response.get("conversationId"), stop_lease_id
+                        )
+                    return response
+                except queue.Empty:
+                    return {
+                        **base,
+                        "ok": False,
+                        "error": "BROWSER_NATIVE_EXTENSION_TIMEOUT",
+                    }
+            finally:
+                with self.pending_lock:
+                    self.pending.pop(request_id, None)
 
         if operation not in {
             "turn",
+            "observe_turn",
             "canonical_read",
+            "catalog_read",
             "canonical_read_complete",
             "release_runtime_tab",
         }:
             return {**base, "ok": False, "error": "BROWSER_NATIVE_UNKNOWN_OPERATION"}
         lease_id = self._request_lease_id(request)
+        if operation == "observe_turn":
+            if lease_id is None:
+                return {
+                    **base,
+                    "ok": False,
+                    "error": "BROWSER_NATIVE_AUTHORITY_LEASE_REQUIRED",
+                }
+            if not self.extension_connected:
+                return {
+                    **base,
+                    "ok": False,
+                    "error": "BROWSER_NATIVE_EXTENSION_NOT_CONNECTED",
+                }
+            if not self._authority_reservation_matches(lease_id):
+                return {
+                    **base,
+                    "ok": False,
+                    "error": "BROWSER_NATIVE_AUTHORITY_LEASE_MISMATCH",
+                }
+            self._refresh_authority_reservation(lease_id)
+            with self.pending_lock:
+                stopped_pending = lease_id in self.stopped_observe_leases
+                stopped_conversation_id = (
+                    self.stopped_observe_leases.pop(lease_id, None)
+                    if stopped_pending
+                    else None
+                )
+            if stopped_pending:
+                requested_conversation_id = request.get("conversationId")
+                return {
+                    **base,
+                    "type": "observe_turn_result",
+                    "ok": True,
+                    "conversationId": stopped_conversation_id
+                    or requested_conversation_id,
+                    "turnExchangeId": request.get("turnExchangeId"),
+                    "messageId": None,
+                    "finishReason": "stopped",
+                    "source": "explicit_stop_broker",
+                }
+            timeout_ms = request.get("timeoutMs")
+            timeout = max(1.0, float(timeout_ms or 120_000) / 1000.0)
+            waiter: queue.Queue[dict[str, Any]] = queue.Queue()
+            with self.pending_lock:
+                self.pending[request_id] = waiter
+                self.pending_requests[request_id] = dict(request)
+            forwarded = {key: value for key, value in request.items() if key != "token"}
+            try:
+                with self.write_lock:
+                    write_native_message(sys.stdout.buffer, forwarded)
+                deadline = time.monotonic() + timeout + 5.0
+                while True:
+                    try:
+                        message = waiter.get(
+                            timeout=max(0.01, deadline - time.monotonic())
+                        )
+                    except queue.Empty:
+                        return {
+                            **base,
+                            "ok": False,
+                            "error": "BROWSER_NATIVE_EXTENSION_TIMEOUT",
+                        }
+                    if message.get("type") == "turn_event":
+                        self._refresh_authority_reservation(lease_id)
+                        if event_sink is not None:
+                            event_sink(message)
+                        continue
+                    self._refresh_authority_reservation(lease_id)
+                    return message
+            finally:
+                with self.pending_lock:
+                    self.pending.pop(request_id, None)
+                    self.pending_requests.pop(request_id, None)
+
         if operation == "canonical_read_complete":
             if lease_id is None:
-                return {**base, "ok": False, "error": "BROWSER_NATIVE_AUTHORITY_LEASE_REQUIRED"}
+                return {
+                    **base,
+                    "ok": False,
+                    "error": "BROWSER_NATIVE_AUTHORITY_LEASE_REQUIRED",
+                }
             completion = self._complete_authority_reservation(lease_id)
             if completion != "OK":
                 return {**base, "ok": False, "error": completion}
             return {**base, "ok": True, "type": "canonical_read_complete_result"}
         if not self.extension_connected:
-            return {**base, "ok": False, "error": "BROWSER_NATIVE_EXTENSION_NOT_CONNECTED"}
+            return {
+                **base,
+                "ok": False,
+                "error": "BROWSER_NATIVE_EXTENSION_NOT_CONNECTED",
+            }
         if not self._claim_authority_lane(operation, lease_id):
             return {**base, "ok": False, "error": "BROWSER_NATIVE_BRIDGE_BUSY"}
 
@@ -379,27 +587,27 @@ class BrowserNativeBroker:
             default_timeout_ms = {
                 "turn": 120_000,
                 "canonical_read": 30_000,
+                "catalog_read": 30_000,
                 "release_runtime_tab": 10_000,
             }[operation]
             timeout = max(
                 1.0,
-                min(float(timeout_ms or default_timeout_ms) / 1000.0, 300.0),
+                float(timeout_ms or default_timeout_ms) / 1000.0,
             )
             waiter: queue.Queue[dict[str, Any]] = queue.Queue()
             with self.pending_lock:
                 self.pending[request_id] = waiter
-            forwarded = {
-                key: value
-                for key, value in request.items()
-                if key != "token"
-            }
+                self.pending_requests[request_id] = dict(request)
+            forwarded = {key: value for key, value in request.items() if key != "token"}
             try:
                 with self.write_lock:
                     write_native_message(sys.stdout.buffer, forwarded)
                 deadline = time.monotonic() + timeout + 5.0
                 while True:
                     try:
-                        message = waiter.get(timeout=max(0.01, deadline - time.monotonic()))
+                        message = waiter.get(
+                            timeout=max(0.01, deadline - time.monotonic())
+                        )
                     except queue.Empty:
                         return {
                             **base,
@@ -410,21 +618,25 @@ class BrowserNativeBroker:
                         if event_sink is not None:
                             event_sink(message)
                         continue
-                    if (
-                        lease_id is not None
-                        and (
-                            operation == "canonical_read"
-                            or (operation == "turn" and message.get("ok") is True)
+                    if lease_id is not None and (
+                        operation == "canonical_read"
+                        or (
+                            operation == "turn"
+                            and message.get("ok") is True
+                            and request.get("conversationMode") != "temporary"
                         )
                     ):
-                        # Retain the cross-request lane until Python has classified
-                        # terminal canonical readback for the matching lease.
+                        # Normal turns retain the cross-request lane until Python has
+                        # classified terminal canonical readback. Temporary Chat is
+                        # page-finalized and intentionally has no canonical readback,
+                        # so its lane is released with the completed turn.
                         self._reserve_authority_for_readback(lease_id)
                         release_lane = False
                     return message
             finally:
                 with self.pending_lock:
                     self.pending.pop(request_id, None)
+                    self.pending_requests.pop(request_id, None)
         finally:
             if release_lane and operation == "canonical_read" and lease_id is not None:
                 # Read timeout/error still needs terminal classification before a

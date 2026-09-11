@@ -6,6 +6,12 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+## 0.3.1 - 2026-09-11
+
+- macOS WKWebView authority: harden the self-contained macOS 12+ backend around a globally serialized minimal WebKit protected-write phase, browser-issued resume fencing, lightweight curl/WebSocket continuation, and canonical finality without retaining the full ChatGPT SPA
+- WK parity and resilience: keep exact model selection, Temporary Chat, image/general-file input, multimodal continuation, Stop, tool-loop and HIGH/DEEP semantics on the native WK path; fix the final-SSE-block EOF race without replaying ambiguous protected writes
+- WK promotion policy: use the lightweight WK topology without enable flags, retain only `CWA_WK_FORCE_LEGACY=1` as the emergency full-page/direct-WK escape hatch, and promote implicit browser-owned source selection to `wkwebview` on identifiable macOS 12+ while keeping older/unknown macOS and non-Darwin hosts on `chrome-native`; public release/global installation remains gated on clean exact-candidate acceptance
+- WK packaging and consumer integration: move Darwin curl/WebSocket dependency ownership into CWA, package/build the native helper from installed artifacts, add blocking macOS CWA/gptty integration gates, and reject experiment/cache/temp/local-path/removed-broker debris from release artifacts
 - connectors / required actions: add post-0.3 typed connector and required-action lifecycle observations that require explicit stable product identity/correlation; authenticated product evidence proves required-action point observation while the combined `tools_connectors` capability remains `UNKNOWN`
 - connector authority boundary: keep product observation separate from approval, connector authorization, canonical finality, retry authority, and downstream filesystem/Git/workspace authority; generic router/tool activity, display names, DOM adjacency and generated ids are not treated as connector lifecycle identity
 - generated artifacts: add a bounded `ProductArtifactObservation` boundary and fail closed around locator-bearing evidence; current generated-artifact download/materialization status is `ARTIFACT_DOWNLOAD_HANDOFF_UNSUPPORTED_WITHOUT_STABLE_PRODUCT_IDENTITY`

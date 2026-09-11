@@ -46,18 +46,44 @@ class BrowserOwnedProductTransport(_core.BrowserOwnedProductTransport):
 
             provider = ProductModelProfileProvider()
         self.provider = provider
+        canonical_builder = getattr(self.provider, "build_canonical_client", None)
         self._browser_context_canonical_enabled = isinstance(
             self.provider,
             BrowserNativeTurnProvider,
-        )
-        self.canonical_client = (
-            source_canonical
-            if isinstance(source_canonical, _LegacyBrowserContextCanonicalClient)
-            or not self._browser_context_canonical_enabled
-            else BrowserContextCanonicalClientV2(source_canonical, self.provider)
-        )
+        ) or callable(canonical_builder)
+        if isinstance(source_canonical, _LegacyBrowserContextCanonicalClient):
+            self.canonical_client = source_canonical
+        elif callable(canonical_builder):
+            self.canonical_client = canonical_builder(source_canonical)
+        elif isinstance(self.provider, BrowserNativeTurnProvider):
+            self.canonical_client = BrowserContextCanonicalClientV2(
+                source_canonical,
+                self.provider,
+            )
+        else:
+            self.canonical_client = source_canonical
         self._model_profile_selection_supported = callable(
             getattr(self.provider, "require_profile", None)
+        )
+        temporary_provider_builder = getattr(
+            self.provider,
+            "build_temporary_chat_provider",
+            None,
+        )
+        self._temporary_provider = (
+            temporary_provider_builder()
+            if callable(temporary_provider_builder)
+            else self.provider
+        )
+        self._temporary_chat_supported = (
+            getattr(self.provider, "temporary_chat_supported", True) is True
+        )
+        self._media_supported = (
+            getattr(self.provider, "supports_attachment_paths", False) is True
+        )
+        self._files_supported = getattr(self.provider, "supports_files", False) is True
+        self._multimodal_continuation_supported = (
+            getattr(self.provider, "supports_multimodal_continuation", False) is True
         )
         self._browser_authority_runtime_policy = browser_authority_policy
         self._browser_authority_runtime_ttl_ms = browser_authority_ttl_ms
@@ -79,7 +105,64 @@ class BrowserOwnedProductTransport(_core.BrowserOwnedProductTransport):
         )
         self._submission_dispatch_lock = threading.RLock()
         self._submission_lifecycle = BrowserOwnedSubmissionLifecycle(self._runtime)
-        self._temporary_runtime = TemporaryProductWriteRuntime(self.provider)
+        self._temporary_runtime = TemporaryProductWriteRuntime(self._temporary_provider)
+
+    def stop_generation(
+        self,
+        conversation: Any = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        helper = getattr(self.provider, "stop_generation", None)
+        if not callable(helper):
+            raise RuntimeError(
+                "stop generation is unavailable for the configured browser authority provider"
+            )
+        conversation_id = None
+        if conversation is not None:
+            from .types import ConversationRef
+
+            conversation_id = ConversationRef.from_any(conversation).conversation_id
+        return helper(conversation_id, timeout=timeout)
+
+    def governance(self) -> dict[str, Any]:
+        governance = dict(super().governance())
+        governance.update(
+            {
+                "browser_authority_backend": getattr(
+                    self.provider,
+                    "browser_authority_backend",
+                    "chrome-native",
+                ),
+                "model_slug_product_runtime_selection_supported": getattr(
+                    self.provider,
+                    "supports_model_slug",
+                    True,
+                ),
+                "temporary_chat_product_runtime_selection_supported": (
+                    self._temporary_chat_supported
+                ),
+                "media_product_runtime_supported": self._media_supported,
+                "media_semantic_default_model_profile_supported": (
+                    self._media_supported and self._model_profile_selection_supported
+                ),
+                "streaming_source": getattr(
+                    self.provider,
+                    "streaming_source",
+                    governance.get("streaming_source"),
+                ),
+                "streaming_canonical_finality": (
+                    getattr(
+                        self.canonical_client,
+                        "canonical_read_plane",
+                        governance.get("streaming_canonical_finality"),
+                    )
+                    if self._browser_context_canonical_enabled
+                    else governance.get("streaming_canonical_finality")
+                ),
+            }
+        )
+        return governance
 
     capabilities = gate_browser_owned_rich_input_capabilities(
         gate_browser_owned_web_search_capability(

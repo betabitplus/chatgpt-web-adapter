@@ -1,5 +1,7 @@
 const _cwaCanonicalPriorOnNativeMessage = onNativeMessage;
 const CWA_CANONICAL_CHUNK_BASE64_CHARS = 600_000;
+const CWA_CANONICAL_READ_TAB_KEY = "browserNativeCanonicalReadTabIdV1";
+const CWA_CANONICAL_READ_URL = `${CHATGPT_ORIGIN}/robots.txt`;
 
 function _cwaCanonicalConversationId(value) {
   const conversationId = typeof value === "string" ? value.trim() : "";
@@ -21,41 +23,141 @@ function _cwaCanonicalStableReason(error) {
     : "CANONICAL_READ_BROWSER_ERROR";
 }
 
+async function _cwaCanonicalPruneOrphanedChatGPTTabs(canonicalTabId) {
+  const runtimeTabId = await storedRuntimeTabId();
+  const keep = new Set(
+    [runtimeTabId, canonicalTabId].filter((tabId) => Number.isInteger(tabId))
+  );
+  const tabs = await chrome.tabs.query({ url: `${CHATGPT_ORIGIN}/*` });
+  const orphanIds = tabs
+    .map((tab) => tab?.id)
+    .filter((tabId) => Number.isInteger(tabId) && !keep.has(tabId));
+  if (orphanIds.length > 0) {
+    try {
+      await chrome.tabs.remove(orphanIds);
+    } catch {}
+  }
+}
+
 async function _cwaCanonicalRuntimeTab() {
-  const storedId = await storedRuntimeTabId();
+  const stored = await chrome.storage.local.get(CWA_CANONICAL_READ_TAB_KEY);
+  const storedId = stored?.[CWA_CANONICAL_READ_TAB_KEY];
   if (Number.isInteger(storedId)) {
     try {
-      const tab = await chrome.tabs.get(storedId);
+      let tab = await chrome.tabs.get(storedId);
       if (isChatGPTUrl(tab?.url || "")) {
-        return tab.status === "complete" ? tab : waitForTabComplete(storedId);
+        if (tab.url !== CWA_CANONICAL_READ_URL) {
+          tab = await chrome.tabs.update(storedId, {
+            url: CWA_CANONICAL_READ_URL,
+            active: false,
+          });
+        }
+        const ready = tab.status === "complete" ? tab : await waitForTabComplete(storedId);
+        await _cwaCanonicalPruneOrphanedChatGPTTabs(storedId);
+        return ready;
       }
     } catch {
-      // Stale runtime-tab state is replaced without navigating another tab.
+      await chrome.storage.local.remove(CWA_CANONICAL_READ_TAB_KEY);
     }
   }
 
-  const tab = await chrome.tabs.create({ url: `${CHATGPT_ORIGIN}/`, active: false });
+  const tab = await chrome.tabs.create({ url: CWA_CANONICAL_READ_URL, active: false });
   if (!Number.isInteger(tab?.id)) {
     throw new Error("CANONICAL_READ_RUNTIME_TAB_CREATE_FAILED");
   }
-  await storeRuntimeTabId(tab.id);
-  return waitForTabComplete(tab.id);
+  await chrome.storage.local.set({ [CWA_CANONICAL_READ_TAB_KEY]: tab.id });
+  const ready = await waitForTabComplete(tab.id);
+  await _cwaCanonicalPruneOrphanedChatGPTTabs(tab.id);
+  return ready;
 }
 
-async function _cwaCanonicalFetch(tabId, conversationId, timeoutMs) {
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const stored = await chrome.storage.local.get(CWA_CANONICAL_READ_TAB_KEY);
+  if (stored?.[CWA_CANONICAL_READ_TAB_KEY] === tabId) {
+    await chrome.storage.local.remove(CWA_CANONICAL_READ_TAB_KEY);
+  }
+});
+
+async function _cwaCanonicalFetch(tabId, endpoint, timeoutMs) {
   const debuggee = { tabId };
-  const endpoint = `${CHATGPT_ORIGIN}/backend-api/conversation/${encodeURIComponent(conversationId)}`;
   const expression = `(async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ${JSON.stringify(timeoutMs)});
     try {
-      const response = await fetch(${JSON.stringify(endpoint)}, {
+      const cacheKey = "__cwaCanonicalAccessTokenV1";
+      const cacheTtlMs = 60_000;
+      const now = Date.now();
+      const cached = globalThis[cacheKey];
+      let accessToken = (
+        cached &&
+        typeof cached.token === "string" &&
+        cached.token &&
+        Number.isFinite(cached.cachedAtMs) &&
+        now - cached.cachedAtMs >= 0 &&
+        now - cached.cachedAtMs < cacheTtlMs
+      ) ? cached.token : "";
+
+      const refreshAccessToken = async () => {
+        const sessionResponse = await fetch("/api/auth/session", {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+          headers: { accept: "application/json" },
+          signal: controller.signal
+        });
+        let sessionPayload = null;
+        try {
+          sessionPayload = await sessionResponse.json();
+        } catch {}
+        const token = typeof sessionPayload?.accessToken === "string"
+          ? sessionPayload.accessToken.trim()
+          : "";
+        if (!sessionResponse.ok || !token) {
+          return {
+            ok: false,
+            status: sessionResponse.status,
+            contentType: (sessionResponse.headers.get("content-type") || "").slice(0, 128),
+            token: ""
+          };
+        }
+        globalThis[cacheKey] = { token, cachedAtMs: Date.now() };
+        return { ok: true, status: sessionResponse.status, contentType: "", token };
+      };
+
+      if (!accessToken) {
+        const refreshed = await refreshAccessToken();
+        if (!refreshed.ok) {
+          return {
+            ok: false,
+            status: refreshed.status,
+            contentType: refreshed.contentType,
+            reasonCode: "CANONICAL_READ_AUTHENTICATION_REQUIRED",
+            retryable: false
+          };
+        }
+        accessToken = refreshed.token;
+      }
+
+      const fetchConversation = (token) => fetch(${JSON.stringify(endpoint)}, {
         method: "GET",
         credentials: "include",
         cache: "no-store",
-        headers: { accept: "application/json" },
+        headers: {
+          accept: "application/json",
+          authorization: "Bearer " + token
+        },
         signal: controller.signal
       });
+
+      let response = await fetchConversation(accessToken);
+      if ((response.status === 401 || response.status === 403) && globalThis[cacheKey]) {
+        delete globalThis[cacheKey];
+        const refreshed = await refreshAccessToken();
+        if (refreshed.ok) {
+          accessToken = refreshed.token;
+          response = await fetchConversation(accessToken);
+        }
+      }
       const contentType = (response.headers.get("content-type") || "").slice(0, 128);
       if (!response.ok) {
         const reasonCode = response.status === 404
@@ -64,13 +166,15 @@ async function _cwaCanonicalFetch(tabId, conversationId, timeoutMs) {
             ? "CANONICAL_READ_AUTHENTICATION_REQUIRED"
             : response.status === 403
               ? "CANONICAL_READ_ACCESS_CHALLENGED"
-              : "CANONICAL_READ_HTTP_ERROR";
+              : response.status === 429
+                ? "CANONICAL_READ_RATE_LIMITED"
+                : "CANONICAL_READ_HTTP_ERROR";
         return {
           ok: false,
           status: response.status,
           contentType,
           reasonCode,
-          retryable: response.status === 404
+          retryable: response.status === 404 || response.status === 429
         };
       }
       if (!contentType.toLowerCase().includes("json")) {
@@ -115,7 +219,7 @@ async function _cwaCanonicalFetch(tabId, conversationId, timeoutMs) {
         reasonCode: error?.name === "AbortError"
           ? "CANONICAL_READ_TIMEOUT"
           : "CANONICAL_READ_NETWORK_ERROR",
-        retryable: false
+        retryable: true
       };
     } finally {
       clearTimeout(timer);
@@ -169,7 +273,8 @@ async function _cwaCanonicalRead(message, port) {
   if (!Number.isInteger(tab?.id)) {
     throw new Error("CANONICAL_READ_RUNTIME_TAB_REQUIRED");
   }
-  const fetched = await _cwaCanonicalFetch(tab.id, conversationId, timeoutMs);
+  const endpoint = `${CHATGPT_ORIGIN}/backend-api/conversation/${encodeURIComponent(conversationId)}`;
+  const fetched = await _cwaCanonicalFetch(tab.id, endpoint, timeoutMs);
   if (fetched.ok !== true) {
     safePortPost(port, {
       protocol: BRIDGE_PROTOCOL_VERSION,
@@ -230,10 +335,94 @@ async function _cwaCanonicalRead(message, port) {
   });
 }
 
+function _cwaCatalogEndpoint(message) {
+  const catalog = typeof message.catalog === "string" ? message.catalog.trim() : "";
+  if (catalog === "models") {
+    return `${CHATGPT_ORIGIN}/backend-api/models?history_and_training_disabled=false`;
+  }
+  if (catalog !== "conversations") throw new Error("CATALOG_READ_KIND_UNSUPPORTED");
+
+  const offset = Number.isInteger(message.offset) && message.offset >= 0 ? message.offset : 0;
+  const limit = Number.isInteger(message.limit)
+    ? Math.max(1, Math.min(message.limit, 100))
+    : 100;
+  const params = new URLSearchParams({
+    offset: String(offset),
+    limit: String(limit),
+    order: "updated",
+    is_archived: String(message.isArchived === true),
+    is_starred: String(message.isStarred === true),
+  });
+  return `${CHATGPT_ORIGIN}/backend-api/conversations?${params.toString()}`;
+}
+
+async function _cwaCatalogRead(message, port) {
+  const requestId = message.request_id;
+  const timeoutMs = Number.isFinite(message.timeoutMs)
+    ? Math.max(1_000, Math.min(Number(message.timeoutMs), 120_000))
+    : 30_000;
+  const endpoint = _cwaCatalogEndpoint(message);
+  const tab = await _cwaCanonicalRuntimeTab();
+  if (!Number.isInteger(tab?.id)) throw new Error("CANONICAL_READ_RUNTIME_TAB_REQUIRED");
+  const fetched = await _cwaCanonicalFetch(tab.id, endpoint, timeoutMs);
+  if (fetched.ok !== true) {
+    safePortPost(port, {
+      protocol: BRIDGE_PROTOCOL_VERSION,
+      type: "catalog_read_result",
+      request_id: requestId,
+      ok: false,
+      reasonCode: fetched.reasonCode,
+      status: fetched.status,
+      contentType: fetched.contentType,
+      retryable: fetched.retryable === true
+    });
+    return;
+  }
+
+  const bodyBase64 = fetched.bodyBase64;
+  if (typeof bodyBase64 !== "string" || !/^[0-9a-f]{64}$/.test(fetched.sha256 || "")) {
+    throw new Error("CANONICAL_READ_TRANSFER_SOURCE_INVALID");
+  }
+  const chunkCount = Math.max(
+    1,
+    Math.ceil(bodyBase64.length / CWA_CANONICAL_CHUNK_BASE64_CHARS)
+  );
+  for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+    const data = bodyBase64.slice(
+      chunkIndex * CWA_CANONICAL_CHUNK_BASE64_CHARS,
+      (chunkIndex + 1) * CWA_CANONICAL_CHUNK_BASE64_CHARS
+    );
+    if (!safePortPost(port, {
+      protocol: BRIDGE_PROTOCOL_VERSION,
+      type: "canonical_read_chunk",
+      request_id: requestId,
+      chunkIndex,
+      chunkCount,
+      totalBytes: fetched.totalBytes,
+      sha256: fetched.sha256,
+      data
+    })) {
+      throw new Error("CANONICAL_READ_CHUNK_DELIVERY_FAILED");
+    }
+  }
+  safePortPost(port, {
+    protocol: BRIDGE_PROTOCOL_VERSION,
+    type: "catalog_read_result",
+    request_id: requestId,
+    ok: true,
+    status: fetched.status,
+    contentType: fetched.contentType,
+    chunkCount,
+    totalBytes: fetched.totalBytes,
+    sha256: fetched.sha256,
+    runtimeTabId: tab.id
+  });
+}
+
 onNativeMessage = async function _cwaOnNativeMessageWithCanonicalRead(message, port) {
   if (
     message?.protocol !== BRIDGE_PROTOCOL_VERSION ||
-    message?.type !== "canonical_read"
+    !["canonical_read", "catalog_read"].includes(message?.type)
   ) {
     return _cwaCanonicalPriorOnNativeMessage(message, port);
   }
@@ -253,11 +442,12 @@ onNativeMessage = async function _cwaOnNativeMessageWithCanonicalRead(message, p
 
   activeRequestId = requestId;
   try {
-    await _cwaCanonicalRead(message, port);
+    if (message.type === "catalog_read") await _cwaCatalogRead(message, port);
+    else await _cwaCanonicalRead(message, port);
   } catch (error) {
     safePortPost(port, {
       protocol: BRIDGE_PROTOCOL_VERSION,
-      type: "canonical_read_result",
+      type: message.type === "catalog_read" ? "catalog_read_result" : "canonical_read_result",
       request_id: requestId,
       ok: false,
       reasonCode: _cwaCanonicalStableReason(error),

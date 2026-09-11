@@ -24,6 +24,7 @@ from .browser_owned_write_runtime import (
     WRITE_OUTCOME_UNKNOWN,
     BrowserOwnedWriteObservation,
     BrowserOwnedWriteRuntimeError,
+    _canonical_status_blocks_browser_owned_write,
     _canonical_status_value,
     _conversation_id,
     _optional_int,
@@ -129,7 +130,9 @@ class BrowserOwnedSubmissionLifecycle:
         with self._lock:
             self._dispatch_reserved = False
 
-    def _validate_inputs(self, text: str, *, timeout: float, poll_interval: float) -> None:
+    def _validate_inputs(
+        self, text: str, *, timeout: float, poll_interval: float
+    ) -> None:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text is required")
         if timeout <= 0:
@@ -166,7 +169,11 @@ class BrowserOwnedSubmissionLifecycle:
                 request_stage="browser_authority_policy",
             )
 
-        preflight = self.runtime.health(conversation)
+        # Browser/extension availability is the only generic preflight here.
+        # Canonical status is durable conversation state, not current UI
+        # liveness; the browser-native write path performs the authoritative
+        # composer-readiness fence immediately before submit.
+        preflight = self.runtime.health()
         if not preflight.ready:
             raise BrowserOwnedWriteRuntimeError(
                 f"browser-owned write preflight failed: {preflight.reason}",
@@ -180,7 +187,9 @@ class BrowserOwnedSubmissionLifecycle:
 
         if conversation is not None:
             try:
-                commit_status = _canonical_status_value(self.runtime.client, conversation)
+                commit_status = _canonical_status_value(
+                    self.runtime.client, conversation
+                )
             except Exception as error:
                 raise BrowserOwnedWriteRuntimeError(
                     "browser-owned write commit check failed: canonical read unavailable",
@@ -192,7 +201,7 @@ class BrowserOwnedSubmissionLifecycle:
                     cause=error,
                     request_stage="browser_owned_write_preflight",
                 ) from error
-            if commit_status != "completed":
+            if _canonical_status_blocks_browser_owned_write(commit_status):
                 raise BrowserOwnedWriteRuntimeError(
                     f"browser-owned write commit check failed: canonical status={commit_status}",
                     failure_kind=CONVERSATION_NOT_COMPLETED,
@@ -210,7 +219,9 @@ class BrowserOwnedSubmissionLifecycle:
         )
 
     def _acknowledge_readback(self, state: _PendingSubmission) -> bool:
-        complete_readback = getattr(self.runtime.client, "complete_canonical_readback", None)
+        complete_readback = getattr(
+            self.runtime.client, "complete_canonical_readback", None
+        )
         if not callable(complete_readback):
             return True
         if state.readback_ack_attempted:
@@ -229,7 +240,10 @@ class BrowserOwnedSubmissionLifecycle:
         browser_context_readback = callable(
             getattr(self.runtime.client, "complete_canonical_readback", None)
         )
-        if isinstance(event, dict) and event.get("type") == "browser_native_write_completed":
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "browser_native_write_completed"
+        ):
             state.write_event_observed = True
             state.delegated_conversation_id = (
                 _optional_text(event.get("conversation_id"))
@@ -237,18 +251,25 @@ class BrowserOwnedSubmissionLifecycle:
             )
             state.runtime_tab_id = _optional_int(event.get("runtime_tab_id"))
             if browser_context_readback:
-                state.lease, state.turn, forwarded = self.runtime._record_write_completion(
-                    state.lease,
-                    state.turn,
-                    event,
+                state.lease, state.turn, forwarded = (
+                    self.runtime._record_write_completion(
+                        state.lease,
+                        state.turn,
+                        event,
+                    )
                 )
             else:
-                state.lease, state.turn, forwarded = self.runtime._release_authority_from_write_event(
-                    state.lease,
-                    state.turn,
-                    event,
+                state.lease, state.turn, forwarded = (
+                    self.runtime._release_authority_from_write_event(
+                        state.lease,
+                        state.turn,
+                        event,
+                    )
                 )
-        elif isinstance(event, dict) and event.get("type") == "browser_native_readback_completed":
+        elif (
+            isinstance(event, dict)
+            and event.get("type") == "browser_native_readback_completed"
+        ):
             if browser_context_readback and state.write_event_observed:
                 if not self._acknowledge_readback(state):
                     raise RequestError(
@@ -315,7 +336,11 @@ class BrowserOwnedSubmissionLifecycle:
         self,
         text: str,
         *,
-        conversation: ConversationRef | ChatConversation | dict[str, Any] | str | None = None,
+        conversation: ConversationRef
+        | ChatConversation
+        | dict[str, Any]
+        | str
+        | None = None,
         timeout: float = 150.0,
         poll_interval: float = 0.5,
         on_token: Callable[[str], None] | None = None,

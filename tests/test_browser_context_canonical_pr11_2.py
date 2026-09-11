@@ -194,9 +194,9 @@ def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -
     )
     read = (EXTENSION / "service_worker_runtime_read.js").read_text(encoding="utf-8")
     runtime = (EXTENSION / "service_worker_runtime.js").read_text(encoding="utf-8")
-    bootstrap = (
-        EXTENSION / "service_worker_temporary_chat_route_reopen_probe.js"
-    ).read_text(encoding="utf-8")
+    bootstrap = (EXTENSION / "service_worker_browser_runtime_v2.js").read_text(
+        encoding="utf-8"
+    )
     connector = (EXTENSION / "service_worker_connector_support_pr10_0.js").read_text(
         encoding="utf-8"
     )
@@ -205,9 +205,13 @@ def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -
     assert manifest["version"] == "0.1.13"
     assert (
         manifest["background"]["service_worker"]
-        == "service_worker_temporary_chat_route_reopen_probe.js"
+        == "service_worker_browser_runtime_v2.js"
     )
-    assert bootstrap.rstrip().endswith('importScripts("service_worker_runtime.js");')
+    assert 'importScripts("service_worker_runtime.js");' in bootstrap
+    assert 'importScripts("service_worker_stop_generation.js");' in bootstrap
+    assert bootstrap.rstrip().endswith(
+        'importScripts("service_worker_passive_stream_observer.js");'
+    )
     assert connector.rstrip().endswith("};")
     citations = 'importScripts("service_worker_product_source_citations_pr9_3.js");'
     canonical = 'importScripts("service_worker_canonical_read_v2.js");'

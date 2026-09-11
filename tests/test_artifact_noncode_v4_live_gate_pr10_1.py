@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
@@ -11,11 +10,10 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from pr10_1_artifact_noncode_v4_live_gate import (  # noqa: E402
-    ProductArtifactNonCodeV4Provider,
     _EXPECTED_SUPPORT,
+    ProductArtifactNonCodeV4Provider,
     _safe_candidate,
 )
-
 
 EXTENSION = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
 WORKER = EXTENSION / "service_worker_generated_artifact_noncode_v4_pr10_1.js"
@@ -27,7 +25,7 @@ GATE = TOOLS / "pr10_1_artifact_noncode_v4_live_gate.py"
 def test_noncode_v4_preserves_historical_manifest_entrypoint() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     assert manifest["background"]["service_worker"] == (
-        "service_worker_temporary_chat_route_reopen_probe.js"
+        "service_worker_browser_runtime_v2.js"
     )
     assert manifest["version"] == "0.1.13"
 
@@ -36,10 +34,14 @@ def test_noncode_v4_loads_after_topology_v3_without_replacing_chain() -> None:
     observability = OBSERVABILITY.read_text(encoding="utf-8")
     v3 = 'importScripts("service_worker_generated_artifact_topology_v3_pr10_1.js");'
     v4 = 'importScripts("service_worker_generated_artifact_noncode_v4_pr10_1.js");'
-    patch = 'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    patch = (
+        'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    )
     assert v3 in observability
     assert v4 in observability
-    assert observability.index(v3) < observability.index(v4) < observability.index(patch)
+    assert (
+        observability.index(v3) < observability.index(v4) < observability.index(patch)
+    )
 
 
 def test_noncode_v4_requires_proven_assistant_turn_and_excludes_pre_code() -> None:
@@ -195,7 +197,10 @@ def test_noncode_v4_snapshot_contract_and_shape(monkeypatch) -> None:
                     "artifactLikeReactPropNames": ["fileId"],
                     "reactComponentNames": ["FileCard"],
                     "artifactLikeReactComponentNames": ["FileCard"],
-                    "candidateReasonKinds": ["identity_react_key", "href_attribute_present"],
+                    "candidateReasonKinds": [
+                        "identity_react_key",
+                        "href_attribute_present",
+                    ],
                 }
             ],
             "preCodeExcluded": True,
@@ -218,7 +223,9 @@ def test_noncode_v4_snapshot_contract_and_shape(monkeypatch) -> None:
     assert snapshot["probe_placement_proven"] is True
     assert snapshot["pre_code_excluded"] is True
     assert snapshot["structural_candidate_count"] == 1
-    assert snapshot["candidate_summaries"][0]["identity_like_react_prop_names"] == ["fileId"]
+    assert snapshot["candidate_summaries"][0]["identity_like_react_prop_names"] == [
+        "fileId"
+    ]
     assert snapshot["react_prop_values_exported"] is False
     assert snapshot["locator_values_exported"] is False
 

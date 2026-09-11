@@ -8,10 +8,10 @@ import chatgpt_web_adapter.product_runtime as product_runtime
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeBridgeStatus
 from chatgpt_web_adapter.product_runtime import (
     BROWSER_OWNED_PRODUCT_TRANSPORT,
-    ChatGPTProductRuntime,
     DEFAULT_PRODUCT_TRANSPORT,
-    ProductRuntimeExecution,
     SUPPORTED_PRODUCT_TRANSPORTS,
+    ChatGPTProductRuntime,
+    ProductRuntimeExecution,
     assemble_product_runtime,
     normalize_product_transport,
 )
@@ -21,6 +21,7 @@ class _Provider:
     def __init__(self, *, tab_id: int | None = 41, connected: bool = True) -> None:
         self.tab_id = tab_id
         self.connected = connected
+        self.stop_calls: list[tuple[str | None, float]] = []
 
     def status(self) -> BrowserNativeBridgeStatus:
         return BrowserNativeBridgeStatus(
@@ -31,6 +32,10 @@ class _Provider:
 
     def send_text(self, *args, **kwargs):
         raise AssertionError("test provider write should not be called")
+
+    def stop_generation(self, conversation_id=None, *, timeout=10.0):
+        self.stop_calls.append((conversation_id, timeout))
+        return {"ok": True, "stopped": True, "conversationId": conversation_id}
 
 
 class _Client:
@@ -94,6 +99,32 @@ def test_reassembled_runtime_observes_same_external_runtime_tab() -> None:
     assert second_health.runtime_tab_preexisting is True
 
 
+def test_stop_generation_delegates_out_of_band_to_browser_provider() -> None:
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+
+    result = runtime.stop_generation("conversation-1", timeout=3.5)
+
+    assert result["stopped"] is True
+    assert provider.stop_calls == [("conversation-1", 3.5)]
+
+
+def test_runtime_exposes_raw_canonical_conversation_payload(monkeypatch) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    payload = {"title": "Graph", "mapping": {"node": {}}}
+    monkeypatch.setattr(
+        runtime.canonical,
+        "get_conversation_payload",
+        lambda _conversation: payload,
+        raising=False,
+    )
+
+    result = runtime.get_conversation_payload("conversation-1")
+
+    assert result == payload
+    assert result is not payload
+
+
 def test_send_text_delegates_exactly_once_without_fallback() -> None:
     runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
     calls = []
@@ -127,6 +158,35 @@ def test_send_text_delegates_exactly_once_without_fallback() -> None:
     ]
     assert runtime.governance()["fallback_transport"] is None
     assert runtime.governance()["legacy_direct_write_fallback"] is False
+
+
+def test_send_text_forwards_real_model_slug_without_profile_mapping() -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    calls = []
+    expected = object()
+
+    def fake_send_text(text, **kwargs):
+        calls.append((text, kwargs))
+        return expected
+
+    runtime._writer.send_text = fake_send_text
+
+    result = runtime.send_text("hello", model="gpt-5-6")
+
+    assert result is expected
+    assert calls == [
+        (
+            "hello",
+            {
+                "conversation": None,
+                "timeout": 150.0,
+                "poll_interval": 0.5,
+                "on_token": None,
+                "on_event": None,
+                "model_slug": "gpt-5-6",
+            },
+        )
+    ]
 
 
 def test_observed_send_preserves_transport_and_writer_observation() -> None:

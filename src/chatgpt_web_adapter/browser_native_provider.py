@@ -47,6 +47,15 @@ class BrowserNativeTurnResult:
     foreground_activation_observed: bool | None = None
     browser_authority_lease_id: str | None = None
     attachment_count: int = 0
+    passive_observer_armed: bool = False
+    canonical_read_transport: str | None = None
+    canonical_read_fallback_reason: str | None = None
+    phase_a_transport: str | None = None
+    phase_a_gate_wait_ms: int | None = None
+    phase_a_elapsed_ms: int | None = None
+    phase_b_transport: str | None = None
+    phase_b_fallback_reason: str | None = None
+    phase_b_elapsed_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +90,8 @@ class BrowserNativeTurnProvider:
         self.connect_timeout = float(connect_timeout)
         self.turn_timeout = float(turn_timeout)
         self._authority_context = threading.local()
+        self._stopped_conversations_lock = threading.Lock()
+        self._stopped_conversations: set[str] = set()
 
     @property
     def descriptor_path(self) -> Path:
@@ -205,10 +216,85 @@ class BrowserNativeTurnProvider:
         return BrowserNativeBridgeStatus(
             available=bool(response.get("ok")),
             extension_connected=bool(response.get("extensionConnected")),
-            host_pid=response.get("hostPid") if isinstance(response.get("hostPid"), int) else None,
-            extension_id=response.get("extensionId") if isinstance(response.get("extensionId"), str) else None,
-            runtime_tab_id=response.get("runtimeTabId") if isinstance(response.get("runtimeTabId"), int) else None,
+            host_pid=response.get("hostPid")
+            if isinstance(response.get("hostPid"), int)
+            else None,
+            extension_id=response.get("extensionId")
+            if isinstance(response.get("extensionId"), str)
+            else None,
+            runtime_tab_id=response.get("runtimeTabId")
+            if isinstance(response.get("runtimeTabId"), int)
+            else None,
         )
+
+    def stop_generation(
+        self,
+        conversation_id: str | None = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        normalized_conversation_id = None
+        if conversation_id is not None:
+            if not isinstance(conversation_id, str) or not conversation_id.strip():
+                raise ValueError("conversation_id must be a non-empty string or None")
+            normalized_conversation_id = conversation_id.strip()
+        total_timeout = float(timeout)
+        if total_timeout <= 0:
+            raise ValueError("timeout must be positive")
+        request_id = str(uuid.uuid4())
+        response = self._rpc(
+            {
+                "type": "stop_generation",
+                "request_id": request_id,
+                "conversationId": normalized_conversation_id,
+                "timeoutMs": int(total_timeout * 1000),
+            },
+            timeout=total_timeout + self.connect_timeout,
+        )
+        if response.get("request_id") != request_id:
+            raise RequestError(
+                "BROWSER_NATIVE_RESPONSE_MISMATCH",
+                request_stage="browser_native_stop_generation",
+            )
+        if not response.get("ok"):
+            raise RequestError(
+                str(response.get("error") or "BROWSER_NATIVE_STOP_GENERATION_FAILED"),
+                request_stage="browser_native_stop_generation",
+            )
+        if response.get("stopped") is True:
+            stopped_conversation_id = response.get("conversationId")
+            if (
+                not isinstance(stopped_conversation_id, str)
+                or not stopped_conversation_id.strip()
+            ):
+                stopped_conversation_id = normalized_conversation_id
+            if (
+                isinstance(stopped_conversation_id, str)
+                and stopped_conversation_id.strip()
+            ):
+                self._mark_conversation_stopped(stopped_conversation_id)
+        return response
+
+    def _mark_conversation_stopped(self, conversation_id: str) -> None:
+        normalized = conversation_id.strip()
+        if not normalized:
+            return
+        with self._stopped_conversations_lock:
+            self._stopped_conversations.add(normalized)
+
+    def stop_requested_for(self, conversation_id: str) -> bool:
+        normalized = conversation_id.strip() if isinstance(conversation_id, str) else ""
+        if not normalized:
+            return False
+        with self._stopped_conversations_lock:
+            return normalized in self._stopped_conversations
+
+    def clear_stop_requested_for(self, conversation_id: str) -> None:
+        normalized = conversation_id.strip() if isinstance(conversation_id, str) else ""
+        if not normalized:
+            return
+        with self._stopped_conversations_lock:
+            self._stopped_conversations.discard(normalized)
 
     @staticmethod
     def _optional_bool(response: dict[str, Any], key: str) -> bool | None:
@@ -232,7 +318,9 @@ class BrowserNativeTurnProvider:
             except (OSError, RuntimeError) as error:
                 raise ValueError(f"attachment_paths[{index}] is unavailable") from error
             if not path.is_file():
-                raise ValueError(f"attachment_paths[{index}] must reference a regular file")
+                raise ValueError(
+                    f"attachment_paths[{index}] must reference a regular file"
+                )
             normalized.append(str(path))
         return normalized
 
@@ -257,6 +345,7 @@ class BrowserNativeTurnProvider:
         timeout: float | None,
         canonical_completed_at_ms: int | None,
         attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
         on_text_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> BrowserNativeTurnResult:
         if not isinstance(text, str) or not text.strip():
@@ -264,13 +353,24 @@ class BrowserNativeTurnProvider:
         if len(text) > 200_000:
             raise ValueError("text is too large for browser-native turn")
         normalized_attachment_paths = self._normalize_attachment_paths(attachment_paths)
+        normalized_model_slug = None
+        if model_slug is not None:
+            if not isinstance(model_slug, str) or not model_slug.strip():
+                raise ValueError("model_slug must be a non-empty string or None")
+            normalized_model_slug = model_slug.strip()
+            if len(normalized_model_slug) > 256:
+                raise ValueError("model_slug is too long")
         conversation_id = None
         if conversation is not None:
             conversation_id = ConversationRef.from_any(conversation).conversation_id
+            self.clear_stop_requested_for(conversation_id)
         if canonical_completed_at_ms is not None and conversation_id is None:
             raise ValueError("stale UI recovery requires an existing conversation")
         if canonical_completed_at_ms is not None:
-            if isinstance(canonical_completed_at_ms, bool) or canonical_completed_at_ms <= 0:
+            if (
+                isinstance(canonical_completed_at_ms, bool)
+                or canonical_completed_at_ms <= 0
+            ):
                 raise ValueError("canonical_completed_at_ms must be a positive integer")
             canonical_completed_at_ms = int(canonical_completed_at_ms)
 
@@ -285,12 +385,14 @@ class BrowserNativeTurnProvider:
                 "request_id": request_id,
                 "conversationId": conversation_id,
                 "text": text,
+                "modelSlug": normalized_model_slug,
                 "attachmentPaths": normalized_attachment_paths,
                 "timeoutMs": int(total_timeout * 1000),
                 "canonicalCompleted": canonical_completed_at_ms is not None,
                 "canonicalCompletedAtMs": canonical_completed_at_ms,
                 "browserAuthorityLeaseId": authority_lease_id,
-                "streamTextObservations": on_text_event is not None,
+                "passiveObserve": True,
+                "streamTextObservations": False,
             },
             timeout=total_timeout + self.connect_timeout,
             on_event=on_text_event,
@@ -311,7 +413,10 @@ class BrowserNativeTurnProvider:
             raise RequestError(error, request_stage="browser_native_turn")
         result_conversation_id = response.get("conversationId")
         status = response.get("responseStatus")
-        if not isinstance(result_conversation_id, str) or not result_conversation_id.strip():
+        if (
+            not isinstance(result_conversation_id, str)
+            or not result_conversation_id.strip()
+        ):
             raise RequestError(
                 "BROWSER_NATIVE_TURN_MISSING_CONVERSATION_ID",
                 request_stage="browser_native_turn",
@@ -329,9 +434,15 @@ class BrowserNativeTurnProvider:
                 request_stage="browser_native_turn",
             )
         attachment_count = response.get("attachmentCount")
-        if not isinstance(attachment_count, int) or isinstance(attachment_count, bool) or attachment_count < 0:
+        if (
+            not isinstance(attachment_count, int)
+            or isinstance(attachment_count, bool)
+            or attachment_count < 0
+        ):
             attachment_count = 0
-        if normalized_attachment_paths and attachment_count != len(normalized_attachment_paths):
+        if normalized_attachment_paths and attachment_count != len(
+            normalized_attachment_paths
+        ):
             raise RequestError(
                 "BROWSER_NATIVE_ATTACHMENT_COUNT_MISMATCH",
                 request_stage="browser_native_turn",
@@ -345,32 +456,98 @@ class BrowserNativeTurnProvider:
             response_mime_type=response.get("responseMimeType")
             if isinstance(response.get("responseMimeType"), str)
             else None,
-            final_url=response.get("finalUrl") if isinstance(response.get("finalUrl"), str) else None,
-            tab_id=response.get("tabId") if isinstance(response.get("tabId"), int) else None,
+            final_url=response.get("finalUrl")
+            if isinstance(response.get("finalUrl"), str)
+            else None,
+            tab_id=response.get("tabId")
+            if isinstance(response.get("tabId"), int)
+            else None,
             tab_was_active=bool(response.get("tabWasActive")),
-            elapsed_ms=response.get("elapsedMs") if isinstance(response.get("elapsedMs"), int) else None,
+            elapsed_ms=response.get("elapsedMs")
+            if isinstance(response.get("elapsedMs"), int)
+            else None,
             runtime_reloaded=bool(response.get("runtimeReloaded")),
             runtime_reload_ms=response.get("runtimeReloadMs")
             if isinstance(response.get("runtimeReloadMs"), int)
             else None,
-            runtime_tab_preexisting=self._optional_bool(response, "runtimeTabPreexisting"),
-            runtime_tab_created_for_turn=self._optional_bool(response, "runtimeTabCreatedForTurn"),
+            runtime_tab_preexisting=self._optional_bool(
+                response, "runtimeTabPreexisting"
+            ),
+            runtime_tab_created_for_turn=self._optional_bool(
+                response, "runtimeTabCreatedForTurn"
+            ),
             tab_active_after=self._optional_bool(response, "tabActiveAfter"),
-            tab_activated_during_turn=self._optional_bool(response, "tabActivatedDuringTurn"),
-            foreground_activation_observed=self._optional_bool(response, "foregroundActivationObserved"),
+            tab_activated_during_turn=self._optional_bool(
+                response, "tabActivatedDuringTurn"
+            ),
+            foreground_activation_observed=self._optional_bool(
+                response, "foregroundActivationObserved"
+            ),
             browser_authority_lease_id=response_lease_id
             if isinstance(response_lease_id, str)
             else None,
             attachment_count=attachment_count,
+            passive_observer_armed=bool(response.get("passiveObserverArmed")),
         )
+
+    def observe_turn(
+        self,
+        *,
+        conversation_id: str,
+        turn_exchange_id: str | None,
+        browser_authority_lease_id: str,
+        timeout: float,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            raise ValueError("conversation_id is required")
+        if (
+            not isinstance(browser_authority_lease_id, str)
+            or not browser_authority_lease_id.strip()
+        ):
+            raise ValueError("browser_authority_lease_id is required")
+        total_timeout = float(timeout)
+        if total_timeout <= 0:
+            raise ValueError("timeout must be positive")
+        request_id = str(uuid.uuid4())
+        response = self._rpc(
+            {
+                "type": "observe_turn",
+                "request_id": request_id,
+                "conversationId": conversation_id.strip(),
+                "turnExchangeId": turn_exchange_id.strip()
+                if isinstance(turn_exchange_id, str) and turn_exchange_id.strip()
+                else None,
+                "browserAuthorityLeaseId": browser_authority_lease_id.strip(),
+                "timeoutMs": int(total_timeout * 1000),
+            },
+            timeout=total_timeout + self.connect_timeout,
+            on_event=on_event,
+        )
+        if response.get("request_id") != request_id:
+            raise RequestError(
+                "BROWSER_NATIVE_RESPONSE_MISMATCH",
+                request_stage="browser_native_observe_turn",
+            )
+        if not response.get("ok"):
+            raise RequestError(
+                str(response.get("error") or "PASSIVE_OBSERVER_FAILED"),
+                request_stage="browser_native_observe_turn",
+            )
+        return response
 
     def send_text(
         self,
         text: str,
         *,
-        conversation: ConversationRef | ChatConversation | dict[str, Any] | str | None = None,
+        conversation: ConversationRef
+        | ChatConversation
+        | dict[str, Any]
+        | str
+        | None = None,
         timeout: float | None = None,
         attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
     ) -> BrowserNativeTurnResult:
         return self._send_text_request(
             text,
@@ -378,15 +555,21 @@ class BrowserNativeTurnProvider:
             timeout=timeout,
             canonical_completed_at_ms=None,
             attachment_paths=attachment_paths,
+            model_slug=model_slug,
         )
 
     def send_text_streaming(
         self,
         text: str,
         *,
-        conversation: ConversationRef | ChatConversation | dict[str, Any] | str | None = None,
+        conversation: ConversationRef
+        | ChatConversation
+        | dict[str, Any]
+        | str
+        | None = None,
         timeout: float | None = None,
         attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
         on_text_event: Callable[[dict[str, Any]], None],
     ) -> BrowserNativeTurnResult:
         if not callable(on_text_event):
@@ -397,6 +580,7 @@ class BrowserNativeTurnProvider:
             timeout=timeout,
             canonical_completed_at_ms=None,
             attachment_paths=attachment_paths,
+            model_slug=model_slug,
             on_text_event=on_text_event,
         )
 
@@ -408,6 +592,7 @@ class BrowserNativeTurnProvider:
         timeout: float | None = None,
         canonical_completed_at_ms: int,
         attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
     ) -> BrowserNativeTurnResult:
         return self._send_text_request(
             text,
@@ -415,6 +600,7 @@ class BrowserNativeTurnProvider:
             timeout=timeout,
             canonical_completed_at_ms=canonical_completed_at_ms,
             attachment_paths=attachment_paths,
+            model_slug=model_slug,
         )
 
     def send_text_with_stale_ui_recovery_streaming(
@@ -425,6 +611,7 @@ class BrowserNativeTurnProvider:
         timeout: float | None = None,
         canonical_completed_at_ms: int,
         attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
         on_text_event: Callable[[dict[str, Any]], None],
     ) -> BrowserNativeTurnResult:
         if not callable(on_text_event):
@@ -435,6 +622,7 @@ class BrowserNativeTurnProvider:
             timeout=timeout,
             canonical_completed_at_ms=canonical_completed_at_ms,
             attachment_paths=attachment_paths,
+            model_slug=model_slug,
             on_text_event=on_text_event,
         )
 
@@ -451,7 +639,10 @@ class BrowserNativeTurnProvider:
             or expected_runtime_tab_id <= 0
         ):
             raise ValueError("expected_runtime_tab_id must be a positive int or None")
-        if not isinstance(browser_authority_lease_id, str) or not browser_authority_lease_id.strip():
+        if (
+            not isinstance(browser_authority_lease_id, str)
+            or not browser_authority_lease_id.strip()
+        ):
             raise ValueError("browser_authority_lease_id is required")
         if timeout <= 0:
             raise ValueError("timeout must be positive")

@@ -19,7 +19,9 @@ class FakeProvider:
         return self._status
 
     def send_text(self, *args, **kwargs):
-        raise AssertionError("low-level provider should be called through send_browser_native")
+        raise AssertionError(
+            "low-level provider should be called through send_browser_native"
+        )
 
 
 class FakeClient:
@@ -29,7 +31,11 @@ class FakeClient:
         self._browser_native_turn_provider = None
 
     def get_status(self, conversation):
-        value = self.status_values.pop(0) if self.status_values is not None and self.status_values else self.status_value
+        value = (
+            self.status_values.pop(0)
+            if self.status_values is not None and self.status_values
+            else self.status_value
+        )
         if isinstance(value, BaseException):
             raise value
         return SimpleNamespace(status=value)
@@ -83,7 +89,9 @@ def test_unreadable_continuation_is_blocked() -> None:
 
 def test_preflight_failure_never_delegates_write(monkeypatch) -> None:
     calls = []
-    monkeypatch.setattr(subject, "send_browser_native", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(
+        subject, "send_browser_native", lambda *a, **k: calls.append((a, k))
+    )
     rt = runtime(connected=False)
     with pytest.raises(subject.BrowserOwnedWriteRuntimeError) as caught:
         rt.send_text("hello")
@@ -95,17 +103,72 @@ def test_preflight_failure_never_delegates_write(monkeypatch) -> None:
     assert error.reconciliation_required is False
 
 
-
-def test_continuation_commit_point_recheck_blocks_completed_to_running_race(monkeypatch) -> None:
+def test_continuation_uses_one_commit_point_status_read_before_delegation(
+    monkeypatch,
+) -> None:
     calls = []
-    monkeypatch.setattr(subject, "send_browser_native", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(
+        subject, "send_browser_native", lambda *a, **k: calls.append((a, k))
+    )
     rt = runtime(status=["completed", "running"])
+
+    result = rt.send_text("hello", conversation="conversation-1")
+
+    assert result is None
+    assert len(calls) == 1
+    assert rt.client.status_values == ["running"]
+
+
+@pytest.mark.parametrize(
+    "status", ["running", "streaming", "tool_running", "tool_calling"]
+)
+def test_unfinished_canonical_status_delegates_to_browser_liveness_fence(
+    monkeypatch, status
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        subject, "send_browser_native", lambda *a, **k: calls.append((a, k))
+    )
+    rt = runtime(status=status)
+
+    result = rt.send_text("continue", conversation="conversation-1")
+
+    assert result is None
+    assert len(calls) == 1
+    assert calls[0][0][1] == "continue"
+    assert calls[0][1]["conversation"] == "conversation-1"
+
+
+def test_awaiting_tool_approval_blocks_before_browser_delegation(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        subject, "send_browser_native", lambda *a, **k: calls.append((a, k))
+    )
+    rt = runtime(status="awaiting_tool_approval")
+
     with pytest.raises(subject.BrowserOwnedWriteRuntimeError) as caught:
-        rt.send_text("hello", conversation="conversation-1")
+        rt.send_text("continue", conversation="conversation-1")
+
     assert calls == []
     assert caught.value.failure_kind == subject.CONVERSATION_NOT_COMPLETED
+    assert "awaiting_tool_approval" in str(caught.value)
+
+
+def test_unreadable_commit_snapshot_fails_closed_before_browser_delegation(
+    monkeypatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        subject, "send_browser_native", lambda *a, **k: calls.append((a, k))
+    )
+    rt = runtime(status=RuntimeError("canonical busy"))
+
+    with pytest.raises(subject.BrowserOwnedWriteRuntimeError) as caught:
+        rt.send_text("continue", conversation="conversation-1")
+
+    assert calls == []
+    assert caught.value.failure_kind == subject.CANONICAL_READ_UNAVAILABLE
     assert caught.value.write_may_have_been_submitted is False
-    assert caught.value.manual_retry_safe_after_repair is True
 
 
 def test_success_delegates_exactly_once(monkeypatch) -> None:

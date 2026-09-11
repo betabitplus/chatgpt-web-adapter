@@ -3,6 +3,12 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify and publish
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,14 +19,77 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Build, verify and publish package
-    runs-on: ubuntu-latest
-    environment: pypi
+  macos-wk-tagged:
+    name: Verify tagged macOS WK release
+    runs-on: macos-latest
 
     steps:
       - name: Checkout tagged release
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install package, tests and build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[test]
+          python -m pip install build twine
+
+      - name: Validate packaged JavaScript syntax
+        run: python tools/check_extension_js_syntax.py
+
+      - name: Compile WK helper with strict warnings
+        run: |
+          clang -fobjc-arc -Wall -Wextra -Werror \
+            -framework Cocoa -framework WebKit \
+            src/chatgpt_web_adapter/wkwebview_helper/WKChatGPTAuthority.m \
+            -o "${RUNNER_TEMP}/WKChatGPTAuthority"
+
+      - name: Run tagged WK and release tests
+        run: >-
+          python -m pytest -q
+          tests/test_wkwebview_backend.py
+          tests/test_wkwebview_lightweight_transport.py
+          tests/test_wkwebview_temporary.py
+          tests/test_wkwebview_stream_observation.py
+          tests/test_wkwebview_integrity_fixtures.py
+          tests/test_release_hardening_pr8_17.py
+
+      - name: Build tagged release artifacts
+        run: python -m build
+
+      - name: Check tagged distributions
+        run: python -m twine check dist/*
+
+      - name: Verify tagged release contract
+        run: >-
+          python tools/release_gate.py
+          --dist-dir dist
+          --tag "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
+
+      - name: Smoke exact tagged wheel
+        run: >-
+          python tools/installed_wheel_smoke.py
+          --wheel-dir dist
+          --expected-version "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
+
+  publish:
+    name: Build, verify and publish package
+    runs-on: ubuntu-latest
+    environment: pypi
+    needs:
+      - macos-wk-tagged
+
+    steps:
+      - name: Checkout tagged release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -40,13 +109,13 @@ jobs:
         run: >-
           python tools/release_gate.py
           --dist-dir dist
-          --tag "${{ github.event.release.tag_name }}"
+          --tag "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
 
       - name: Install and smoke-test exact wheel
         run: >-
           python tools/installed_wheel_smoke.py
           --wheel-dir dist
-          --expected-version "${{ github.event.release.tag_name }}"
+          --expected-version "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}"
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

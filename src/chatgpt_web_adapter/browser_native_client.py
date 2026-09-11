@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -13,13 +15,20 @@ from .canonical_product_observation_gate_pr9_3 import (
     _gate_wait_for_new_final_assistant,
 )
 from .exceptions import ConversationTimeoutError, RequestError
+from .message_text import extract_message_text
 from .messages import _chat_message_from_node, _current_branch_nodes
 from .product_media import current_browser_owned_attachment_paths
-from .revision_safe_streaming_pr8_9 import RevisionSafeTextAccumulator
+from .revision_safe_streaming_pr8_9 import (
+    ASSISTANT_TEXT_DELTA,
+    ASSISTANT_TEXT_REVISION,
+    ASSISTANT_TEXT_SNAPSHOT,
+    RevisionSafeTextAccumulator,
+)
 from .status import _status_from_payload
 from .types import (
     AttachedConversation,
     ChatConversation,
+    ChatMessage,
     ChatMetrics,
     ChatRequestDiagnostics,
     ChatResponse,
@@ -34,6 +43,7 @@ class BrowserNativeSubmission:
     submission_id: str
     turn: Any
     baseline_assistant_ids: frozenset[str]
+    baseline_message_ids: frozenset[str]
     timeout: float
     poll_interval: float
     started_monotonic: float
@@ -44,6 +54,26 @@ class BrowserNativeSubmission:
     on_token: Callable[[str], None] | None
     on_event: Callable[[dict[str, Any]], None] | None
     final_response: ChatResponse | None = None
+
+
+_CANONICAL_LIVE_POLL_INTERVAL_SECONDS = 15.0
+_CANONICAL_RATE_LIMIT_BACKOFF_SECONDS = 15.0
+_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS = 5.0
+_PASSIVE_FINAL_RECONCILE_SETTLE_SECONDS = 4.0
+_PASSIVE_STREAM_ENDED_RECONCILE_SECONDS = 5.0
+_PREWRITE_CANONICAL_COMPLETION_MAX_AGE_MS = 5_000
+_CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS = 6_000
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?:authorization|cookie|set[-_]?cookie|access[-_]?token|refresh[-_]?token|"
+    r"id[-_]?token|api[-_]?key|password|passwd|secret|session[-_]?token|csrf)",
+    re.IGNORECASE,
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
+_SENSITIVE_LINE_RE = re.compile(
+    r"(?im)^(\s*(?:authorization|cookie|set[-_]?cookie|access[-_]?token|"
+    r"refresh[-_]?token|id[-_]?token|api[-_]?key|password|passwd|secret|"
+    r"session[-_]?token|csrf)\s*[:=]\s*).+$"
+)
 
 
 def set_browser_native_turn_provider(
@@ -77,6 +107,63 @@ def _canonical_status_value(self: Any, conversation: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _canonical_prewrite_snapshot(
+    self: Any,
+    conversation: Any,
+    *,
+    canonical_payload: dict[str, Any] | None = None,
+) -> tuple[set[str], set[str], str | None]:
+    """Resolve continuation baseline IDs/status, reusing a caller-owned commit snapshot."""
+
+    payload = canonical_payload
+    if payload is None:
+        canonical_reader = getattr(self, "_get_conversation_payload", None)
+        if callable(canonical_reader):
+            ref = ConversationRef.from_any(conversation)
+            candidate = canonical_reader(ref.conversation_id)
+            if isinstance(candidate, dict):
+                payload = candidate
+    if isinstance(payload, dict):
+        message_ids: set[str] = set()
+        assistant_ids: set[str] = set()
+        for node_id, node in _current_branch_nodes(payload):
+            message = _chat_message_from_node(node_id, node)
+            if message is None:
+                continue
+            message_id = getattr(message, "message_id", None)
+            if not isinstance(message_id, str):
+                continue
+            message_ids.add(message_id)
+            if getattr(message, "role", None) == "assistant":
+                assistant_ids.add(message_id)
+        status = _status_from_payload(payload)
+        status_value = getattr(status, "status", None)
+        return (
+            message_ids,
+            assistant_ids,
+            status_value if isinstance(status_value, str) else None,
+        )
+
+    messages = self.get_messages(
+        conversation,
+        limit=None,
+        roles=None,
+        include_empty=True,
+    )
+    message_ids = {
+        message.message_id
+        for message in messages
+        if isinstance(getattr(message, "message_id", None), str)
+    }
+    assistant_ids = {
+        message.message_id
+        for message in messages
+        if getattr(message, "role", None) == "assistant"
+        and isinstance(getattr(message, "message_id", None), str)
+    }
+    return message_ids, assistant_ids, _canonical_status_value(self, conversation)
+
+
 def _status_finalizes_message(status: Any, message_id: str) -> bool:
     if status is None or not isinstance(message_id, str) or not message_id:
         return False
@@ -86,15 +173,299 @@ def _status_finalizes_message(status: Any, message_id: str) -> bool:
     )
 
 
+def _node_turn_exchange_id(node: dict[str, Any]) -> str | None:
+    message = node.get("message")
+    if not isinstance(message, dict):
+        return None
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("turn_exchange_id", "working_turn_id"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _redact_intermediate_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > 8:
+        return "[TRUNCATED]"
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 128:
+                redacted["..."] = "[TRUNCATED]"
+                break
+            rendered_key = str(key)
+            if _SENSITIVE_KEY_RE.search(rendered_key):
+                redacted[rendered_key] = "[REDACTED]"
+            else:
+                redacted[rendered_key] = _redact_intermediate_value(
+                    item, depth=depth + 1
+                )
+        return redacted
+    if isinstance(value, list):
+        items = [
+            _redact_intermediate_value(item, depth=depth + 1) for item in value[:128]
+        ]
+        if len(value) > 128:
+            items.append("[TRUNCATED]")
+        return items
+    if isinstance(value, str):
+        return _redact_intermediate_string(value)
+    return value
+
+
+def _redact_intermediate_string(value: str) -> str:
+    text = _BEARER_RE.sub("Bearer [REDACTED]", value)
+    return _SENSITIVE_LINE_RE.sub(lambda match: f"{match.group(1)}[REDACTED]", text)
+
+
+def _sanitize_intermediate_text(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) <= 200_000 and text[:1] in {"{", "["}:
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            pass
+        else:
+            text = json.dumps(
+                _redact_intermediate_value(parsed),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+    text = _redact_intermediate_string(text)
+    if len(text) > _CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS:
+        text = text[:_CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS].rstrip() + "\n…[truncated]"
+    return text
+
+
+def _tool_call_label(
+    raw_message: dict[str, Any], metadata: dict[str, Any], recipient: str
+) -> str | None:
+    explicit = metadata.get("tool_invoking_message")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    raw = extract_message_text(raw_message).strip()
+    if not raw or len(raw) > 200_000 or raw[:1] not in {"{", "["}:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    if recipient == "api_tool.list_resources":
+        query = payload.get("query")
+        if isinstance(query, str) and query.strip():
+            return f"Discovering {query.strip()}..."
+        paths = payload.get("paths")
+        if isinstance(paths, list) and paths and isinstance(paths[0], str):
+            return f"Discovering {paths[0]} tools..."
+        return "Discovering tools..."
+
+    if recipient != "api_tool.call_tool":
+        return None
+
+    resource_path = payload.get("path")
+    action = None
+    if isinstance(resource_path, str) and resource_path.strip():
+        action = resource_path.rstrip("/").rsplit("/", 1)[-1].strip() or None
+    args = payload.get("args")
+    if not isinstance(args, dict):
+        args = {}
+
+    if action == "git_status":
+        return "Reading git status..."
+    if action == "show_changes":
+        return "Reviewing changes..."
+    if action == "open_workspace":
+        return "Opening workspace..."
+    if action == "read":
+        path = args.get("path")
+        if isinstance(path, str) and path.strip():
+            return f"Reading {path.strip()}..."
+        return "Reading file..."
+    if action == "tree":
+        path = args.get("path")
+        if isinstance(path, str) and path.strip():
+            return f"Reading tree {path.strip()}..."
+        return "Reading tree..."
+    if action == "search":
+        query = args.get("query")
+        if isinstance(query, str) and query.strip():
+            return f"Searching {query.strip()}..."
+        return "Searching workspace..."
+    if action == "bash":
+        return "Running command..."
+    if action:
+        return f"Calling {action.replace('_', ' ')}..."
+    return None
+
+
+def _canonical_intermediate_events(
+    payload: dict[str, Any],
+    *,
+    baseline_message_ids: set[str] | frozenset[str],
+    emitted_message_ids: set[str],
+    submission_id: str | None,
+) -> list[dict[str, Any]]:
+    current_node = payload.get("current_node")
+    events: list[dict[str, Any]] = []
+    for node_id, node in _current_branch_nodes(payload):
+        raw_message = node.get("message")
+        if not isinstance(raw_message, dict):
+            continue
+        metadata = raw_message.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if metadata.get("is_visually_hidden_from_conversation") is True:
+            continue
+        message_id = raw_message.get("id")
+        if not isinstance(message_id, str) or not message_id.strip():
+            message_id = node_id
+        if message_id in baseline_message_ids or message_id in emitted_message_ids:
+            continue
+
+        author = raw_message.get("author")
+        if not isinstance(author, dict):
+            author = {}
+        role = author.get("role")
+        recipient = raw_message.get("recipient")
+        recipient = recipient.strip() if isinstance(recipient, str) else "all"
+        content = raw_message.get("content")
+        if not isinstance(content, dict):
+            content = {}
+        content_type = content.get("content_type")
+        text = ""
+        kind: str | None = None
+        label: str | None = None
+        tool_name: str | None = None
+
+        if role == "assistant" and recipient not in {"", "all"}:
+            kind = "tool_call"
+            tool_name = recipient
+            label = _tool_call_label(raw_message, metadata, recipient)
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+        elif role == "tool":
+            kind = "tool_result"
+            raw_name = author.get("name")
+            tool_name = (
+                raw_name.strip()
+                if isinstance(raw_name, str) and raw_name.strip()
+                else recipient
+            )
+            label = metadata.get("tool_invoked_message")
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+        elif role == "assistant" and content_type == "reasoning_recap":
+            kind = "reasoning"
+            label = metadata.get("reasoning_title") or "Reasoning summary"
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+        elif role == "assistant" and content_type == "thoughts":
+            reasoning_title = metadata.get("reasoning_title")
+            if isinstance(reasoning_title, str) and reasoning_title.strip():
+                kind = "reasoning"
+                label = reasoning_title.strip()
+        elif (
+            role == "assistant"
+            and recipient in {"", "all"}
+            and metadata.get("is_thinking_preamble_message") is True
+        ):
+            kind = "assistant_progress"
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+        elif content_type == "tether_browsing_display":
+            kind = "activity"
+            label = "Browsing update"
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+
+        if kind is None:
+            continue
+
+        # User-visible thinking/preamble text is revision-prone while it remains
+        # the conversation current_node. Never freeze a partial first snapshot
+        # such as "Первый". Tool calls can be shown immediately, but thinking text
+        # is emitted only after ChatGPT advances to the next canonical node.
+        revision_sensitive = kind in {"assistant_progress", "reasoning"} and bool(text)
+        if revision_sensitive and node_id == current_node:
+            continue
+
+        emitted_message_ids.add(message_id)
+        event = {
+            "type": "canonical_intermediate_message",
+            "message_id": message_id,
+            "message_kind": kind,
+            "text": text,
+            "label": label.strip()
+            if isinstance(label, str) and label.strip()
+            else None,
+            "tool_name": tool_name.strip()
+            if isinstance(tool_name, str) and tool_name.strip()
+            else None,
+        }
+        if submission_id is not None:
+            event["submission_id"] = submission_id
+        events.append(event)
+    return events
+
+
 def _assistant_candidates_from_payload(
     payload: dict[str, Any],
     *,
     baseline_assistant_ids: set[str] | frozenset[str],
+    turn_exchange_id: str | None = None,
+    allow_unfinished: bool = False,
 ) -> list[Any]:
+    branch = _current_branch_nodes(payload)
+    normalized_turn_exchange_id = (
+        turn_exchange_id.strip()
+        if isinstance(turn_exchange_id, str) and turn_exchange_id.strip()
+        else None
+    )
+    turn_metadata_present = normalized_turn_exchange_id is not None and any(
+        _node_turn_exchange_id(node) is not None for _, node in branch
+    )
+
     candidates: list[Any] = []
-    for node_id, node in _current_branch_nodes(payload):
+    for node_id, node in branch:
         message = _chat_message_from_node(node_id, node)
         if message is None or getattr(message, "role", None) != "assistant":
+            continue
+        recipient = getattr(message, "recipient", None)
+        if isinstance(recipient, str) and recipient.strip() not in {"", "all"}:
+            continue
+        if (
+            turn_metadata_present
+            and _node_turn_exchange_id(node) != normalized_turn_exchange_id
+        ):
+            continue
+        raw_message = node.get("message")
+        if not isinstance(raw_message, dict):
+            continue
+        metadata = raw_message.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        content = raw_message.get("content")
+        if not isinstance(content, dict):
+            content = {}
+        content_type = content.get("content_type")
+        if metadata.get("is_thinking_preamble_message") is True:
+            continue
+        if content_type in {"thoughts", "reasoning_recap"}:
+            continue
+        finish_reason = getattr(message, "finish_reason", None)
+        has_finish_reason = isinstance(finish_reason, str) and bool(
+            finish_reason.strip()
+        )
+        if (
+            not allow_unfinished
+            and raw_message.get("end_turn") is not True
+            and not has_finish_reason
+        ):
             continue
         message_id = getattr(message, "message_id", None)
         if not isinstance(message_id, str) or message_id in baseline_assistant_ids:
@@ -111,9 +482,17 @@ def _wait_for_new_final_assistant(
     conversation_id: str,
     *,
     baseline_assistant_ids: set[str] | frozenset[str],
+    baseline_message_ids: set[str] | frozenset[str] = frozenset(),
     timeout: float,
     interval: float,
     include_readback: bool = False,
+    turn_exchange_id: str | None = None,
+    retry_400_until_timeout: bool = False,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    submission_id: str | None = None,
+    minimum_poll_interval: float | None = None,
+    allow_unfinished: bool = False,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> Any | tuple[Any, dict[str, Any] | None, int | None]:
     """Wait for canonical finality, optionally returning the reused payload.
 
@@ -125,13 +504,22 @@ def _wait_for_new_final_assistant(
     previous get_status/get_messages path.
     """
 
-    deadline = time.monotonic() + timeout
+    poll_started = time.monotonic()
+    deadline = poll_started + timeout
     last_status = None
     canonical_reader = getattr(self, "_get_conversation_payload", None)
     use_single_payload = callable(canonical_reader)
     canonical_payload_read_count = 0
+    emitted_message_ids = set(baseline_message_ids)
 
     while True:
+        if stop_requested is not None and stop_requested():
+            raise ConversationTimeoutError(
+                "browser-native turn stopped by user",
+                timeout=0.0,
+                last_status="stopped",
+            )
+        rate_limited_read_failure = False
         if use_single_payload:
             payload = None
             try:
@@ -139,19 +527,43 @@ def _wait_for_new_final_assistant(
                 payload = canonical_reader(conversation_id)
             except RequestError as error:
                 # A freshly created conversation can briefly be absent from the
-                # canonical read plane. Other request failures are deterministic
-                # for this attempt and must not be hidden until the turn timeout.
-                if error.status_code != 404:
+                # canonical read plane. After an early-detached new-chat write, the
+                # browser route may also resolve while canonical GET still returns
+                # 400. Retry that new-chat-only condition until the caller's overall
+                # turn deadline; continuations keep failing deterministic 400s fast.
+                # Explicitly retry transport-marked temporary failures such as 429
+                # without turning backend throttling into a semantic turn failure.
+                transient_400 = error.status_code == 400 and retry_400_until_timeout
+                retryable_error = bool(getattr(error, "retryable", False))
+                if (
+                    error.status_code != 404
+                    and not transient_400
+                    and not retryable_error
+                ):
                     raise
+                rate_limited_read_failure = error.status_code == 429
                 payload = None
 
             if isinstance(payload, dict):
                 last_status = _status_from_payload(payload)
+                for event in _canonical_intermediate_events(
+                    payload,
+                    baseline_message_ids=baseline_message_ids,
+                    emitted_message_ids=emitted_message_ids,
+                    submission_id=submission_id,
+                ):
+                    _emit_revision_safe_event(self, on_event, event)
                 candidates = _assistant_candidates_from_payload(
                     payload,
                     baseline_assistant_ids=baseline_assistant_ids,
+                    turn_exchange_id=turn_exchange_id,
+                    allow_unfinished=allow_unfinished,
                 )
                 for candidate in reversed(candidates):
+                    if allow_unfinished:
+                        if include_readback:
+                            return candidate, payload, canonical_payload_read_count
+                        return candidate
                     finish_reason = getattr(candidate, "finish_reason", None)
                     if isinstance(finish_reason, str) and bool(finish_reason.strip()):
                         if include_readback:
@@ -177,9 +589,17 @@ def _wait_for_new_final_assistant(
                 for message in messages
                 if isinstance(getattr(message, "message_id", None), str)
                 and message.message_id not in baseline_assistant_ids
+                and (
+                    not isinstance(getattr(message, "recipient", None), str)
+                    or getattr(message, "recipient", None).strip() in {"", "all"}
+                )
                 and bool(getattr(message, "text", "").strip())
             ]
             for candidate in reversed(candidates):
+                if allow_unfinished:
+                    if include_readback:
+                        return candidate, None, None
+                    return candidate
                 finish_reason = getattr(candidate, "finish_reason", None)
                 if isinstance(finish_reason, str) and bool(finish_reason.strip()):
                     if include_readback:
@@ -196,7 +616,19 @@ def _wait_for_new_final_assistant(
                 timeout=timeout,
                 last_status=last_status,
             )
-        time.sleep(max(0.2, interval))
+        retry_floor = (
+            _CANONICAL_RATE_LIMIT_BACKOFF_SECONDS
+            if rate_limited_read_failure
+            else (
+                _CANONICAL_LIVE_POLL_INTERVAL_SECONDS
+                if minimum_poll_interval is None
+                else max(0.0, float(minimum_poll_interval))
+            )
+        )
+        sleep_for = max(retry_floor, interval)
+        remaining_sleep = max(0.0, deadline - time.monotonic())
+        if remaining_sleep > 0:
+            time.sleep(min(sleep_for, remaining_sleep))
 
 
 def _emit_revision_safe_event(
@@ -221,6 +653,8 @@ def _emit_revision_safe_event(
 def _provider_supports_revision_safe_streaming(provider: Any) -> bool:
     if not callable(getattr(provider, "send_text_streaming", None)):
         return False
+    if getattr(provider, "revision_safe_streaming_supported", False) is True:
+        return True
     rpc = getattr(provider, "_rpc", None)
     if not callable(rpc):
         return False
@@ -248,6 +682,34 @@ def _callable_accepts_attachment_paths(value: Any) -> bool:
     )
 
 
+def _callable_accepts_model_slug(value: Any) -> bool:
+    if not callable(value):
+        return False
+    try:
+        parameters = inspect.signature(value).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "model_slug"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _callable_accepts_write_identity(value: Any) -> bool:
+    if not callable(value):
+        return False
+    try:
+        parameters = inspect.signature(value).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "on_write_identity"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def submit_browser_native(
     self: Any,
     prompt: str,
@@ -262,6 +724,9 @@ def submit_browser_native(
     on_token: Callable[[str], None] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     attachment_paths: Sequence[str | Path] | None = None,
+    model_slug: str | None = None,
+    _prewrite_canonical_payload: dict[str, Any] | None = None,
+    _prewrite_canonical_completed_at_ms: int | None = None,
 ) -> BrowserNativeSubmission:
     """Perform exactly one browser-owned write and return before canonical finality."""
 
@@ -288,30 +753,98 @@ def submit_browser_native(
             "BROWSER_NATIVE_RICH_INPUT_PROVIDER_UNSUPPORTED",
             request_stage="browser_native_turn_preflight",
         )
+    normalized_model_slug = model_slug.strip() if isinstance(model_slug, str) else None
+    if model_slug is not None and not normalized_model_slug:
+        raise ValueError("model_slug must be a non-empty string or None")
+    if normalized_model_slug and not _callable_accepts_model_slug(provider.send_text):
+        raise RequestError(
+            "BROWSER_NATIVE_MODEL_SLUG_PROVIDER_UNSUPPORTED",
+            request_stage="browser_native_turn_preflight",
+        )
 
     started = time.monotonic()
     submission_id = str(uuid.uuid4())
     baseline_assistant_ids: set[str] = set()
+    baseline_message_ids: set[str] = set()
     is_continuation = conversation is not None
     canonical_status_before_turn = None
-    if conversation is not None:
-        baseline_assistant_ids = _assistant_message_ids(self, conversation)
-        canonical_status_before_turn = _canonical_status_value(self, conversation)
 
-    recovery_send = getattr(provider, "send_text_with_stale_ui_recovery", None)
-    recovery_stream_send = getattr(
-        provider, "send_text_with_stale_ui_recovery_streaming", None
+    # BrowserAuthorityLease fences the browser write and its terminal readback.
+    # Continuation preflight reads happen before any write is submitted, so they
+    # must not inherit the newly-issued write lease. A persistent runtime tab
+    # may still carry the previous completed turn's lease in extension storage;
+    # presenting the new lease during these reads would fail closed before the
+    # new turn has a chance to replace it.
+    current_lease = getattr(provider, "_current_browser_authority_lease_id", None)
+    clear_lease = getattr(provider, "clear_browser_authority_lease", None)
+    set_lease = getattr(provider, "set_browser_authority_lease", None)
+    suspended_lease_id = current_lease() if callable(current_lease) else None
+    suspend_prewrite_lease = (
+        conversation is not None
+        and isinstance(suspended_lease_id, str)
+        and bool(suspended_lease_id)
+        and callable(clear_lease)
+        and callable(set_lease)
     )
-    stream_send = getattr(provider, "send_text_streaming", None)
-    canonical_status_recovery_confirm = None
-    recovery_authorized = False
-    if (
-        is_continuation
-        and canonical_status_before_turn == "completed"
-        and callable(recovery_send)
-    ):
-        canonical_status_recovery_confirm = _canonical_status_value(self, conversation)
-        recovery_authorized = canonical_status_recovery_confirm == "completed"
+    if suspend_prewrite_lease:
+        clear_lease()
+    try:
+        if conversation is not None:
+            (
+                baseline_message_ids,
+                baseline_assistant_ids,
+                canonical_status_before_turn,
+            ) = _canonical_prewrite_snapshot(
+                self,
+                conversation,
+                canonical_payload=_prewrite_canonical_payload,
+            )
+
+        recovery_send = getattr(provider, "send_text_with_stale_ui_recovery", None)
+        recovery_stream_send = getattr(
+            provider, "send_text_with_stale_ui_recovery_streaming", None
+        )
+        stream_send = getattr(provider, "send_text_streaming", None)
+        canonical_status_recovery_confirm = None
+        recovery_authorized = False
+        recovery_completed_at_ms: int | None = None
+        supplied_completion_age_ms = None
+        if (
+            isinstance(_prewrite_canonical_completed_at_ms, int)
+            and not isinstance(_prewrite_canonical_completed_at_ms, bool)
+            and _prewrite_canonical_completed_at_ms > 0
+        ):
+            supplied_completion_age_ms = (
+                int(time.time() * 1000) - _prewrite_canonical_completed_at_ms
+            )
+        reusable_commit_completion = (
+            is_continuation
+            and canonical_status_before_turn == "completed"
+            and isinstance(_prewrite_canonical_payload, dict)
+            and isinstance(supplied_completion_age_ms, int)
+            and 0
+            <= supplied_completion_age_ms
+            <= _PREWRITE_CANONICAL_COMPLETION_MAX_AGE_MS
+        )
+        if (
+            is_continuation
+            and canonical_status_before_turn == "completed"
+            and callable(recovery_send)
+        ):
+            if reusable_commit_completion:
+                canonical_status_recovery_confirm = "completed"
+                recovery_authorized = True
+                recovery_completed_at_ms = _prewrite_canonical_completed_at_ms
+            else:
+                canonical_status_recovery_confirm = _canonical_status_value(
+                    self, conversation
+                )
+                recovery_authorized = canonical_status_recovery_confirm == "completed"
+                if recovery_authorized:
+                    recovery_completed_at_ms = int(time.time() * 1000)
+    finally:
+        if suspend_prewrite_lease:
+            set_lease(suspended_lease_id)
 
     self._emit_event(
         on_event,
@@ -332,6 +865,29 @@ def submit_browser_native(
             normalized = {**normalized, "submission_id": submission_id}
             _emit_revision_safe_event(self, on_event, normalized)
 
+    def handle_write_identity(event: dict[str, Any]) -> None:
+        if (
+            not isinstance(event, dict)
+            or event.get("type") != "write_identity_resolved"
+        ):
+            return
+        conversation_id = event.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            return
+        status_code = event.get("submit_response_status")
+        self._emit_event(
+            on_event,
+            "browser_native_write_identity_resolved",
+            submission_id=submission_id,
+            conversation_id=conversation_id.strip(),
+            submit_response_observed=bool(event.get("submit_response_observed")),
+            status_code=(
+                status_code
+                if isinstance(status_code, int) and not isinstance(status_code, bool)
+                else None
+            ),
+        )
+
     streaming_requested = (
         on_event is not None and _provider_supports_revision_safe_streaming(provider)
     )
@@ -340,8 +896,12 @@ def submit_browser_native(
         if normalized_attachment_paths
         else {}
     )
+    model_kwargs = (
+        {"model_slug": normalized_model_slug} if normalized_model_slug else {}
+    )
+    provider_kwargs = {**attachment_kwargs, **model_kwargs}
     if recovery_authorized:
-        canonical_completed_at_ms = int(time.time() * 1000)
+        canonical_completed_at_ms = recovery_completed_at_ms or int(time.time() * 1000)
         if streaming_requested and callable(recovery_stream_send):
             if normalized_attachment_paths and not _callable_accepts_attachment_paths(
                 recovery_stream_send
@@ -350,13 +910,19 @@ def submit_browser_native(
                     "BROWSER_NATIVE_RICH_INPUT_RECOVERY_PROVIDER_UNSUPPORTED",
                     request_stage="browser_native_turn_preflight",
                 )
+            write_identity_kwargs = (
+                {"on_write_identity": handle_write_identity}
+                if _callable_accepts_write_identity(recovery_stream_send)
+                else {}
+            )
             turn = recovery_stream_send(
                 prompt,
                 conversation=conversation,
                 timeout=timeout,
                 canonical_completed_at_ms=canonical_completed_at_ms,
                 on_text_event=handle_text_event,
-                **attachment_kwargs,
+                **write_identity_kwargs,
+                **provider_kwargs,
             )
         else:
             if normalized_attachment_paths and not _callable_accepts_attachment_paths(
@@ -371,7 +937,7 @@ def submit_browser_native(
                 conversation=conversation,
                 timeout=timeout,
                 canonical_completed_at_ms=canonical_completed_at_ms,
-                **attachment_kwargs,
+                **provider_kwargs,
             )
     elif streaming_requested and callable(stream_send):
         if normalized_attachment_paths and not _callable_accepts_attachment_paths(
@@ -381,19 +947,25 @@ def submit_browser_native(
                 "BROWSER_NATIVE_RICH_INPUT_STREAM_PROVIDER_UNSUPPORTED",
                 request_stage="browser_native_turn_preflight",
             )
+        write_identity_kwargs = (
+            {"on_write_identity": handle_write_identity}
+            if _callable_accepts_write_identity(stream_send)
+            else {}
+        )
         turn = stream_send(
             prompt,
             conversation=conversation,
             timeout=timeout,
             on_text_event=handle_text_event,
-            **attachment_kwargs,
+            **write_identity_kwargs,
+            **provider_kwargs,
         )
     else:
         turn = provider.send_text(
             prompt,
             conversation=conversation,
             timeout=timeout,
-            **attachment_kwargs,
+            **provider_kwargs,
         )
 
     raw_attachment_count = getattr(turn, "attachment_count", None)
@@ -438,6 +1010,16 @@ def submit_browser_native(
         tab_activated_during_turn=turn.tab_activated_during_turn,
         foreground_activation_observed=turn.foreground_activation_observed,
         attachment_count=attachment_count,
+        canonical_read_transport=getattr(turn, "canonical_read_transport", None),
+        canonical_read_fallback_reason=getattr(
+            turn, "canonical_read_fallback_reason", None
+        ),
+        phase_a_transport=getattr(turn, "phase_a_transport", None),
+        phase_a_gate_wait_ms=getattr(turn, "phase_a_gate_wait_ms", None),
+        phase_a_elapsed_ms=getattr(turn, "phase_a_elapsed_ms", None),
+        phase_b_transport=getattr(turn, "phase_b_transport", None),
+        phase_b_fallback_reason=getattr(turn, "phase_b_fallback_reason", None),
+        phase_b_elapsed_ms=getattr(turn, "phase_b_elapsed_ms", None),
         revision_safe_stream_observation_count=stream_state.observation_count,
         canonical_finality_proven=False,
     )
@@ -446,6 +1028,7 @@ def submit_browser_native(
         submission_id=submission_id,
         turn=turn,
         baseline_assistant_ids=frozenset(baseline_assistant_ids),
+        baseline_message_ids=frozenset(baseline_message_ids),
         timeout=float(timeout),
         poll_interval=float(poll_interval),
         started_monotonic=started,
@@ -474,29 +1057,245 @@ def await_browser_native_final(
         1.0,
         submission.timeout - (time.monotonic() - submission.started_monotonic),
     )
-    final_message, canonical_payload, canonical_payload_read_count = (
-        _wait_for_new_final_assistant(
-            self,
-            turn.conversation_id,
-            baseline_assistant_ids=submission.baseline_assistant_ids,
-            timeout=remaining,
-            interval=submission.poll_interval,
-            include_readback=True,
+    retry_400_until_timeout = not submission.is_continuation
+    provider = getattr(self, "_browser_native_turn_provider", None)
+    observe_turn = getattr(provider, "observe_turn", None)
+    stop_requested_for = getattr(provider, "stop_requested_for", None)
+
+    def provider_stop_requested() -> bool:
+        return bool(
+            callable(stop_requested_for) and stop_requested_for(turn.conversation_id)
         )
-    )
+
+    authority_lease_id = getattr(turn, "browser_authority_lease_id", None)
+    observed_turn_exchange_id = getattr(turn, "turn_exchange_id", None)
+    passive_observer_used = False
+    passive_finish_reason: str | None = None
+    passive_message_id: str | None = None
+    passive_stream_ended_without_terminal = False
+    incomplete_without_terminal = False
+    passive_emitted_message_ids = set(submission.baseline_message_ids)
+    # A provider may deliver the first part of a turn from the write response
+    # itself and then hand finality/continuation to the passive canonical
+    # observer. Seed the observer from the already-normalized stream state so
+    # sequence numbers remain monotonic and the first canonical snapshot can be
+    # emitted as a delta (or revision) instead of restarting the stream.
+    passive_text_sequence = submission.stream_state.last_sequence
+    passive_text_message_id: str | None = submission.stream_state.message_id
+    passive_text_snapshot = submission.stream_state.text
+
+    if (
+        bool(getattr(turn, "passive_observer_armed", False))
+        and callable(observe_turn)
+        and isinstance(authority_lease_id, str)
+        and authority_lease_id
+    ):
+
+        def handle_passive_event(event: dict[str, Any]) -> None:
+            nonlocal \
+                passive_text_sequence, \
+                passive_text_message_id, \
+                passive_text_snapshot
+            if not isinstance(event, dict):
+                return
+            event_type = event.get("type")
+            if event_type == "passive_observer_heartbeat":
+                return
+            if event_type != "canonical_payload_snapshot":
+                normalized = {**event, "submission_id": submission.submission_id}
+                _emit_revision_safe_event(self, submission.on_event, normalized)
+                return
+
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                return
+            for intermediate in _canonical_intermediate_events(
+                payload,
+                baseline_message_ids=submission.baseline_message_ids,
+                emitted_message_ids=passive_emitted_message_ids,
+                submission_id=submission.submission_id,
+            ):
+                _emit_revision_safe_event(self, submission.on_event, intermediate)
+
+            candidates = _assistant_candidates_from_payload(
+                payload,
+                baseline_assistant_ids=submission.baseline_assistant_ids,
+                turn_exchange_id=observed_turn_exchange_id,
+                allow_unfinished=True,
+            )
+            if not candidates:
+                return
+            candidate = candidates[-1]
+            message_id = getattr(candidate, "message_id", None)
+            text = getattr(candidate, "text", "")
+            if not isinstance(text, str) or not text:
+                return
+            if message_id == passive_text_message_id and text == passive_text_snapshot:
+                return
+
+            passive_text_sequence += 1
+            if passive_text_message_id is None or message_id != passive_text_message_id:
+                text_event = {
+                    "type": ASSISTANT_TEXT_SNAPSHOT,
+                    "sequence": passive_text_sequence,
+                    "message_id": message_id,
+                    "text": text,
+                }
+            elif text.startswith(passive_text_snapshot):
+                delta = text[len(passive_text_snapshot) :]
+                if not delta:
+                    return
+                text_event = {
+                    "type": ASSISTANT_TEXT_DELTA,
+                    "sequence": passive_text_sequence,
+                    "message_id": message_id,
+                    "delta": delta,
+                }
+            else:
+                text_event = {
+                    "type": ASSISTANT_TEXT_REVISION,
+                    "sequence": passive_text_sequence,
+                    "message_id": message_id,
+                    "text": text,
+                }
+
+            passive_text_message_id = message_id
+            passive_text_snapshot = text
+            normalized = submission.stream_state.apply(text_event)
+            if normalized is not None:
+                normalized = {**normalized, "submission_id": submission.submission_id}
+                _emit_revision_safe_event(self, submission.on_event, normalized)
+
+        try:
+            observe_result = observe_turn(
+                conversation_id=turn.conversation_id,
+                turn_exchange_id=observed_turn_exchange_id,
+                browser_authority_lease_id=authority_lease_id,
+                timeout=remaining,
+                on_event=handle_passive_event,
+            )
+            learned_turn_exchange_id = (
+                observe_result.get("turnExchangeId")
+                if isinstance(observe_result, dict)
+                else None
+            )
+            if (
+                isinstance(learned_turn_exchange_id, str)
+                and learned_turn_exchange_id.strip()
+            ):
+                observed_turn_exchange_id = learned_turn_exchange_id.strip()
+            learned_finish_reason = (
+                observe_result.get("finishReason")
+                if isinstance(observe_result, dict)
+                else None
+            )
+            if isinstance(learned_finish_reason, str) and learned_finish_reason.strip():
+                passive_finish_reason = learned_finish_reason.strip()
+            learned_message_id = (
+                observe_result.get("messageId")
+                if isinstance(observe_result, dict)
+                else None
+            )
+            if isinstance(learned_message_id, str) and learned_message_id.strip():
+                passive_message_id = learned_message_id.strip()
+            passive_observer_used = True
+            remaining = max(
+                1.0,
+                submission.timeout - (time.monotonic() - submission.started_monotonic),
+            )
+            settle_seconds = min(
+                _PASSIVE_FINAL_RECONCILE_SETTLE_SECONDS,
+                max(0.0, remaining - 1.0),
+            )
+            if settle_seconds > 0:
+                time.sleep(settle_seconds)
+                remaining = max(
+                    1.0,
+                    submission.timeout
+                    - (time.monotonic() - submission.started_monotonic),
+                )
+        except (RequestError, OSError, EOFError, ValueError) as error:
+            reason = str(error)
+            if (
+                isinstance(error, RequestError)
+                and "PASSIVE_OBSERVER_STREAM_ENDED_WITHOUT_TERMINAL" in reason
+            ):
+                passive_stream_ended_without_terminal = True
+                passive_observer_used = True
+                remaining = min(remaining, _PASSIVE_STREAM_ENDED_RECONCILE_SECONDS)
+            self._emit_event(
+                submission.on_event,
+                "browser_native_passive_observer_fallback",
+                submission_id=submission.submission_id,
+                reason=reason,
+            )
+
+    passive_stopped = passive_finish_reason == "stopped"
+    stopped_by_user = passive_stopped or provider_stop_requested()
+    readback_timeout = min(remaining, 1.0) if stopped_by_user else remaining
+    try:
+        final_message, canonical_payload, canonical_payload_read_count = (
+            _wait_for_new_final_assistant(
+                self,
+                turn.conversation_id,
+                baseline_assistant_ids=submission.baseline_assistant_ids,
+                baseline_message_ids=submission.baseline_message_ids,
+                timeout=readback_timeout,
+                interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS
+                if passive_observer_used
+                else submission.poll_interval,
+                include_readback=True,
+                turn_exchange_id=observed_turn_exchange_id,
+                retry_400_until_timeout=retry_400_until_timeout,
+                on_event=None if passive_observer_used else submission.on_event,
+                submission_id=submission.submission_id,
+                minimum_poll_interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS
+                if passive_observer_used
+                else None,
+                allow_unfinished=stopped_by_user,
+                stop_requested=None if passive_stopped else provider_stop_requested,
+            )
+        )
+    except ConversationTimeoutError:
+        stopped_by_user = stopped_by_user or provider_stop_requested()
+        if not stopped_by_user and not passive_stream_ended_without_terminal:
+            raise
+        incomplete_without_terminal = (
+            passive_stream_ended_without_terminal and not stopped_by_user
+        )
+        final_message = ChatMessage(
+            message_id=passive_message_id,
+            role="assistant",
+            text="",
+            finish_reason="stopped" if stopped_by_user else "incomplete",
+        )
+        canonical_payload = None
+        canonical_payload_read_count = None
+
+    stopped_by_user = stopped_by_user or provider_stop_requested()
+    result_finish_reason = "stopped" if stopped_by_user else final_message.finish_reason
 
     if canonical_payload is not None:
         result_conversation = ChatConversation(
             conversation_id=turn.conversation_id,
             message_id=final_message.message_id,
             parent_message_id=final_message.message_id,
-            finish_reason=final_message.finish_reason,
+            finish_reason=result_finish_reason,
             is_thinking=False,
         )
         attached = AttachedConversation.from_payload(
             canonical_payload,
             conversation=result_conversation,
         )
+    elif stopped_by_user or incomplete_without_terminal:
+        result_conversation = ChatConversation(
+            conversation_id=turn.conversation_id,
+            message_id=final_message.message_id,
+            parent_message_id=final_message.message_id,
+            finish_reason=result_finish_reason,
+            is_thinking=False,
+        )
+        attached = AttachedConversation(conversation=result_conversation)
     else:
         attached = self.attach_conversation(turn.conversation_id)
         conversation_data = attached.conversation.to_dict()
@@ -504,7 +1303,7 @@ def await_browser_native_final(
             {
                 "conversation_id": turn.conversation_id,
                 "message_id": final_message.message_id,
-                "finish_reason": final_message.finish_reason,
+                "finish_reason": result_finish_reason,
                 "is_thinking": False,
             }
         )
@@ -520,7 +1319,7 @@ def await_browser_native_final(
             conversation_id=turn.conversation_id,
             is_continuation=submission.is_continuation,
             observed_model=final_message.model,
-            turn_exchange_id=turn.turn_exchange_id,
+            turn_exchange_id=observed_turn_exchange_id,
         ),
     )
 
@@ -529,7 +1328,7 @@ def await_browser_native_final(
         conversation_id=turn.conversation_id,
         message_id=final_message.message_id,
         model=final_message.model,
-        finish_reason=final_message.finish_reason,
+        finish_reason=result_finish_reason,
     )
     finalization = {**finalization, "submission_id": submission.submission_id}
     _emit_revision_safe_event(self, submission.on_event, finalization)
@@ -551,8 +1350,15 @@ def await_browser_native_final(
         revision_safe_stream_observation_count=submission.stream_state.observation_count,
         revision_safe_stream_revision_count=submission.stream_state.revision_count,
         revision_safe_stream_delivery_incomplete=submission.stream_state.delivery_incomplete,
-        canonical_finality_proven=True,
+        canonical_finality_proven=not stopped_by_user
+        and not incomplete_without_terminal,
+        stopped_by_user=stopped_by_user,
+        incomplete_without_terminal=incomplete_without_terminal,
     )
+    if stopped_by_user:
+        clear_stop_requested_for = getattr(provider, "clear_stop_requested_for", None)
+        if callable(clear_stop_requested_for):
+            clear_stop_requested_for(turn.conversation_id)
     submission.final_response = response
     return response
 
@@ -572,6 +1378,9 @@ def send_browser_native(
     on_token: Callable[[str], None] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     attachment_paths: Sequence[str | Path] | None = None,
+    model_slug: str | None = None,
+    _prewrite_canonical_payload: dict[str, Any] | None = None,
+    _prewrite_canonical_completed_at_ms: int | None = None,
 ) -> ChatResponse:
     """Compatibility composition: submit exactly once, then await canonical finality."""
 
@@ -584,5 +1393,8 @@ def send_browser_native(
         on_token=on_token,
         on_event=on_event,
         attachment_paths=attachment_paths,
+        model_slug=model_slug,
+        _prewrite_canonical_payload=_prewrite_canonical_payload,
+        _prewrite_canonical_completed_at_ms=_prewrite_canonical_completed_at_ms,
     )
     return await_browser_native_final(self, submission)

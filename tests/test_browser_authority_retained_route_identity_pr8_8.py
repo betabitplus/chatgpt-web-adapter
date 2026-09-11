@@ -16,7 +16,9 @@ LEASE_ID = "lease-route-identity"
 
 
 class FakeHealth:
-    def __init__(self, *, ready=True, canonical_status="completed", runtime_tab_id=TAB_ID):
+    def __init__(
+        self, *, ready=True, canonical_status="completed", runtime_tab_id=TAB_ID
+    ):
         self.ready = ready
         self.canonical_status = canonical_status
         self.runtime_tab_id = runtime_tab_id
@@ -99,7 +101,9 @@ class FakeProvider:
             },
         )
 
-    def retained_route_identity_forensics(self, conversation, *, expected_runtime_tab_id, timeout=10.0):
+    def retained_route_identity_forensics(
+        self, conversation, *, expected_runtime_tab_id, timeout=10.0
+    ):
         assert conversation == CONVERSATION
         assert expected_runtime_tab_id == TAB_ID
         return dict(self.route)
@@ -116,7 +120,9 @@ class FakeProvider:
             "zero_product_writes": True,
         }
 
-    def retained_picker_surface_forensics(self, conversation, *, expected_runtime_tab_id, timeout=20.0):
+    def retained_picker_surface_forensics(
+        self, conversation, *, expected_runtime_tab_id, timeout=20.0
+    ):
         self.surface_calls += 1
         assert conversation == CONVERSATION
         assert expected_runtime_tab_id == TAB_ID
@@ -165,8 +171,12 @@ class FakeProvider:
             runtime_tab_id=self.runtime_tab_id,
         )
 
-    def release_runtime_tab(self, *, expected_runtime_tab_id, browser_authority_lease_id, timeout):
-        self.release_calls.append((expected_runtime_tab_id, browser_authority_lease_id, timeout))
+    def release_runtime_tab(
+        self, *, expected_runtime_tab_id, browser_authority_lease_id, timeout
+    ):
+        self.release_calls.append(
+            (expected_runtime_tab_id, browser_authority_lease_id, timeout)
+        )
         self.runtime_tab_id = None
         self.lease_id_present = False
         return SimpleNamespace(
@@ -208,10 +218,17 @@ def test_extension_route_layer_is_additive_and_read_only():
     root = browser_native_extension_dir()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["version"] == "0.1.13"
-    assert manifest["background"]["service_worker"] == "service_worker_temporary_chat_route_reopen_probe.js"
+    assert (
+        manifest["background"]["service_worker"]
+        == "service_worker_browser_runtime_v2.js"
+    )
 
-    observability = (root / "service_worker_observability.js").read_text(encoding="utf-8")
-    route_worker = (root / "service_worker_retained_route_identity_pr8_8.js").read_text(encoding="utf-8")
+    observability = (root / "service_worker_observability.js").read_text(
+        encoding="utf-8"
+    )
+    route_worker = (root / "service_worker_retained_route_identity_pr8_8.js").read_text(
+        encoding="utf-8"
+    )
     old_import = 'importScripts("service_worker_retained_picker_forensics_pr8_8.js")'
     new_import = 'importScripts("service_worker_retained_route_identity_pr8_8.js")'
     assert old_import in observability and new_import in observability
@@ -288,7 +305,9 @@ def test_provider_parses_safe_route_identity(monkeypatch):
         "debuggerAttachedBefore": False,
         "debuggerAttachedAfter": False,
     }
-    monkeypatch.setattr(provider, "_characterization_rpc", lambda payload, *, timeout: response)
+    monkeypatch.setattr(
+        provider, "_characterization_rpc", lambda payload, *, timeout: response
+    )
     record = provider.retained_route_identity_forensics(
         CONVERSATION,
         expected_runtime_tab_id=TAB_ID,
@@ -324,7 +343,10 @@ def test_other_conversation_mismatch_preserves_only_safe_identity():
     )
     report = runner.run(conversation=CONVERSATION, expected_runtime_tab_id=TAB_ID)
     assert report["ok"] is True
-    assert report["route_identity_summary"]["observed_conversation_id"] == OTHER_CONVERSATION
+    assert (
+        report["route_identity_summary"]["observed_conversation_id"]
+        == OTHER_CONVERSATION
+    )
     assert report["route_identity_summary"]["raw_url_exported"] is False
     assert report["route_identity_summary"]["query_exported"] is False
     assert report["route_identity_summary"]["fragment_exported"] is False

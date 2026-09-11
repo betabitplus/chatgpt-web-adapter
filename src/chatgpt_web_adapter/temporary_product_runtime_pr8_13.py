@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
 import threading
 import time
 import uuid
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
-from .browser_native_provider import BrowserNativeTurnProvider
 from .exceptions import RequestError
 from .product_capabilities import ORDINARY_CHATGPT_PRODUCT_SEMANTICS
 from .product_provenance import (
@@ -164,7 +163,9 @@ class TemporaryFinalTextCollector:
         if state is None:
             message_id = event.get("message_id")
             state = _AssistantStreamMessage(
-                message_id=message_id if isinstance(message_id, str) and message_id else None
+                message_id=message_id
+                if isinstance(message_id, str) and message_id
+                else None
             )
             self._messages[key] = state
             self._order.append(key)
@@ -219,7 +220,7 @@ class TemporaryProductWriteRuntime:
     continuation authority from a Temporary conversation id or tab id alone.
     """
 
-    def __init__(self, provider: BrowserNativeTurnProvider) -> None:
+    def __init__(self, provider: Any) -> None:
         self.provider = provider
         self._lock = threading.RLock()
         self._lifecycle_token: str | None = None
@@ -273,6 +274,31 @@ class TemporaryProductWriteRuntime:
         on_event: Callable[[dict[str, Any]], None],
         browser_authority_lease_id: str,
     ) -> dict[str, Any]:
+        provider_send = getattr(self.provider, "send_temporary_text", None)
+        if callable(provider_send):
+            response = provider_send(
+                text,
+                conversation_id=conversation_id,
+                lifecycle_id=lifecycle_token,
+                timeout=timeout,
+                on_event=on_event,
+                browser_authority_lease_id=browser_authority_lease_id,
+            )
+            if not isinstance(response, dict):
+                raise TemporaryProductWriteRuntimeError(
+                    "PR8_13_TEMPORARY_PROVIDER_RESULT_INVALID",
+                    write_may_have_been_submitted=True,
+                    reconciliation_required=True,
+                    request_stage="temporary_provider_contract",
+                )
+            if response.get("ok") is not True:
+                raise TemporaryProductWriteRuntimeError(
+                    str(response.get("error") or "PR8_13_TEMPORARY_TURN_FAILED"),
+                    write_may_have_been_submitted=True,
+                    reconciliation_required=True,
+                )
+            return response
+
         rpc = getattr(self.provider, "_rpc", None)
         if not callable(rpc):
             raise TemporaryProductWriteRuntimeError(
@@ -313,8 +339,8 @@ class TemporaryProductWriteRuntime:
             )
         return response
 
-    @staticmethod
     def _validate_temporary_result(
+        self,
         response: dict[str, Any],
         *,
         lifecycle_token: str,
@@ -353,7 +379,10 @@ class TemporaryProductWriteRuntime:
                 write_may_have_been_submitted=True,
                 reconciliation_required=True,
             )
-        if response.get("temporaryPrewriteProof") != TEMPORARY_PREWRITE_PROOF:
+        expected_prewrite_proof = getattr(
+            self.provider, "temporary_prewrite_proof", TEMPORARY_PREWRITE_PROOF
+        )
+        if response.get("temporaryPrewriteProof") != expected_prewrite_proof:
             raise TemporaryProductWriteRuntimeError(
                 "PR8_13_TEMPORARY_PREWRITE_PROOF_MISMATCH",
                 write_may_have_been_submitted=True,
@@ -394,8 +423,8 @@ class TemporaryProductWriteRuntime:
             raise ValueError("poll_interval must be positive")
 
         self._bridge_preflight()
-        lifecycle_token, expected_conversation_id, is_continuation = self._binding_for_turn(
-            conversation
+        lifecycle_token, expected_conversation_id, is_continuation = (
+            self._binding_for_turn(conversation)
         )
         collector = TemporaryFinalTextCollector()
         browser_authority_lease_id = str(uuid.uuid4())
@@ -505,7 +534,9 @@ class TemporaryProductWriteRuntime:
             temporary_live_write_authority_proven=True,
             temporary_paused_conversation_write_count=(
                 int(response_payload.get("temporaryPausedConversationWriteCount", 0))
-                if isinstance(response_payload.get("temporaryPausedConversationWriteCount"), int)
+                if isinstance(
+                    response_payload.get("temporaryPausedConversationWriteCount"), int
+                )
                 else 0
             ),
             stream_observation_count=collector.observation_count,
@@ -523,9 +554,11 @@ class TemporaryProductWriteRuntime:
             observed_conversation_mode=ConversationMode.TEMPORARY,
             observed_mode_evidence_source=ConversationModeEvidenceSource.PRODUCT_MODE_OBSERVATION,
             observed_mode_proven=True,
-            proof_detail=(
+            proof_detail=getattr(
+                self.provider,
+                "temporary_mode_proof_detail",
                 "page-generated conversation POST was paused before network dispatch and "
-                "proved history_and_training_disabled=true"
+                "proved history_and_training_disabled=true",
             ),
         )
         lifecycle_provenance = ProductTemporaryLifecycleProvenance(
@@ -535,9 +568,11 @@ class TemporaryProductWriteRuntime:
             ),
             lifecycle_state_proven=True,
             live_write_authority_proven=True,
-            proof_detail=(
+            proof_detail=getattr(
+                self.provider,
+                "temporary_lifecycle_proof_detail",
                 "opaque process-local lifecycle token is bound to one CWA-owned Temporary "
-                "tab and Temporary product conversation; id alone cannot continue it"
+                "tab and Temporary product conversation; id alone cannot continue it",
             ),
         )
         provenance = ProductExecutionProvenance(
@@ -552,9 +587,11 @@ class TemporaryProductWriteRuntime:
                 canonical_completion_proven=False,
                 finish_reason=final_message.finish_reason,
                 finish_reason_observed=final_message.finish_reason is not None,
-                finality_detail=(
+                finality_detail=getattr(
+                    self.provider,
+                    "temporary_finality_detail",
                     "page-owned Temporary terminal assistant stream; ordinary canonical "
-                    "conversation GET is intentionally not claimed"
+                    "conversation GET is intentionally not claimed",
                 ),
             ),
             identity=ProductIdentityProvenance(
@@ -582,6 +619,33 @@ class TemporaryProductWriteRuntime:
             conversation_id = self._conversation_id
         if token is None:
             return False
+
+        provider_end = getattr(self.provider, "end_temporary_lifecycle", None)
+        if callable(provider_end):
+            try:
+                result = provider_end(
+                    lifecycle_id=token, conversation_id=conversation_id
+                )
+                if (
+                    not isinstance(result, dict)
+                    or result.get("ok") is not True
+                    or result.get("temporaryLifecycleState") != "ENDED"
+                ):
+                    raise TemporaryProductWriteRuntimeError(
+                        "PR8_13_TEMPORARY_LIFECYCLE_END_NOT_PROVEN",
+                        write_may_have_been_submitted=False,
+                        reconciliation_required=False,
+                        request_stage="temporary_lifecycle_close",
+                    )
+            except Exception:
+                if not suppress_errors:
+                    raise
+                return False
+            finally:
+                with self._lock:
+                    self._lifecycle_token = None
+                    self._conversation_id = None
+            return True
 
         rpc = getattr(self.provider, "_rpc", None)
         if not callable(rpc):
@@ -633,7 +697,9 @@ class TemporaryProductWriteRuntime:
     def lifecycle_snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "state": "LIVE" if self._lifecycle_token is not None else "NOT_ESTABLISHED",
+                "state": "LIVE"
+                if self._lifecycle_token is not None
+                else "NOT_ESTABLISHED",
                 "conversation_id": self._conversation_id,
                 "token_present": self._lifecycle_token is not None,
                 "token_exported": False,

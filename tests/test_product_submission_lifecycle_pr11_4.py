@@ -7,12 +7,17 @@ import pytest
 import chatgpt_web_adapter.browser_owned_submission_lifecycle as lifecycle_subject
 from chatgpt_web_adapter.browser_native_client import BrowserNativeSubmission
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeBridgeStatus
-from chatgpt_web_adapter.browser_owned_product_transport import BrowserOwnedProductTransport
+from chatgpt_web_adapter.browser_owned_product_transport import (
+    BrowserOwnedProductTransport,
+)
 from chatgpt_web_adapter.browser_owned_submission_lifecycle import (
     SUBMISSION_FINALITY_PENDING,
     SUBMISSION_HANDLE_INVALID,
 )
-from chatgpt_web_adapter.browser_owned_write_runtime import BrowserOwnedWriteRuntimeError
+from chatgpt_web_adapter.browser_owned_write_runtime import (
+    BrowserOwnedWriteRuntimeError,
+)
+from chatgpt_web_adapter.product_runtime import ChatGPTProductRuntime
 from chatgpt_web_adapter.product_submission import (
     ProductSubmissionAck,
     SubmissionEvidenceSource,
@@ -20,8 +25,9 @@ from chatgpt_web_adapter.product_submission import (
 from chatgpt_web_adapter.product_submission_runtime_gate import (
     ProductSubmissionLifecycleUnavailableError,
 )
-from chatgpt_web_adapter.product_runtime import ChatGPTProductRuntime
-from chatgpt_web_adapter.revision_safe_streaming_pr8_9 import RevisionSafeTextAccumulator
+from chatgpt_web_adapter.revision_safe_streaming_pr8_9 import (
+    RevisionSafeTextAccumulator,
+)
 from chatgpt_web_adapter.types import ChatResponse, ConversationStatus
 
 
@@ -29,9 +35,12 @@ class FakeClient:
     def __init__(self) -> None:
         self._browser_native_turn_provider = None
         self.readback_ack_count = 0
+        self.status_value = "completed"
 
     def get_status(self, conversation):
-        return ConversationStatus(status="completed", message_id="baseline")
+        if isinstance(self.status_value, BaseException):
+            raise self.status_value
+        return ConversationStatus(status=self.status_value, message_id="baseline")
 
     def get_messages(self, conversation, **kwargs):
         return []
@@ -52,7 +61,9 @@ class FakeProvider:
         self.release_calls = []
 
     def send_text(self, *args, **kwargs):
-        raise AssertionError("low-level provider call is replaced by submit_browser_native")
+        raise AssertionError(
+            "low-level provider call is replaced by submit_browser_native"
+        )
 
     def status(self):
         self.status_count += 1
@@ -114,6 +125,7 @@ def _install_split_stubs(monkeypatch, provider: FakeProvider):
             submission_id="submission-1",
             turn=turn,
             baseline_assistant_ids=frozenset(),
+            baseline_message_ids=frozenset(),
             timeout=float(kwargs["timeout"]),
             poll_interval=float(kwargs["poll_interval"]),
             started_monotonic=1.0,
@@ -196,6 +208,39 @@ def test_submit_ack_is_write_acceptance_not_canonical_finality(monkeypatch):
     assert governance["submission_dispatch_serialized"] is True
     assert governance["submission_await_serialized"] is True
     assert governance["submission_automatic_write_retry"] is False
+
+
+def test_split_submit_allows_stale_tool_running_for_browser_liveness_fence(monkeypatch):
+    runtime, _transport, client, _provider, calls = _runtime(monkeypatch)
+    client.status_value = "tool_running"
+
+    ack = runtime.submit("continue", conversation="conversation-1")
+
+    assert isinstance(ack, ProductSubmissionAck)
+    assert calls["submit"] == 1
+
+
+def test_split_submit_blocks_awaiting_tool_approval_before_browser_write(monkeypatch):
+    runtime, _transport, client, _provider, calls = _runtime(monkeypatch)
+    client.status_value = "awaiting_tool_approval"
+
+    with pytest.raises(BrowserOwnedWriteRuntimeError) as caught:
+        runtime.submit("continue", conversation="conversation-1")
+
+    assert calls["submit"] == 0
+    assert "awaiting_tool_approval" in str(caught.value)
+
+
+def test_split_submit_unreadable_commit_fails_closed_before_browser_write(monkeypatch):
+    runtime, _transport, client, _provider, calls = _runtime(monkeypatch)
+    client.status_value = RuntimeError("canonical busy")
+
+    with pytest.raises(BrowserOwnedWriteRuntimeError) as caught:
+        runtime.submit("continue", conversation="conversation-1")
+
+    assert calls["submit"] == 0
+    assert caught.value.failure_kind == lifecycle_subject.CANONICAL_READ_UNAVAILABLE
+    assert caught.value.write_may_have_been_submitted is False
 
 
 def test_pending_submission_blocks_every_second_write_before_delegation(monkeypatch):

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 EXT = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
 
@@ -43,7 +42,9 @@ def test_temporary_id_is_explicitly_session_routing_not_public_authority() -> No
 def test_continuation_stream_identity_must_match_live_session_identity() -> None:
     source = _source("service_worker_temporary_session_identity_pr8_13.js")
     assert "temporaryContext.expectedConversationId !== null" in source
-    assert "identity.conversationId !== temporaryContext.expectedConversationId" in source
+    assert (
+        "identity.conversationId !== temporaryContext.expectedConversationId" in source
+    )
     assert "TEMPORARY_STREAM_IDENTITY_CONVERSATION_MISMATCH" in source
 
 
@@ -72,6 +73,22 @@ def test_fresh_temporary_identity_flush_uses_extension_local_sentinel_only() -> 
 def test_fresh_identity_sentinel_resolves_only_from_live_temporary_context() -> None:
     source = _source("service_worker_temporary_fresh_identity_flush_pr8_13.js")
     assert "_pr813TemporaryTurnContext" in source
+    assert "if (active === null) return null;" in source
     assert "ephemeralConversationId" in source
     assert "_pr813LiveTemporaryLifecycle" in source
+    assert "live.token !== active.token" in source
+    assert "live.tabId !== active.tabId" in source
+    assert 'live.state !== "LIVE"' in source
     assert "conversationId: resolvedConversationId" in source
+
+
+def test_stale_previous_process_temporary_lifecycle_cannot_reclassify_fresh_sentinel() -> (
+    None
+):
+    source = _source("service_worker_temporary_fresh_identity_flush_pr8_13.js")
+    sentinel_branch = source.split(
+        "_pr813ConversationId = function _pr813ConversationIdWithFreshIdentitySentinel",
+        1,
+    )[0]
+    assert "if (active === null) return null;" in sentinel_branch
+    assert "live.token !== active.token" in sentinel_branch

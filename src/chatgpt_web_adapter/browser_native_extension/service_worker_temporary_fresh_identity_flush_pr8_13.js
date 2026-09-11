@@ -15,15 +15,23 @@ const _pr813FreshIdentityPriorExecuteNativeTurn = executeNativeTurn;
 
 function _pr813FreshIdentityFromLiveContext() {
   const active = _pr813TemporaryTurnContext;
+  if (active === null) return null;
+
   const activeId = _pr813FreshIdentityPriorConversationId(
-    active?.ephemeralConversationId
+    active.ephemeralConversationId
   );
   if (activeId) return activeId;
 
-  const liveId = _pr813FreshIdentityPriorConversationId(
-    _pr813LiveTemporaryLifecycle?.conversationId
-  );
-  return liveId || null;
+  const live = _pr813LiveTemporaryLifecycle;
+  if (
+    !live ||
+    live.token !== active.token ||
+    live.tabId !== active.tabId ||
+    live.state !== "LIVE"
+  ) {
+    return null;
+  }
+  return _pr813FreshIdentityPriorConversationId(live.conversationId);
 }
 
 _pr813ConversationId = function _pr813ConversationIdWithFreshIdentitySentinel(value) {

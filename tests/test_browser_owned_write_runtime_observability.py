@@ -7,7 +7,9 @@ import chatgpt_web_adapter.browser_owned_write_runtime as subject
 
 class FakeProvider:
     def send_text(self, *args, **kwargs):
-        raise AssertionError("low-level provider should be called through send_browser_native")
+        raise AssertionError(
+            "low-level provider should be called through send_browser_native"
+        )
 
     def status(self):
         return subject.BrowserNativeBridgeStatus(
@@ -25,7 +27,9 @@ class FakeClient:
 
 
 def _runtime():
-    return subject.BrowserOwnedProductWriteRuntime(FakeClient(), provider=FakeProvider())
+    return subject.BrowserOwnedProductWriteRuntime(
+        FakeClient(), provider=FakeProvider()
+    )
 
 
 def test_observed_send_captures_created_background_tab(monkeypatch) -> None:
@@ -56,6 +60,38 @@ def test_observed_send_captures_created_background_tab(monkeypatch) -> None:
     assert execution.observation.foreground_activation_observed is False
 
 
+def test_observed_send_preserves_wk_transport_provenance(monkeypatch) -> None:
+    expected = SimpleNamespace(text="ok")
+
+    def fake_send(*args, **kwargs):
+        kwargs["on_event"](
+            {
+                "type": "browser_native_write_completed",
+                "canonical_read_transport": "curl_cffi",
+                "canonical_read_fallback_reason": None,
+                "phase_a_transport": "wkwebview_minimal_security_shell",
+                "phase_a_gate_wait_ms": 17,
+                "phase_a_elapsed_ms": 214,
+                "phase_b_transport": "curl_cffi_websocket",
+                "phase_b_fallback_reason": None,
+                "phase_b_elapsed_ms": 381,
+            }
+        )
+        return expected
+
+    monkeypatch.setattr(subject, "send_browser_native", fake_send)
+    observation = _runtime().send_text_observed("hello").observation
+
+    assert observation.canonical_read_transport == "curl_cffi"
+    assert observation.canonical_read_fallback_reason is None
+    assert observation.phase_a_transport == "wkwebview_minimal_security_shell"
+    assert observation.phase_a_gate_wait_ms == 17
+    assert observation.phase_a_elapsed_ms == 214
+    assert observation.phase_b_transport == "curl_cffi_websocket"
+    assert observation.phase_b_fallback_reason is None
+    assert observation.phase_b_elapsed_ms == 381
+
+
 def test_observed_send_preserves_old_extension_metadata_as_unknown(monkeypatch) -> None:
     expected = SimpleNamespace(text="ok")
 
@@ -71,9 +107,13 @@ def test_observed_send_preserves_old_extension_metadata_as_unknown(monkeypatch) 
     assert observation.foreground_activation_observed is None
 
 
-def test_observed_send_reports_missing_write_event_without_false_negative(monkeypatch) -> None:
+def test_observed_send_reports_missing_write_event_without_false_negative(
+    monkeypatch,
+) -> None:
     expected = SimpleNamespace(text="ok")
-    monkeypatch.setattr(subject, "send_browser_native", lambda *args, **kwargs: expected)
+    monkeypatch.setattr(
+        subject, "send_browser_native", lambda *args, **kwargs: expected
+    )
     observation = _runtime().send_text_observed("hello").observation
     assert observation.write_event_observed is False
     assert observation.foreground_activation_observed is None

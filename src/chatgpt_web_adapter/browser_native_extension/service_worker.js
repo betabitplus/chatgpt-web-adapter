@@ -118,10 +118,17 @@ async function storeRuntimeTabId(tabId) {
   });
 }
 
-async function ensureRuntimeTab(conversationId) {
-  const targetUrl = conversationId
-    ? `${CHATGPT_ORIGIN}/c/${encodeURIComponent(conversationId)}`
-    : `${CHATGPT_ORIGIN}/`;
+async function ensureRuntimeTab(conversationId, modelSlug = null) {
+  const requestedModelSlug = typeof modelSlug === "string" && modelSlug.trim()
+    ? modelSlug.trim()
+    : null;
+  const target = new URL(
+    conversationId
+      ? `${CHATGPT_ORIGIN}/c/${encodeURIComponent(conversationId)}`
+      : `${CHATGPT_ORIGIN}/`
+  );
+  if (requestedModelSlug) target.searchParams.set("model", requestedModelSlug);
+  const targetUrl = target.toString();
 
   let tab = null;
   const storedId = await storedRuntimeTabId();
@@ -141,10 +148,16 @@ async function ensureRuntimeTab(conversationId) {
     return waitForTabComplete(tab.id);
   }
 
+  const currentUrl = new URL(tab.url || CHATGPT_ORIGIN);
   const currentConversationId = conversationIdFromUrl(tab.url || "");
-  const alreadyTargeted = conversationId
-    ? currentConversationId === conversationId
-    : currentConversationId == null && new URL(tab.url || CHATGPT_ORIGIN).pathname === "/";
+  const modelMatches = requestedModelSlug
+    ? currentUrl.searchParams.get("model") === requestedModelSlug
+    : true;
+  const alreadyTargeted = (
+    conversationId
+      ? currentConversationId === conversationId
+      : currentConversationId == null && currentUrl.pathname === "/"
+  ) && modelMatches;
 
   if (!alreadyTargeted) {
     await chrome.tabs.update(tab.id, { url: targetUrl, active: false });
@@ -543,10 +556,13 @@ async function executeNativeTurn(message) {
     ? message.conversationId.trim()
     : null;
   const timeoutMs = Number.isFinite(message.timeoutMs)
-    ? Math.max(10_000, Math.min(Number(message.timeoutMs), 300_000))
+    ? Math.max(10_000, Number(message.timeoutMs))
     : DEFAULT_TIMEOUT_MS;
+  const modelSlug = typeof message.modelSlug === "string" && message.modelSlug.trim()
+    ? message.modelSlug.trim()
+    : null;
 
-  const tab = await ensureRuntimeTab(conversationId);
+  const tab = await ensureRuntimeTab(conversationId, modelSlug);
   if (!Number.isInteger(tab.id)) throw new Error("CHATGPT_RUNTIME_TAB_MISSING_ID");
   const result = await executeOfficialPageTurn({
     tabId: tab.id,

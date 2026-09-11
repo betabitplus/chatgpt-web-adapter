@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any, Sequence
 
 from . import cli as legacy_cli
@@ -37,8 +37,7 @@ PRODUCT_NATIVE_TO_SEMANTIC: dict[str, str] = {
     "HIGH": "DEEP",
 }
 SEMANTIC_TO_PRODUCT_NATIVE: dict[str, str] = {
-    semantic: product
-    for product, semantic in PRODUCT_NATIVE_TO_SEMANTIC.items()
+    semantic: product for product, semantic in PRODUCT_NATIVE_TO_SEMANTIC.items()
 }
 DEFAULT_PUBLIC_MODEL_PROFILE = "HIGH"
 
@@ -161,7 +160,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="read normalized messages from the canonical current conversation branch",
     )
     _add_inspection_common(messages)
-    messages.add_argument("conversation", help="raw conversation id or ChatGPT conversation URL")
+    messages.add_argument(
+        "conversation", help="raw conversation id or ChatGPT conversation URL"
+    )
     messages.add_argument("--limit", type=int)
     messages.add_argument(
         "--role",
@@ -175,11 +176,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="include messages whose normalized text is empty",
     )
 
+    catalog = root.add_parser(
+        "catalog",
+        help="read the canonical ChatGPT conversation catalog without performing a write",
+    )
+    _add_inspection_common(catalog)
+
+    conversation = root.add_parser(
+        "conversation",
+        help="read one exact canonical ChatGPT conversation payload without performing a write",
+    )
+    _add_inspection_common(conversation)
+    conversation.add_argument(
+        "conversation",
+        help="raw conversation id or ChatGPT conversation URL",
+    )
+
     export = root.add_parser(
         "export",
         help="write a normalized current-branch export plus stable artifact manifest",
     )
-    export.add_argument("conversation", help="raw conversation id or ChatGPT conversation URL")
+    export.add_argument(
+        "conversation", help="raw conversation id or ChatGPT conversation URL"
+    )
     export.add_argument("--auth-file", type=Path, default=DEFAULT_AUTH_FILE)
     export.add_argument(
         "--format",
@@ -187,7 +206,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default="markdown",
         help="export representation: markdown/md, jsonl, or txt/text",
     )
-    export.add_argument("--name", default="conversation", help="artifact file-name prefix")
+    export.add_argument(
+        "--name", default="conversation", help="artifact file-name prefix"
+    )
     export.add_argument("--output-dir", type=Path, default=Path("."))
     export.add_argument("--index", type=int)
     export.add_argument("--timeout", type=float, default=120.0)
@@ -286,7 +307,9 @@ def _run_status(args: argparse.Namespace) -> int:
         if health.canonical_status is not None:
             print(f"canonical_status: {health.canonical_status}")
         if health.extension_connected is not None:
-            print(f"extension_connected: {str(bool(health.extension_connected)).lower()}")
+            print(
+                f"extension_connected: {str(bool(health.extension_connected)).lower()}"
+            )
     return EXIT_OK if health.ready else EXIT_UNAVAILABLE
 
 
@@ -308,8 +331,12 @@ def _run_capabilities(args: argparse.Namespace) -> int:
         entries = capabilities.get("capabilities", {})
         for name in sorted(entries):
             entry = entries[name]
-            state = entry.get("state", "UNKNOWN") if isinstance(entry, dict) else "UNKNOWN"
-            owner = entry.get("owner", "UNKNOWN") if isinstance(entry, dict) else "UNKNOWN"
+            state = (
+                entry.get("state", "UNKNOWN") if isinstance(entry, dict) else "UNKNOWN"
+            )
+            owner = (
+                entry.get("owner", "UNKNOWN") if isinstance(entry, dict) else "UNKNOWN"
+            )
             print(f"{name}: {state} ({owner})")
         print("model_profiles: INSTANT MEDIUM HIGH")
         print("aliases: FAST=INSTANT BALANCED=MEDIUM DEEP=HIGH")
@@ -341,6 +368,44 @@ def _run_messages(args: argparse.Namespace) -> int:
         for message in messages:
             role = message.role or "unknown"
             print(f"[{role}] {message.text}")
+    return EXIT_OK
+
+
+def _run_catalog(args: argparse.Namespace) -> int:
+    runtime = _runtime_for(args)
+    items = [dict(item) for item in runtime.list_conversations()]
+    payload = {
+        "schema": CLI_CONTRACT_SCHEMA,
+        "command": "catalog",
+        "ok": True,
+        "count": len(items),
+        "items": items,
+    }
+    if args.json:
+        _json_print(payload)
+    else:
+        for item in items:
+            conversation_id = item.get("id", "")
+            title = item.get("title") or "Untitled chat"
+            print(f"{conversation_id}\t{title}")
+    return EXIT_OK
+
+
+def _run_conversation(args: argparse.Namespace) -> int:
+    runtime = _runtime_for(args)
+    ref = ConversationRef.from_any(args.conversation)
+    conversation_payload = runtime.get_conversation_payload(ref)
+    payload = {
+        "schema": CLI_CONTRACT_SCHEMA,
+        "command": "conversation",
+        "ok": True,
+        "conversation_id": ref.conversation_id,
+        "conversation": conversation_payload,
+    }
+    if args.json:
+        _json_print(payload)
+    else:
+        _json_print(conversation_payload)
     return EXIT_OK
 
 
@@ -452,7 +517,9 @@ def _error_exit_code(error: BaseException) -> int:
     return EXIT_OPERATION_FAILED
 
 
-def _error_payload(args: argparse.Namespace, error: BaseException, exit_code: int) -> dict[str, Any]:
+def _error_payload(
+    args: argparse.Namespace, error: BaseException, exit_code: int
+) -> dict[str, Any]:
     detail: dict[str, Any] = {
         "type": type(error).__name__,
         "message": str(error),
@@ -492,6 +559,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_capabilities(args)
         if args.command == "messages":
             return _run_messages(args)
+        if args.command == "catalog":
+            return _run_catalog(args)
+        if args.command == "conversation":
+            return _run_conversation(args)
         if args.command == "snapshot":
             return _run_snapshot_artifact(args)
         if args.command == "export":

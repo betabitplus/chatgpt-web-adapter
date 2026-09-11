@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
@@ -11,12 +10,11 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from pr10_1_artifact_fiber_state_v6_live_gate import (  # noqa: E402
+    _EXPECTED_SUPPORT,
     FIBER_STATE_SCHEMA,
     ProductArtifactFiberStateV6Provider,
-    _EXPECTED_SUPPORT,
     _safe_hit,
 )
-
 
 EXTENSION = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
 WORKER = EXTENSION / "service_worker_generated_artifact_fiber_state_v6_pr10_1.js"
@@ -28,7 +26,7 @@ GATE = TOOLS / "pr10_1_artifact_fiber_state_v6_live_gate.py"
 def test_fiber_state_v6_preserves_historical_manifest_entrypoint() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     assert manifest["background"]["service_worker"] == (
-        "service_worker_temporary_chat_route_reopen_probe.js"
+        "service_worker_browser_runtime_v2.js"
     )
     assert manifest["version"] == "0.1.13"
 
@@ -37,10 +35,14 @@ def test_fiber_state_v6_loads_after_v5_without_replacing_chain() -> None:
     observability = OBSERVABILITY.read_text(encoding="utf-8")
     v5 = 'importScripts("service_worker_generated_artifact_action_v5_pr10_1.js");'
     v6 = 'importScripts("service_worker_generated_artifact_fiber_state_v6_pr10_1.js");'
-    patch = 'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    patch = (
+        'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    )
     assert v5 in observability
     assert v6 in observability
-    assert observability.index(v5) < observability.index(v6) < observability.index(patch)
+    assert (
+        observability.index(v5) < observability.index(v6) < observability.index(patch)
+    )
 
 
 def test_fiber_state_v6_requires_proven_assistant_probe_turn() -> None:

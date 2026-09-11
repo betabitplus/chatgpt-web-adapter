@@ -2,6 +2,8 @@
 
 PR8.2.0–PR8.2.3 established that ordinary ChatGPT canonical reads and session renewal can operate browserlessly, while no documented supported non-browser external ordinary-ChatGPT write surface was found. PR8.2.4 therefore productionizes the smallest proven browser-owned write boundary instead of expanding private protected-write reconstruction.
 
+> **Current implementation note:** the PR8.2.4 requirement below that every continuation be canonically `completed` before delegation is historical. Interrupted chats can retain stale `running`/`tool_running` canonical status after the browser UI is ready. Current browser-owned writes still require a successful canonical commit read and still hard-block explicit user-action states such as `awaiting_tool_approval`, but live-generation exclusion is enforced by the browser-native composer-readiness fence immediately before submit. `health(conversation)` remains a strict diagnostic view and may therefore report such stale conversations as not ready.
+
 ## Runtime split
 
 - **Read plane:** `BROWSERLESS_CANONICAL_HTTP`

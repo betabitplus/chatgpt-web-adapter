@@ -58,7 +58,7 @@ function _pr92TurnTimeoutMs(message) {
   if (!Number.isFinite(message?.timeoutMs)) return DEFAULT_TIMEOUT_MS;
   const timeoutMs = Number(message.timeoutMs);
   if (timeoutMs <= 0) throw new Error("PR9_2_TURN_TIMEOUT_MUST_BE_POSITIVE");
-  return Math.min(timeoutMs, 300_000);
+  return timeoutMs;
 }
 
 function _pr92CreateTurnContext(message) {

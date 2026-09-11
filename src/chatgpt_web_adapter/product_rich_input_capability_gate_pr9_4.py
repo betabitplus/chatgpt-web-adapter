@@ -40,8 +40,15 @@ def _uses_frozen_bound_implementation(
 
 
 def _provider_uses_proven_pr92_rich_input_path(provider: Any) -> bool:
-    """Return whether a provider preserves the live-proven PR9.2 write path."""
+    """Return whether a provider preserves a live-proven rich-input write path."""
 
+    if (
+        getattr(provider, "browser_authority_backend", None) == "wkwebview"
+        and getattr(provider, "supports_attachment_paths", False) is True
+        and getattr(provider, "supports_files", False) is True
+        and getattr(provider, "supports_multimodal_continuation", False) is True
+    ):
+        return True
     if not isinstance(provider, ProductModelProfileProvider):
         return False
     return _uses_frozen_bound_implementation(

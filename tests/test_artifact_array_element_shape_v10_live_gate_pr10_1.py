@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
@@ -11,15 +10,16 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from pr10_1_artifact_array_element_shape_v10_live_gate import (  # noqa: E402
+    _EXPECTED_SUPPORT,
     ARTIFACT_ARRAY_ELEMENT_SHAPE_SCHEMA,
     ProductArtifactArrayElementShapeV10Provider,
-    _EXPECTED_SUPPORT,
     _safe_candidate,
 )
 
-
 EXTENSION = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
-WORKER = EXTENSION / "service_worker_generated_artifact_array_element_shape_v10_pr10_1.js"
+WORKER = (
+    EXTENSION / "service_worker_generated_artifact_array_element_shape_v10_pr10_1.js"
+)
 OBSERVABILITY = EXTENSION / "service_worker_observability.js"
 MANIFEST = EXTENSION / "manifest.json"
 GATE = TOOLS / "pr10_1_artifact_array_element_shape_v10_live_gate.py"
@@ -27,7 +27,10 @@ GATE = TOOLS / "pr10_1_artifact_array_element_shape_v10_live_gate.py"
 
 def test_array_element_shape_v10_preserves_historical_manifest_entrypoint() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    assert manifest["background"]["service_worker"] == "service_worker_temporary_chat_route_reopen_probe.js"
+    assert (
+        manifest["background"]["service_worker"]
+        == "service_worker_browser_runtime_v2.js"
+    )
     assert manifest["version"] == "0.1.13"
 
 
@@ -35,10 +38,14 @@ def test_array_element_shape_v10_loads_after_v9_without_replacing_chain() -> Non
     observability = OBSERVABILITY.read_text(encoding="utf-8")
     v9 = 'importScripts("service_worker_generated_artifact_root_key_shape_v9_pr10_1.js");'
     v10 = 'importScripts("service_worker_generated_artifact_array_element_shape_v10_pr10_1.js");'
-    patch = 'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    patch = (
+        'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    )
     assert v9 in observability
     assert v10 in observability
-    assert observability.index(v9) < observability.index(v10) < observability.index(patch)
+    assert (
+        observability.index(v9) < observability.index(v10) < observability.index(patch)
+    )
 
 
 def test_array_element_shape_v10_targets_only_attachment_opaque_arrays() -> None:
@@ -55,7 +62,9 @@ def test_array_element_shape_v10_targets_only_attachment_opaque_arrays() -> None
     assert "arrayElementsBounded:true" in source
 
 
-def test_array_element_shape_v10_exports_types_shapes_and_whitelisted_key_names_only() -> None:
+def test_array_element_shape_v10_exports_types_shapes_and_whitelisted_key_names_only() -> (
+    None
+):
     source = WORKER.read_text(encoding="utf-8")
     assert "elementValueKindCounts" in source
     assert "stringElementShapeCounts" in source
@@ -198,7 +207,9 @@ def test_array_element_shape_v10_support_normalizes_exact_contract(monkeypatch) 
     assert diagnostic["support_fields_present"] is True
 
 
-def test_array_element_shape_v10_snapshot_preserves_only_safe_shape(monkeypatch) -> None:
+def test_array_element_shape_v10_snapshot_preserves_only_safe_shape(
+    monkeypatch,
+) -> None:
     provider = ProductArtifactArrayElementShapeV10Provider()
 
     def fake_rpc(message, *, timeout):

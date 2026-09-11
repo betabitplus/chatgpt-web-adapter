@@ -5,6 +5,12 @@ from typing import Any, Sequence
 
 from . import product_runtime_core as _core
 from .auth import DEFAULT_AUTH_FILE
+from .browser_authority_backend import (
+    WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
+    assemble_browser_authority_provider,
+    normalize_browser_authority_backend,
+    resolve_browser_authority_backend,
+)
 from .client import DEFAULT_TIMEOUT_SECONDS, ChatGPTWebClient
 from .product_runtime_observation_gate import gate_product_runtime_send_text_observed
 from .product_submission import ProductSubmissionAck
@@ -101,8 +107,32 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                 )
 
         self.write_transport = write_transport
+        transport_canonical = getattr(write_transport, "canonical_client", None)
+        if transport_canonical is not None:
+            self.canonical = require_canonical_conversation_client(transport_canonical)
         self._transport = write_transport
         self._writer = getattr(write_transport, "_runtime", write_transport)
+
+    def stop_generation(
+        self,
+        conversation: ConversationInput = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        helper = getattr(self.write_transport, "stop_generation", None)
+        if not callable(helper):
+            raise RuntimeError(
+                "stop generation is unavailable for the selected product transport"
+            )
+        return helper(conversation, timeout=timeout)
+
+    def get_conversation_payload(self, conversation: Any) -> dict[str, Any]:
+        helper = getattr(self.canonical, "get_conversation_payload", None)
+        if not callable(helper):
+            raise RuntimeError(
+                "raw canonical conversation payload is unavailable on the selected canonical client"
+            )
+        return dict(helper(conversation))
 
     @gate_product_runtime_send_text_observed
     def send_text_observed(
@@ -118,6 +148,7 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
         browser_authority_policy: str | None = None,
         browser_authority_ttl_ms: int | None = None,
         model_profile: str | None = None,
+        model: str | None = None,
         media: Sequence[MediaItem] | None = None,
     ) -> ProductRuntimeExecution:
         return super().send_text_observed(
@@ -131,6 +162,7 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             browser_authority_policy=browser_authority_policy,
             browser_authority_ttl_ms=browser_authority_ttl_ms,
             model_profile=model_profile,
+            model=model,
             media=media,
         )
 
@@ -186,6 +218,7 @@ def assemble_product_runtime(
     client: Any | None = None,
     provider: Any | None = None,
     write_transport: ProductWriteTransport | None = None,
+    browser_authority_backend: str | None = None,
     browser_authority_policy: str | None = None,
     browser_authority_ttl_ms: int | None = None,
     auth_file: str | Path = DEFAULT_AUTH_FILE,
@@ -196,6 +229,38 @@ def assemble_product_runtime(
     """Assemble an explicit ordinary-ChatGPT product runtime without fallback."""
 
     normalized = normalize_product_transport(transport)
+    normalized_backend: str | None = None
+    if browser_authority_backend is not None:
+        normalized_backend = normalize_browser_authority_backend(
+            browser_authority_backend
+        )
+        if normalized != BROWSER_OWNED_PRODUCT_TRANSPORT:
+            raise ValueError(
+                "browser authority backend selection requires transport='browser-owned'"
+            )
+        if provider is not None:
+            raise ValueError(
+                "provider and browser_authority_backend are mutually exclusive"
+            )
+        if write_transport is not None:
+            raise ValueError(
+                "write_transport and browser_authority_backend are mutually exclusive"
+            )
+    elif (
+        normalized == BROWSER_OWNED_PRODUCT_TRANSPORT
+        and provider is None
+        and write_transport is None
+    ):
+        normalized_backend = resolve_browser_authority_backend(None)
+
+    if normalized_backend is not None:
+        provider = assemble_browser_authority_provider(normalized_backend)
+        if (
+            normalized_backend == WKWEBVIEW_BROWSER_AUTHORITY_BACKEND
+            and browser_authority_policy is None
+        ):
+            browser_authority_policy = "TURN_SCOPED"
+
     if client is None:
         client = ChatGPTWebClient(
             auth_file=auth_file,

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
@@ -11,12 +10,11 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from pr10_1_artifact_root_key_shape_v9_live_gate import (  # noqa: E402
+    _EXPECTED_SUPPORT,
     ARTIFACT_ROOT_KEY_SHAPE_SCHEMA,
     ProductArtifactRootKeyShapeV9Provider,
-    _EXPECTED_SUPPORT,
     _safe_candidate,
 )
-
 
 EXTENSION = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
 WORKER = EXTENSION / "service_worker_generated_artifact_root_key_shape_v9_pr10_1.js"
@@ -27,7 +25,10 @@ GATE = TOOLS / "pr10_1_artifact_root_key_shape_v9_live_gate.py"
 
 def test_root_key_shape_v9_preserves_historical_manifest_entrypoint() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    assert manifest["background"]["service_worker"] == "service_worker_temporary_chat_route_reopen_probe.js"
+    assert (
+        manifest["background"]["service_worker"]
+        == "service_worker_browser_runtime_v2.js"
+    )
     assert manifest["version"] == "0.1.13"
 
 
@@ -35,10 +36,14 @@ def test_root_key_shape_v9_loads_after_v8_without_replacing_chain() -> None:
     observability = OBSERVABILITY.read_text(encoding="utf-8")
     v8 = 'importScripts("service_worker_generated_artifact_root_shape_v8_pr10_1.js");'
     v9 = 'importScripts("service_worker_generated_artifact_root_key_shape_v9_pr10_1.js");'
-    patch = 'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    patch = (
+        'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    )
     assert v8 in observability
     assert v9 in observability
-    assert observability.index(v8) < observability.index(v9) < observability.index(patch)
+    assert (
+        observability.index(v8) < observability.index(v9) < observability.index(patch)
+    )
 
 
 def test_root_key_shape_v9_targets_only_nonempty_structural_artifact_roots() -> None:
@@ -258,7 +263,10 @@ def test_root_key_shape_v9_snapshot_preserves_only_shape(monkeypatch) -> None:
     assert diagnostic["failure_reason"] is None
     assert snapshot["identity_as_key_candidate_count"] == 1
     assert snapshot["record_like_identity_key_child_count"] == 1
-    assert snapshot["candidate_summaries"][0]["key_shape_counts"]["file_prefixed_token"] == 1
+    assert (
+        snapshot["candidate_summaries"][0]["key_shape_counts"]["file_prefixed_token"]
+        == 1
+    )
     assert snapshot["raw_root_keys_exported"] is False
     assert snapshot["child_values_exported"] is False
 

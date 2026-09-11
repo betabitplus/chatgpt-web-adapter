@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import threading
 from contextlib import nullcontext
 from functools import wraps
-import threading
 from typing import Any
 
 from .browser_authority_lease import (
@@ -157,7 +157,8 @@ def _build_browser_owned_capabilities(
                 name=name,
                 state=(
                     _BROWSER_OWNED_CAPABILITY_STATES[name]
-                    if profile_selection_supported or name not in _PROFILE_SELECTION_CAPABILITIES
+                    if profile_selection_supported
+                    or name not in _PROFILE_SELECTION_CAPABILITIES
                     else CapabilityState.UNKNOWN
                 ),
                 owner=_BROWSER_OWNED_CAPABILITY_OWNERS.get(
@@ -166,7 +167,8 @@ def _build_browser_owned_capabilities(
                 ),
                 evidence=(
                     _BROWSER_OWNED_CAPABILITY_EVIDENCE.get(name)
-                    if profile_selection_supported or name not in _PROFILE_SELECTION_CAPABILITIES
+                    if profile_selection_supported
+                    or name not in _PROFILE_SELECTION_CAPABILITIES
                     else "configured browser-native provider does not expose PR8.10 profile requirements"
                 ),
             )
@@ -204,7 +206,9 @@ def _serialize_submission_operation(method: Any) -> Any:
     """Serialize every browser-owned write/finality operation on one transport."""
 
     @wraps(method)
-    def serialized(self: "BrowserOwnedProductTransport", *args: Any, **kwargs: Any) -> Any:
+    def serialized(
+        self: "BrowserOwnedProductTransport", *args: Any, **kwargs: Any
+    ) -> Any:
         with self._submission_dispatch_lock:
             return method(self, *args, **kwargs)
 
@@ -372,9 +376,12 @@ class BrowserOwnedProductTransport:
         browser_authority_policy: BrowserAuthorityPolicy | str | None = None,
         browser_authority_ttl_ms: int | None = None,
         model_profile: str | None = None,
+        model_slug: str | None = None,
         conversation_mode: str = _NORMAL_CONVERSATION_MODE,
     ) -> ChatResponse:
         self._submission_lifecycle.ensure_no_pending_submission()
+        if model_profile is not None and model_slug is not None:
+            raise ValueError("model_profile and model_slug are mutually exclusive")
         mode = _normalize_mode(conversation_mode)
         with self._model_profile_context(model_profile):
             if mode == _TEMPORARY_CONVERSATION_MODE:
@@ -398,6 +405,7 @@ class BrowserOwnedProductTransport:
                 browser_authority_policy=browser_authority_policy,
                 browser_authority_ttl_ms=browser_authority_ttl_ms,
             )
+            model_kwargs = {"model_slug": model_slug} if model_slug is not None else {}
             return self._runtime.send_text(
                 text,
                 conversation=conversation,
@@ -405,6 +413,7 @@ class BrowserOwnedProductTransport:
                 poll_interval=poll_interval,
                 on_token=on_token,
                 on_event=on_event,
+                **model_kwargs,
                 **authority_kwargs,
             )
 
@@ -470,7 +479,9 @@ class BrowserOwnedProductTransport:
         if not isinstance(submission, ProductSubmissionAck):
             raise TypeError("submission must be ProductSubmissionAck")
         if submission.transport != self.transport_id:
-            raise ValueError("submission transport does not match browser-owned transport")
+            raise ValueError(
+                "submission transport does not match browser-owned transport"
+            )
         return self._submission_lifecycle.await_final(submission.submission_id)
 
     def submission_lifecycle_snapshot(self) -> dict[str, Any]:
@@ -489,9 +500,12 @@ class BrowserOwnedProductTransport:
         browser_authority_policy: BrowserAuthorityPolicy | str | None = None,
         browser_authority_ttl_ms: int | None = None,
         model_profile: str | None = None,
+        model_slug: str | None = None,
         conversation_mode: str = _NORMAL_CONVERSATION_MODE,
     ) -> ProductRuntimeExecution:
         self._submission_lifecycle.ensure_no_pending_submission()
+        if model_profile is not None and model_slug is not None:
+            raise ValueError("model_profile and model_slug are mutually exclusive")
         mode = _normalize_mode(conversation_mode)
         with self._model_profile_context(model_profile):
             if mode == _TEMPORARY_CONVERSATION_MODE:
@@ -515,6 +529,7 @@ class BrowserOwnedProductTransport:
                 browser_authority_policy=browser_authority_policy,
                 browser_authority_ttl_ms=browser_authority_ttl_ms,
             )
+            model_kwargs = {"model_slug": model_slug} if model_slug is not None else {}
             execution: BrowserOwnedWriteExecution = self._runtime.send_text_observed(
                 text,
                 conversation=conversation,
@@ -522,6 +537,7 @@ class BrowserOwnedProductTransport:
                 poll_interval=poll_interval,
                 on_token=on_token,
                 on_event=on_event,
+                **model_kwargs,
                 **authority_kwargs,
             )
         return ProductRuntimeExecution(

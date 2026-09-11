@@ -6,6 +6,8 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+## 0.3.1 - 2026-09-11
+
 - macOS WKWebView authority: harden the self-contained macOS 12+ backend around a globally serialized minimal WebKit protected-write phase, browser-issued resume fencing, lightweight curl/WebSocket continuation, and canonical finality without retaining the full ChatGPT SPA
 - WK parity and resilience: keep exact model selection, Temporary Chat, image/general-file input, multimodal continuation, Stop, tool-loop and HIGH/DEEP semantics on the native WK path; fix the final-SSE-block EOF race without replaying ambiguous protected writes
 - WK promotion policy: use the lightweight WK topology without enable flags, retain only `CWA_WK_FORCE_LEGACY=1` as the emergency full-page/direct-WK escape hatch, and promote implicit browser-owned source selection to `wkwebview` on identifiable macOS 12+ while keeping older/unknown macOS and non-Darwin hosts on `chrome-native`; public release/global installation remains gated on clean exact-candidate acceptance

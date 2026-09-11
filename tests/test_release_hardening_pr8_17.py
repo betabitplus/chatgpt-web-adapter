@@ -325,9 +325,19 @@ def test_publish_workflow_gates_tag_and_exact_wheel_before_upload() -> None:
     assert "tests/test_wkwebview_backend.py" in text
     assert "tests/test_wkwebview_integrity_fixtures.py" in text
     assert "-Wall -Wextra -Werror" in text
+    assert "types: [published]" in text
+    assert "workflow_dispatch:" in text
+    assert "description: Release tag to verify and publish" in text
+    assert "required: true" in text
     assert "github.event.release.tag_name" in text
-    assert "ref: ${{ github.event.release.tag_name }}" in text
-    assert '--expected-version "${{ github.event.release.tag_name }}"' in text
+    release_tag = (
+        "${{ github.event_name == 'workflow_dispatch' "
+        "&& inputs.tag || github.event.release.tag_name }}"
+    )
+    assert f"ref: {release_tag}" in text
+    assert f'--tag "{release_tag}"' in text
+    assert f'--expected-version "{release_tag}"' in text
+    assert text.count(release_tag) == 6
     assert tag_gate < wheel_smoke < publish
 
 

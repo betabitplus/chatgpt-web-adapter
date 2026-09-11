@@ -662,6 +662,18 @@ class WKLightweightTransport:
             timeout=timeout,
             relay_text_event=relay_text_event,
         )
+        if self._stop_requested is not None and self._stop_requested(conversation_id):
+            return {
+                "ok": True,
+                "status": 200,
+                "conversation_id": conversation_id,
+                "canonical_completed": False,
+                "stream_started": True,
+                "stream_ended": True,
+                "stream_terminal_observed": True,
+                "stop_requested": True,
+                "ws_token_events": raw_sequence,
+            }
         deadline = started + max(1.0, float(timeout))
         canonical_url = (
             f"https://chatgpt.com/backend-api/conversation/{conversation_id}"

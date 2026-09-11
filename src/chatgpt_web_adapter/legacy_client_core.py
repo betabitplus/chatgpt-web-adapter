@@ -783,6 +783,7 @@ class ChatGPTWebClient:
         state: dict[str, Any],
         on_event: Callable[[dict[str, Any]], None] | None,
         on_token: Callable[[str], None] | None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         import websockets
 
@@ -848,6 +849,14 @@ class ChatGPTWebClient:
                 if token and on_token is not None:
                     on_token(token)
 
+        def cancellation_requested() -> bool:
+            if cancel_check is None:
+                return False
+            try:
+                return bool(cancel_check())
+            except Exception:
+                return False
+
         async with websockets.connect(
             websocket_url,
             additional_headers=headers,
@@ -865,10 +874,25 @@ class ChatGPTWebClient:
             )
             await websocket.send(json.dumps([connect_command, subscribe_command], ensure_ascii=False))
             while not completed:
+                if cancellation_requested():
+                    return
                 try:
-                    raw_frame = await asyncio.wait_for(websocket.recv(), timeout=max(float(self.timeout), 30.0))
-                except TimeoutError as error:
-                    raise RequestError("ws topic stream timed out while waiting for a frame") from error
+                    raw_frame = await asyncio.wait_for(
+                        websocket.recv(),
+                        timeout=(
+                            0.25
+                            if cancel_check is not None
+                            else max(float(self.timeout), 30.0)
+                        ),
+                    )
+                except (TimeoutError, asyncio.TimeoutError) as error:
+                    if cancel_check is not None:
+                        if cancellation_requested():
+                            return
+                        continue
+                    raise RequestError(
+                        "ws topic stream timed out while waiting for a frame"
+                    ) from error
                 if not isinstance(raw_frame, str):
                     continue
                 self._emit_event(on_event, "raw_ws_frame", topic_id=topic_id, raw=raw_frame)
@@ -912,6 +936,7 @@ class ChatGPTWebClient:
         state: dict[str, Any],
         on_event: Callable[[dict[str, Any]], None] | None,
         on_token: Callable[[str], None] | None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         try:
             asyncio.run(
@@ -920,6 +945,7 @@ class ChatGPTWebClient:
                     state=state,
                     on_event=on_event,
                     on_token=on_token,
+                    cancel_check=cancel_check,
                 )
             )
         except RequestError:

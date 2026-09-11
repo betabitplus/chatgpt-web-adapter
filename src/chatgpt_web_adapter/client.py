@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+import copy
+from typing import Any, Callable, Sequence
 
 from . import legacy_client_core as _core
 from .attach import attach_conversation as _attach_conversation
@@ -22,6 +23,7 @@ from .conversation_send import send_to_conversation as _send_to_conversation
 from .diagnostic_metrics import (
     send_with_expanded_metrics as _send_with_expanded_metrics,
 )
+from .exceptions import RequestError
 from .export import export_conversation as _export_conversation
 from .model_registry import (
     DEFAULT_MODEL as DEFAULT_MODEL,
@@ -250,6 +252,57 @@ class ChatGPTWebClient(_core.ChatGPTWebClient):
     _write_debug_trace = _gate_debug_trace_writer(
         _core.ChatGPTWebClient._write_debug_trace
     )
+
+    def wk_transport_headers(
+        self, extra: dict[str, str | None] | None = None
+    ) -> dict[str, str]:
+        """Build authenticated headers for the WK lightweight transport boundary."""
+
+        return self._build_headers(extra)
+
+    def wk_transport_resume_state(
+        self, resume_token: str, *, conversation_id: str
+    ) -> tuple[str, dict[str, Any]]:
+        """Decode a browser-issued resume token into the WS topic state."""
+
+        state: dict[str, Any] = {"conversation_id": conversation_id}
+        self._capture_resume_token_diagnostics(resume_token, state)
+        topic_id = state.get("resume_turn_topic_id")
+        if not isinstance(topic_id, str) or not topic_id:
+            raise RequestError("resume token did not contain a WebSocket topic id")
+        return topic_id, state
+
+    def wk_transport_stream_topic(
+        self,
+        topic_id: str,
+        *,
+        websocket_url: str,
+        state: dict[str, Any],
+        on_token: Callable[[str], None] | None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
+        """Stream one resume topic using a caller-provided Celsius WS URL."""
+
+        ws_client = copy.copy(self)
+
+        def probe_celsius() -> dict[str, Any]:
+            return {"websocket_url": websocket_url}
+
+        ws_client._probe_celsius_ws_user = probe_celsius
+        ws_client._stream_handoff_via_ws_topic(
+            topic_id,
+            state=state,
+            on_event=None,
+            on_token=on_token,
+            cancel_check=should_stop,
+        )
+
+    def wk_transport_upload_media_files(
+        self, media: Sequence[tuple[Any, str | None]]
+    ) -> list[dict[str, Any]]:
+        """Upload media through the source client's authenticated path."""
+
+        return self._upload_media_files(media)
 
     approve_pending_action = _policy_approve_pending_action(
         _core.ChatGPTWebClient.approve_pending_action

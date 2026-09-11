@@ -4,8 +4,19 @@ from pathlib import Path
 
 import pytest
 
+from chatgpt_web_adapter.client import ChatGPTWebClient
 from chatgpt_web_adapter.exceptions import MediaError, RequestError
 from chatgpt_web_adapter.wkwebview_lightweight_transport import WKLightweightTransport
+
+
+def test_production_client_exposes_wk_lightweight_source_contract() -> None:
+    for method_name in (
+        "wk_transport_headers",
+        "wk_transport_resume_state",
+        "wk_transport_stream_topic",
+        "wk_transport_upload_media_files",
+    ):
+        assert callable(getattr(ChatGPTWebClient, method_name, None))
 
 
 class _Response:
@@ -309,6 +320,54 @@ def test_lightweight_transport_resumes_and_finalizes_through_explicit_contract(
     assert cached == [("conversation-1", final_payload)]
     assert result["canonical_completed"] is True
     assert result["ws_token_events"] == 1
+
+
+def test_lightweight_resume_stop_skips_canonical_polling(monkeypatch) -> None:
+    source = _SourceClient()
+    cached: list[tuple[str, dict]] = []
+    transport = WKLightweightTransport(
+        source,
+        canonical_matches_write=lambda payload, **kwargs: False,
+        cache_final_payload=lambda conversation_id, payload: cached.append(
+            (conversation_id, payload)
+        ),
+        stop_requested=lambda conversation_id: conversation_id == "conversation-1",
+    )
+
+    def stopped_stream(
+        topic_id: str,
+        *,
+        websocket_url: str,
+        state: dict,
+        on_token,
+        should_stop=None,
+    ) -> None:
+        source.stream_calls.append((topic_id, websocket_url))
+        assert should_stop is not None
+        assert should_stop() is True
+
+    monkeypatch.setattr(source, "wk_transport_stream_topic", stopped_stream)
+    curl = _CurlRequests(
+        [[_Response(200, {"websocket_url": "wss://example.invalid/ws"})]]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+
+    result = transport.resume_turn(
+        conversation_id="conversation-1",
+        resume_value="resume-secret",
+        timeout=10,
+        relay_text_event=lambda _event: None,
+        text="prompt",
+        baseline_current_node="node-before",
+    )
+
+    assert result["stop_requested"] is True
+    assert result["canonical_completed"] is False
+    assert result["stream_terminal_observed"] is True
+    assert result["ws_token_events"] == 0
+    assert source.stream_calls == [("topic-1", "wss://example.invalid/ws")]
+    assert len(curl.sessions) == 1
+    assert cached == []
 
 
 def test_lightweight_canonical_auth_failure_does_not_fallback(monkeypatch) -> None:

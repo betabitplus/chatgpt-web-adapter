@@ -37,8 +37,13 @@ def _normalize_snapshot_name(name: str) -> str:
         raise ValueError("snapshot name is required")
     if normalized in {".", ".."}:
         raise ValueError("snapshot name must be a file-name component")
-    if any(character in _SAFE_NAME_FORBIDDEN or ord(character) < 32 for character in normalized):
-        raise ValueError("snapshot name contains characters that are invalid in file names")
+    if any(
+        character in _SAFE_NAME_FORBIDDEN or ord(character) < 32
+        for character in normalized
+    ):
+        raise ValueError(
+            "snapshot name contains characters that are invalid in file names"
+        )
     return normalized
 
 
@@ -92,7 +97,10 @@ def _context_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
 
 
 def render_snapshot_context(messages: list[ChatMessage]) -> str:
-    blocks = [f"## {(message.role or 'message').upper()}\n\n{message.text}" for message in messages]
+    blocks = [
+        f"## {(message.role or 'message').upper()}\n\n{message.text}"
+        for message in messages
+    ]
     if not blocks:
         return ""
     return _CONTEXT_SEPARATOR.join(blocks) + "\n"
@@ -139,12 +147,16 @@ def snapshot_conversation(
         if include_raw_payload
         else None
     )
-    manifest_path = directory / f"{normalized_name}_chat_snapshot_{normalized_index}.manifest.json"
+    manifest_path = (
+        directory / f"{normalized_name}_chat_snapshot_{normalized_index}.manifest.json"
+    )
 
     if context_path.exists():
         raise FileExistsError(f"snapshot context already exists: {context_path}")
     if raw_payload_path is not None and raw_payload_path.exists():
-        raise FileExistsError(f"snapshot raw payload already exists: {raw_payload_path}")
+        raise FileExistsError(
+            f"snapshot raw payload already exists: {raw_payload_path}"
+        )
     if manifest_path.exists():
         raise FileExistsError(f"snapshot manifest already exists: {manifest_path}")
 

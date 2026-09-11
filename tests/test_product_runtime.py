@@ -109,6 +109,23 @@ def test_stop_generation_delegates_out_of_band_to_browser_provider() -> None:
     assert provider.stop_calls == [("conversation-1", 3.5)]
 
 
+def test_runtime_exposes_canonical_conversation_catalog(monkeypatch) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    catalog = [{"id": "conversation-1", "title": "One"}]
+    monkeypatch.setattr(
+        runtime.canonical,
+        "list_conversations",
+        lambda: catalog,
+        raising=False,
+    )
+
+    result = runtime.list_conversations()
+
+    assert result == catalog
+    assert result is not catalog
+    assert result[0] is not catalog[0]
+
+
 def test_runtime_exposes_raw_canonical_conversation_payload(monkeypatch) -> None:
     runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
     payload = {"title": "Graph", "mapping": {"node": {}}}

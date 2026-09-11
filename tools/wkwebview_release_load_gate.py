@@ -166,11 +166,15 @@ def _descendants(rows: dict[int, dict[str, Any]], roots: set[int]) -> set[int]:
 
 def _specs(args: argparse.Namespace) -> list[tuple[str, str]]:
     workers = max(1, int(args.workers))
-    conversations = [str(item).strip() for item in args.conversation if str(item).strip()]
+    conversations = [
+        str(item).strip() for item in args.conversation if str(item).strip()
+    ]
     if args.mode == "continuation" and len(conversations) < workers:
         raise SystemExit("continuation mode requires one --conversation per worker")
     if args.mode == "mixed" and len(conversations) < workers // 2:
-        raise SystemExit("mixed mode requires --conversation values for half the workers")
+        raise SystemExit(
+            "mixed mode requires --conversation values for half the workers"
+        )
 
     result: list[tuple[str, str]] = []
     continuation_index = 0
@@ -184,9 +188,7 @@ def _specs(args: argparse.Namespace) -> list[tuple[str, str]]:
             conversation = conversations[continuation_index]
             continuation_index += 1
             kind = "CONT"
-        marker = (
-            f"{args.marker_prefix}_{args.mode.upper()}_{kind}_{index}_OK_20260911"
-        )
+        marker = f"{args.marker_prefix}_{args.mode.upper()}_{kind}_{index}_OK_20260911"
         result.append((marker, conversation))
     return result
 

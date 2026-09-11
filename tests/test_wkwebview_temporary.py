@@ -59,7 +59,11 @@ class _Provider:
     ) -> WKHelperInvocation:
         return WKHelperInvocation(
             command=["wk-helper", "--timeout", str(timeout)],
-            request={"conversation": conversation_id, "prompt": text, "timeout": timeout},
+            request={
+                "conversation": conversation_id,
+                "prompt": text,
+                "timeout": timeout,
+            },
         )
 
     @contextmanager
@@ -76,7 +80,9 @@ class _Provider:
     ) -> dict[str, Any]:
         del timeout, on_text_event
         self.invocations.append(invocation)
-        conversation_id = invocation.request.get("minimal_conversation_id") or "temporary-1"
+        conversation_id = (
+            invocation.request.get("minimal_conversation_id") or "temporary-1"
+        )
         return {
             "ok": True,
             "conversation_id": conversation_id,
@@ -152,11 +158,16 @@ def test_wk_temporary_requires_browser_observed_mode_proof() -> None:
 
 
 def test_packaged_wk_helper_proves_temporary_mode_from_observed_submit_body() -> None:
-    root = Path(__file__).resolve().parents[1] / "src" / "chatgpt_web_adapter" / "wkwebview_helper"
+    root = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "chatgpt_web_adapter"
+        / "wkwebview_helper"
+    )
     shell = (root / "minimal_security_shell.js").read_text(encoding="utf-8")
     helper = (root / "WKChatGPTAuthority.m").read_text(encoding="utf-8")
 
     assert "history_and_training_disabled: true" in shell
     assert "history_and_training_disabled=${temporary" in shell
     assert "temporary_mode:temporary" in helper
-    assert 'submit_temporary_mode_observed' in helper
+    assert "submit_temporary_mode_observed" in helper

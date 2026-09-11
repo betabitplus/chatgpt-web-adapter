@@ -75,7 +75,6 @@ class WKTurnOrchestrator:
 
         return make_stream_relay
 
-
     @staticmethod
     def _payload_contains_client_message(
         payload: dict[str, Any],
@@ -100,7 +99,9 @@ class WKTurnOrchestrator:
             parts = content.get("parts") if isinstance(content, dict) else None
             if not isinstance(parts, list):
                 return False
-            rendered = "\n".join(part for part in parts if isinstance(part, str)).strip()
+            rendered = "\n".join(
+                part for part in parts if isinstance(part, str)
+            ).strip()
             return rendered == expected_text
         return False
 
@@ -232,8 +233,9 @@ class WKTurnOrchestrator:
                 time.sleep(min(0.25, max(0.05, remaining)))
                 continue
 
-            if matched_payload is not None and provider._canonical_state.payload_is_final(
-                matched_payload
+            if (
+                matched_payload is not None
+                and provider._canonical_state.payload_is_final(matched_payload)
             ):
                 provider._cache_final_payload(candidate_id, matched_payload)
                 payload.update(

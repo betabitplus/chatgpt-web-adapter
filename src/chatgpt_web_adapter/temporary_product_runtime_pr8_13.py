@@ -163,7 +163,9 @@ class TemporaryFinalTextCollector:
         if state is None:
             message_id = event.get("message_id")
             state = _AssistantStreamMessage(
-                message_id=message_id if isinstance(message_id, str) and message_id else None
+                message_id=message_id
+                if isinstance(message_id, str) and message_id
+                else None
             )
             self._messages[key] = state
             self._order.append(key)
@@ -421,8 +423,8 @@ class TemporaryProductWriteRuntime:
             raise ValueError("poll_interval must be positive")
 
         self._bridge_preflight()
-        lifecycle_token, expected_conversation_id, is_continuation = self._binding_for_turn(
-            conversation
+        lifecycle_token, expected_conversation_id, is_continuation = (
+            self._binding_for_turn(conversation)
         )
         collector = TemporaryFinalTextCollector()
         browser_authority_lease_id = str(uuid.uuid4())
@@ -532,7 +534,9 @@ class TemporaryProductWriteRuntime:
             temporary_live_write_authority_proven=True,
             temporary_paused_conversation_write_count=(
                 int(response_payload.get("temporaryPausedConversationWriteCount", 0))
-                if isinstance(response_payload.get("temporaryPausedConversationWriteCount"), int)
+                if isinstance(
+                    response_payload.get("temporaryPausedConversationWriteCount"), int
+                )
                 else 0
             ),
             stream_observation_count=collector.observation_count,
@@ -619,7 +623,9 @@ class TemporaryProductWriteRuntime:
         provider_end = getattr(self.provider, "end_temporary_lifecycle", None)
         if callable(provider_end):
             try:
-                result = provider_end(lifecycle_id=token, conversation_id=conversation_id)
+                result = provider_end(
+                    lifecycle_id=token, conversation_id=conversation_id
+                )
                 if (
                     not isinstance(result, dict)
                     or result.get("ok") is not True
@@ -691,7 +697,9 @@ class TemporaryProductWriteRuntime:
     def lifecycle_snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "state": "LIVE" if self._lifecycle_token is not None else "NOT_ESTABLISHED",
+                "state": "LIVE"
+                if self._lifecycle_token is not None
+                else "NOT_ESTABLISHED",
                 "conversation_id": self._conversation_id,
                 "token_present": self._lifecycle_token is not None,
                 "token_exported": False,

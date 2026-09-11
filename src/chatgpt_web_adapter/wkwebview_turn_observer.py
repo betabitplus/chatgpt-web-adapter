@@ -79,7 +79,10 @@ class WKTurnObserver:
     ) -> dict[str, Any]:
         provider = self.provider
         ref = ConversationRef(conversation_id)
-        if not isinstance(browser_authority_lease_id, str) or not browser_authority_lease_id.strip():
+        if (
+            not isinstance(browser_authority_lease_id, str)
+            or not browser_authority_lease_id.strip()
+        ):
             raise ValueError("browser_authority_lease_id is required")
         total_timeout = float(timeout)
         if total_timeout <= 0:
@@ -199,9 +202,8 @@ class WKTurnObserver:
         )
         proof_kind = None
         stream_status = None
-        if (
-            final_payload is not None
-            and provider._is_client_stopped_payload(final_payload)
+        if final_payload is not None and provider._is_client_stopped_payload(
+            final_payload
         ):
             proof_kind = "canonical_client_stopped"
 
@@ -221,9 +223,8 @@ class WKTurnObserver:
                 conversation_id,
                 timeout=remaining,
             )
-            if (
-                final_payload is not None
-                and provider._is_client_stopped_payload(final_payload)
+            if final_payload is not None and provider._is_client_stopped_payload(
+                final_payload
             ):
                 proof_kind = "canonical_client_stopped"
 

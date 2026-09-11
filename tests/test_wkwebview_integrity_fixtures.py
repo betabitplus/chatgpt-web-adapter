@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SHELL = ROOT / "src" / "chatgpt_web_adapter" / "wkwebview_helper" / "minimal_security_shell.js"
+SHELL = (
+    ROOT
+    / "src"
+    / "chatgpt_web_adapter"
+    / "wkwebview_helper"
+    / "minimal_security_shell.js"
+)
 FIXTURES = ROOT / "tests" / "fixtures" / "wkwebview_integrity"
 
 

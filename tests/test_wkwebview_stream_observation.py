@@ -21,7 +21,9 @@ def _passive_stream_observation_script() -> str:
     return "".join(json.loads(f'"{chunk}"') for chunk in chunks)
 
 
-def test_passive_stream_observation_flushes_resume_event_at_eof_without_blank_line() -> None:
+def test_passive_stream_observation_flushes_resume_event_at_eof_without_blank_line() -> (
+    None
+):
     observation = _passive_stream_observation_script()
     harness = f"""
 const events = [];

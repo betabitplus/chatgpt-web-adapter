@@ -55,7 +55,10 @@ class WKTemporaryTurnRuntime:
         total_timeout = float(timeout)
         if total_timeout <= 0:
             raise ValueError("timeout must be positive")
-        if self.provider._current_browser_authority_lease_id() != browser_authority_lease_id:
+        if (
+            self.provider._current_browser_authority_lease_id()
+            != browser_authority_lease_id
+        ):
             raise RequestError(
                 "WKWEBVIEW_TEMPORARY_AUTHORITY_LEASE_MISMATCH",
                 request_stage="wkwebview_temporary_preflight",
@@ -113,7 +116,10 @@ class WKTemporaryTurnRuntime:
             )
 
         result_conversation_id = payload.get("conversation_id")
-        if not isinstance(result_conversation_id, str) or not result_conversation_id.strip():
+        if (
+            not isinstance(result_conversation_id, str)
+            or not result_conversation_id.strip()
+        ):
             raise RequestError(
                 "WKWEBVIEW_TEMPORARY_CONVERSATION_ID_MISSING",
                 request_stage="wkwebview_temporary_write",
@@ -169,7 +175,8 @@ class WKTemporaryTurnRuntime:
             "temporaryLiveWriteAuthorityProven": True,
             "temporaryContinuationIdentityProven": conversation_id is not None,
             "temporaryPausedConversationWriteCount": 0,
-            "turnExchangeId": streamed.get("turn_exchange_id") or payload.get("turn_exchange_id"),
+            "turnExchangeId": streamed.get("turn_exchange_id")
+            or payload.get("turn_exchange_id"),
             "tabId": None,
         }
 

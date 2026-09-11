@@ -11,7 +11,9 @@ from .browser_authority_backend import (
     normalize_browser_authority_backend,
     resolve_browser_authority_backend,
 )
+from .browser_native_client import _canonical_intermediate_events
 from .client import DEFAULT_TIMEOUT_SECONDS, ChatGPTWebClient
+from .messages import get_messages
 from .product_runtime_observation_gate import gate_product_runtime_send_text_observed
 from .product_submission import ProductSubmissionAck
 from .product_transport import (
@@ -36,7 +38,8 @@ from .product_transport import (
 )
 from .product_transport import ProductRuntimeHealth as ProductRuntimeHealth
 from .product_ui_liveness import BrowserUILivenessObservation
-from .types import ChatResponse, MediaItem
+from .status import get_status
+from .types import ChatResponse, ConversationRef, MediaItem
 
 ProductConversationModeUnavailableError = _core.ProductConversationModeUnavailableError
 ProductRichInputUnavailableError = _core.ProductRichInputUnavailableError
@@ -149,6 +152,39 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                 "canonical conversation snapshot is unavailable on the selected canonical client"
             )
         return dict(helper(conversation, **kwargs))
+
+    def conversation_follow_snapshot(
+        self,
+        conversation: Any,
+        *,
+        emitted_message_ids: Sequence[str] = (),
+        limit: int | None = 128,
+    ) -> dict[str, Any]:
+        ref = ConversationRef.from_any(conversation)
+        payload = self.get_conversation_payload(ref)
+
+        class _PayloadReader:
+            def _get_conversation_payload(self, _conversation_id: str) -> dict[str, Any]:
+                return payload
+
+        reader = _PayloadReader()
+        emitted = {
+            str(message_id).strip()
+            for message_id in emitted_message_ids
+            if str(message_id).strip()
+        }
+        events = _canonical_intermediate_events(
+            payload,
+            baseline_message_ids=frozenset(),
+            emitted_message_ids=emitted,
+            submission_id=None,
+        )
+        return {
+            "status": get_status(reader, ref),
+            "messages": get_messages(reader, ref, limit=limit),
+            "events": events,
+            "emitted_message_ids": sorted(emitted),
+        }
 
     def get_conversation_payload(self, conversation: Any) -> dict[str, Any]:
         helper = getattr(self.canonical, "get_conversation_payload", None)

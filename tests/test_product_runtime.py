@@ -166,6 +166,66 @@ def test_runtime_exposes_canonical_conversation_snapshot(monkeypatch) -> None:
     assert calls == [("conversation-1", {"limit": 25})]
 
 
+def test_runtime_follow_snapshot_reuses_one_canonical_payload(monkeypatch) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    payload = {"current_node": "node-2", "mapping": {}}
+    reads = []
+    status = SimpleNamespace(status="tool_running")
+    messages = [SimpleNamespace(message_id="m2", role="assistant", text="thinking")]
+
+    def fake_payload(_conversation):
+        reads.append("payload")
+        return payload
+
+    def fake_status(reader, ref):
+        assert reader._get_conversation_payload(ref.conversation_id) is not payload
+        assert reader._get_conversation_payload(ref.conversation_id) == payload
+        return status
+
+    def fake_messages(reader, ref, *, limit=None):
+        assert reader._get_conversation_payload(ref.conversation_id) == payload
+        assert limit == 32
+        return messages
+
+    def fake_events(
+        event_payload,
+        *,
+        baseline_message_ids,
+        emitted_message_ids,
+        submission_id,
+    ):
+        assert event_payload == payload
+        assert baseline_message_ids == frozenset()
+        assert emitted_message_ids == {"m1"}
+        assert submission_id is None
+        emitted_message_ids.add("m2")
+        return [{"type": "canonical_intermediate_message", "message_id": "m2"}]
+
+    monkeypatch.setattr(
+        runtime.canonical,
+        "get_conversation_payload",
+        fake_payload,
+        raising=False,
+    )
+    monkeypatch.setattr(product_runtime, "get_status", fake_status)
+    monkeypatch.setattr(product_runtime, "get_messages", fake_messages)
+    monkeypatch.setattr(product_runtime, "_canonical_intermediate_events", fake_events)
+
+    result = runtime.conversation_follow_snapshot(
+        "conversation-1",
+        emitted_message_ids=["m1"],
+        limit=32,
+    )
+
+    assert reads == ["payload"]
+    assert result["status"] is status
+    assert result["messages"] is messages
+    assert result["events"] == [
+        {"type": "canonical_intermediate_message", "message_id": "m2"}
+    ]
+    assert result["emitted_message_ids"] == ["m1", "m2"]
+
+
 def test_runtime_exposes_complete_gptty_read_surface() -> None:
     runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
 
@@ -176,6 +236,7 @@ def test_runtime_exposes_complete_gptty_read_surface() -> None:
         "list_conversations",
         "list_models",
         "conversation_snapshot",
+        "conversation_follow_snapshot",
         "get_conversation_payload",
     ):
         assert callable(getattr(runtime, name, None)), name

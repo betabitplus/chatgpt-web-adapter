@@ -204,6 +204,25 @@ def _installed_checks(*, expected_version: str) -> dict[str, object]:
     if not list(extension_dir.glob("*.js")):
         raise RuntimeError("installed browser extension contains no JavaScript files")
 
+    wk_helper_dir = package_path.parent / "wkwebview_helper"
+    required_wk_helper_files = (
+        wk_helper_dir / "WKChatGPTAuthority.m",
+        wk_helper_dir / "Info.plist",
+        wk_helper_dir / "minimal_security_shell.js",
+    )
+    if not all(path.is_file() for path in required_wk_helper_files):
+        raise RuntimeError(f"installed WKWebView helper package data is incomplete: {wk_helper_dir}")
+
+    wk_helper_build = False
+    if sys.platform == "darwin":
+        from chatgpt_web_adapter.wkwebview_helper_runtime import WKWebViewHelperRuntime
+
+        with tempfile.TemporaryDirectory(prefix="cwa-installed-wk-helper-") as tmp:
+            helper = WKWebViewHelperRuntime(Path(tmp), build_timeout=60).ensure_helper()
+            if not helper.is_file():
+                raise RuntimeError("installed WKWebView helper build did not produce a binary")
+        wk_helper_build = True
+
     entry_points = _console_scripts()
     if entry_points != EXPECTED_ENTRY_POINTS:
         raise RuntimeError(f"installed console entry points mismatch: {entry_points!r}")
@@ -249,6 +268,8 @@ def _installed_checks(*, expected_version: str) -> dict[str, object]:
         "version": version,
         "package_path": str(package_path),
         "extension_dir": str(extension_dir),
+        "wk_helper_dir": str(wk_helper_dir),
+        "wk_helper_build": wk_helper_build,
         "entry_points": sorted(entry_points),
         "help_commands": len(HELP_COMMANDS),
         "pre_setup_doctor_exit": 1,

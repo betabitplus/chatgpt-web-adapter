@@ -156,6 +156,7 @@ def test_assemble_product_runtime_forwards_runtime_default_to_owned_assembly(mon
 
     runtime = assemble_product_runtime(
         client=canonical,
+        browser_authority_backend="chrome-native",
         browser_authority_policy="TURN_SCOPED",
         browser_authority_ttl_ms=0,
     )

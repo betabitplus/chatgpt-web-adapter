@@ -10,6 +10,7 @@ from .browser_authority_backend import (
     WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
     assemble_browser_authority_provider,
     normalize_browser_authority_backend,
+    resolve_browser_authority_backend,
 )
 from .client import DEFAULT_TIMEOUT_SECONDS, ChatGPTWebClient
 from .product_capabilities import ProductCapabilities
@@ -336,7 +337,9 @@ def _model_slug_override_kwargs(
         raise ValueError("model must be a non-empty model slug or None")
     governance = dict(write_transport.governance())
     if governance.get("model_slug_product_runtime_selection_supported") is not True:
-        raise ValueError("model selection is unavailable for the selected write transport")
+        raise ValueError(
+            "model selection is unavailable for the selected write transport"
+        )
     return {"model_slug": model.strip()}
 
 
@@ -454,7 +457,9 @@ class ChatGPTProductRuntime:
     ) -> dict[str, Any]:
         helper = getattr(self.write_transport, "stop_generation", None)
         if not callable(helper):
-            raise RuntimeError("stop generation is unavailable for the selected product transport")
+            raise RuntimeError(
+                "stop generation is unavailable for the selected product transport"
+            )
         return helper(conversation, timeout=timeout)
 
     def capabilities(self) -> ProductCapabilities:
@@ -749,19 +754,25 @@ class ChatGPTProductRuntime:
     def list_conversations(self) -> list[dict[str, Any]]:
         helper = getattr(self.canonical, "list_conversations", None)
         if not callable(helper):
-            raise RuntimeError("conversation catalog is unavailable on the selected canonical client")
+            raise RuntimeError(
+                "conversation catalog is unavailable on the selected canonical client"
+            )
         return helper()
 
     def list_models(self) -> list[dict[str, Any]]:
         helper = getattr(self.canonical, "list_models", None)
         if not callable(helper):
-            raise RuntimeError("model catalog is unavailable on the selected canonical client")
+            raise RuntimeError(
+                "model catalog is unavailable on the selected canonical client"
+            )
         return helper()
 
     def conversation_snapshot(self, conversation: Any, **kwargs: Any) -> dict[str, Any]:
         helper = getattr(self.canonical, "conversation_snapshot", None)
         if not callable(helper):
-            raise RuntimeError("conversation snapshot is unavailable on the selected canonical client")
+            raise RuntimeError(
+                "conversation snapshot is unavailable on the selected canonical client"
+            )
         return helper(conversation, **kwargs)
 
     def governance(self) -> dict[str, Any]:
@@ -921,18 +932,31 @@ def assemble_product_runtime(
     """
 
     normalized = normalize_product_transport(transport)
+    normalized_backend: str | None = None
     if browser_authority_backend is not None:
-        normalized_backend = normalize_browser_authority_backend(browser_authority_backend)
+        normalized_backend = normalize_browser_authority_backend(
+            browser_authority_backend
+        )
         if normalized != BROWSER_OWNED_PRODUCT_TRANSPORT:
             raise ValueError(
                 "browser authority backend selection requires transport='browser-owned'"
             )
         if provider is not None:
-            raise ValueError("provider and browser_authority_backend are mutually exclusive")
+            raise ValueError(
+                "provider and browser_authority_backend are mutually exclusive"
+            )
         if write_transport is not None:
             raise ValueError(
                 "write_transport and browser_authority_backend are mutually exclusive"
             )
+    elif (
+        normalized == BROWSER_OWNED_PRODUCT_TRANSPORT
+        and provider is None
+        and write_transport is None
+    ):
+        normalized_backend = resolve_browser_authority_backend(None)
+
+    if normalized_backend is not None:
         provider = assemble_browser_authority_provider(normalized_backend)
         if (
             normalized_backend == WKWEBVIEW_BROWSER_AUTHORITY_BACKEND

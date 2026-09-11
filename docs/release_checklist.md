@@ -17,6 +17,7 @@ Merging release-hardening code never grants permission to publish. A tagged PyPI
 Run the focused release-surface tests and then the full repository suite:
 
 ```powershell
+python tools/check_extension_js_syntax.py
 python -m pytest tests/test_release_hardening_pr8_17.py tests/test_release_surface_pr9_4.py -q
 python -m pytest -q
 ```
@@ -52,8 +53,10 @@ The candidate gate validates:
 - wheel `Name` / `Version` metadata;
 - `cwa`, `chatgpt-web-adapter`, and native-host console entry points;
 - frozen product-runtime, transport, capability, provenance, observation and public-surface modules required by the 0.3 SDK;
-- all packaged browser-extension `.json` / `.js` files from the source package-data set;
-- required sdist source/package files, including root `CHANGELOG.md`.
+- all packaged browser-extension assets from the source package-data set;
+- packaged WKWebView helper resources (`WKChatGPTAuthority.m`, `Info.plist`, `minimal_security_shell.js`) in both wheel and sdist;
+- required sdist source/package files, including root `CHANGELOG.md`;
+- artifact hygiene: no experiment/cache/temp debris, local checkout paths, or removed WK broker runtime may ship in production package contents.
 
 This candidate gate does not require a Git tag.
 
@@ -80,10 +83,11 @@ The smoke installs the wheel through `pip --no-deps --force-reinstall` and verif
 - all three console scripts are installed with the frozen targets;
 - `cwa --help` and the stable command help surfaces execute successfully;
 - the installed browser-extension directory contains the required package data;
+- the installed `wkwebview_helper/` directory contains the Objective-C source, plist and minimal security shell required to build the short-lived macOS helper;
 - `cwa doctor` can diagnose a deliberately unconfigured/missing-auth environment as structured unavailable (`exit 1`) rather than crashing;
 - static installed-package doctor checks remain `PASS`.
 
-CI runs this installed-wheel smoke on Linux and Windows with Python 3.10 and 3.14 after the full Python 3.10-3.14 source-test matrix on both operating systems.
+CI runs this installed-wheel smoke on Linux and Windows with Python 3.10 and 3.14 after the full Python 3.10-3.14 source-test matrix on both operating systems. A separate blocking `macos-latest` WK job validates packaged JavaScript, compiles the native helper with `-Wall -Wextra -Werror`, runs the targeted WK/release tests, builds the distributions, applies the release gate, and installs the exact wheel to build the packaged WK helper from `site-packages`.
 
 ## 5. Live product verification
 
@@ -108,7 +112,7 @@ no automatic ambiguous-write retry            PASS
 fallback transport                            NONE
 ```
 
-Capability declarations must remain narrower than the evidence. In particular, `tools_connectors` remains `UNKNOWN`, and `browserless-request` remains `EXPERIMENTAL`.
+Capability declarations must remain narrower than the evidence. In particular, `tools_connectors` remains `UNKNOWN`, and `browserless-request` remains `EXPERIMENTAL`. For the macOS WKWebView promotion candidate, the complete public capability-state map must match the Chrome Native production backend; `files` and `multimodal_continuation` are included in that parity gate rather than inferred from generic attachment support. An explicitly selected WK backend must use the minimal-security/lightweight path without feature-enable flags; `CWA_WK_FORCE_LEGACY=1` is the only supported emergency override and must retain the full-page/direct-WK fallback path.
 
 ## 6. Version and changelog finalization
 
@@ -123,12 +127,12 @@ Before creating `vX.Y.Z`:
 
 3. The GitHub release tag must be exactly `vX.Y.Z` (the checker also accepts a raw `X.Y.Z` input for local verification).
 
-Validate the strict tagged contract locally before publishing. For CWA 0.3.0:
+Validate the strict tagged contract locally before publishing. For the staged CWA 0.3.1 candidate:
 
 ```powershell
 python tools/release_gate.py `
   --dist-dir dist `
-  --tag v0.3.0 `
+  --tag v0.3.1 `
   --json
 ```
 
@@ -150,10 +154,12 @@ Before tagging:
 
 PyPI publishing is triggered only by a published GitHub Release and uses Trusted Publishing.
 
-The publish workflow rebuilds the distributions and reruns, in order:
+The publish workflow first requires a tagged macOS WK verification job, then the publishing job rebuilds the distributions and reruns the generic release gates. The pre-upload order is:
 
 ```text
-python -m build
+tagged macOS WK verification (JS + strict native compile + WK/release tests)
+tagged macOS build + twine check + strict tag gate + installed-wheel smoke
+Ubuntu publish build
 python -m twine check dist/*
 strict tagged release gate
 installed exact-wheel smoke with release tag

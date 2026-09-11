@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -12,13 +13,16 @@ import time
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from .exceptions import RequestError
 
 _HELPER_DIRNAME = "wkwebview-authority"
 _RESULT_PREFIX = "WK_RESULT "
 _EVENT_PREFIX = "WK_EVENT "
+
+_ObserverResult = TypeVar("_ObserverResult")
+_MINIMUM_MACOS = (12, 0)
 
 
 @dataclass
@@ -72,10 +76,27 @@ class WKWebViewHelperRuntime:
         digest.update(minimal_shell.read_bytes())
         return digest.hexdigest()
 
+    @staticmethod
+    def macos_version() -> tuple[int, int] | None:
+        raw = platform.mac_ver()[0]
+        try:
+            parts = tuple(int(part) for part in raw.split(".")[:2])
+        except ValueError:
+            return None
+        if len(parts) < 2:
+            return None
+        return parts[0], parts[1]
+
     def ensure_helper(self) -> Path:
         if sys.platform != "darwin":
             raise RequestError(
                 "WKWEBVIEW_AUTHORITY_UNAVAILABLE: macOS is required",
+                request_stage="wkwebview_authority_build",
+            )
+        macos_version = self.macos_version()
+        if macos_version is None or macos_version < _MINIMUM_MACOS:
+            raise RequestError(
+                "WKWEBVIEW_AUTHORITY_UNAVAILABLE: macOS 12+ is required",
                 request_stage="wkwebview_authority_build",
             )
         source, plist, minimal_shell = self.source_paths()
@@ -219,7 +240,9 @@ class WKWebViewHelperRuntime:
                 payload = candidate
                 break
         if payload is None:
-            detail = (completed.stderr or completed.stdout or "no helper result").strip()
+            detail = (
+                completed.stderr or completed.stdout or "no helper result"
+            ).strip()
             raise RequestError(
                 f"WKWEBVIEW_AUTHORITY_NO_RESULT: {detail[-2000:]}",
                 request_stage="wkwebview_authority_turn",
@@ -314,12 +337,19 @@ class WKWebViewHelperRuntime:
                         try:
                             on_text_event(event)
                         except Exception:
+                            # Consumer callbacks are observational; they must not abort
+                            # or corrupt the browser-owned transport lifecycle.
                             pass
                         continue
-                    if event_type == "write_identity_resolved" and on_lifecycle_event is not None:
+                    if (
+                        event_type == "write_identity_resolved"
+                        and on_lifecycle_event is not None
+                    ):
                         try:
                             on_lifecycle_event(event)
                         except Exception:
+                            # Lifecycle callbacks are also observational; transport
+                            # completion/finality must not depend on consumer code.
                             pass
                     continue
                 if not line.startswith(_RESULT_PREFIX):
@@ -335,7 +365,7 @@ class WKWebViewHelperRuntime:
             if process.poll() is None:
                 self.terminate_process(process)
 
-        resume_value = ""
+        private_handoff = ""
         if resume_read_fd is not None:
             try:
                 chunks: list[bytes] = []
@@ -344,20 +374,36 @@ class WKWebViewHelperRuntime:
                     if not chunk:
                         break
                     chunks.append(chunk)
-                resume_value = b"".join(chunks).decode("utf-8").strip()
+                private_handoff = b"".join(chunks).decode("utf-8").strip()
             except (OSError, UnicodeDecodeError):
-                resume_value = ""
+                private_handoff = ""
             finally:
                 os.close(resume_read_fd)
-        if payload is not None and resume_value:
-            payload["stream_resume_value"] = resume_value
+        if payload is not None and private_handoff:
+            try:
+                handoff_payload = json.loads(private_handoff)
+            except json.JSONDecodeError:
+                handoff_payload = None
+            if isinstance(handoff_payload, dict):
+                resume_value = handoff_payload.get("r")
+                stop_conduit_token = handoff_payload.get("c")
+                turn_trace_id = handoff_payload.get("t")
+                if isinstance(resume_value, str) and resume_value:
+                    payload["stream_resume_value"] = resume_value
+                if isinstance(stop_conduit_token, str) and stop_conduit_token:
+                    payload["_cwa_stop_conduit_token"] = stop_conduit_token
+                if isinstance(turn_trace_id, str) and turn_trace_id:
+                    payload["_cwa_stop_turn_trace_id"] = turn_trace_id
+            else:
+                # Backward-compatible private handoff for an already-built helper.
+                payload["stream_resume_value"] = private_handoff
 
         if payload is None:
             detail = "no helper result"
             if process.stderr is not None:
                 try:
                     stderr = process.stderr.read().strip()
-                except Exception:
+                except (OSError, ValueError):
                     stderr = ""
                 if stderr:
                     detail = stderr
@@ -373,6 +419,80 @@ class WKWebViewHelperRuntime:
                 request_stage="wkwebview_authority_turn",
             )
         return payload
+
+    def run_event_observer(
+        self,
+        invocation: list[str] | WKHelperInvocation,
+        *,
+        timeout: float,
+        on_event: Callable[[dict[str, Any]], _ObserverResult | None],
+        on_tick: Callable[[], _ObserverResult | None] | None = None,
+        request_stage: str,
+        launch_error_prefix: str,
+    ) -> _ObserverResult | None:
+        """Run a helper that emits ``WK_EVENT`` envelopes until a callback resolves it."""
+
+        if not callable(on_event):
+            raise TypeError("on_event must be callable")
+        if on_tick is not None and not callable(on_tick):
+            raise TypeError("on_tick must be callable")
+
+        env = os.environ.copy()
+        env.setdefault("NSUnbufferedIO", "YES")
+        command, request_input = self.subprocess_input(invocation)
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE if request_input is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+        except OSError as error:
+            raise RequestError(
+                f"{launch_error_prefix}: {error}",
+                request_stage=request_stage,
+            ) from error
+
+        if request_input is not None:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(request_input)
+                process.stdin.close()
+            except OSError:
+                pass
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        try:
+            assert process.stdout is not None
+            while time.monotonic() < deadline:
+                if on_tick is not None:
+                    resolved = on_tick()
+                    if resolved is not None:
+                        return resolved
+
+                line = process.stdout.readline()
+                if not line:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                    continue
+                if not line.startswith(_EVENT_PREFIX):
+                    continue
+                try:
+                    event = json.loads(line[len(_EVENT_PREFIX) :])
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                resolved = on_event(event)
+                if resolved is not None:
+                    return resolved
+        finally:
+            self.terminate_process(process)
+        return None
 
     @staticmethod
     def terminate_process(process: subprocess.Popen[str]) -> None:

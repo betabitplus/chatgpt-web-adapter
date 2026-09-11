@@ -5,9 +5,11 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+import chatgpt_web_adapter.browser_authority_backend as browser_backend
 from chatgpt_web_adapter.browser_authority_backend import (
     CHROME_NATIVE_BROWSER_AUTHORITY_BACKEND,
     WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
@@ -21,9 +23,11 @@ from chatgpt_web_adapter.product_capabilities import (
 )
 from chatgpt_web_adapter.product_runtime import assemble_product_runtime
 from chatgpt_web_adapter.wkwebview_canonical import (
-    WKWEBVIEW_CONTEXT_CANONICAL_READ_PLANE,
+    WKWEBVIEW_CANONICAL_READ_PLANE,
+    WKCanonicalState,
     WKWebViewCanonicalClient,
 )
+from chatgpt_web_adapter.wkwebview_helper_runtime import WKWebViewHelperRuntime
 from chatgpt_web_adapter.wkwebview_provider import WKWebViewTurnProvider
 
 
@@ -94,6 +98,64 @@ def test_browser_authority_backend_selection_is_closed() -> None:
         normalize_browser_authority_backend("webkit-ish")
 
 
+@pytest.mark.parametrize(
+    ("platform_name", "macos_version", "expected"),
+    [
+        ("darwin", (12, 0), WKWEBVIEW_BROWSER_AUTHORITY_BACKEND),
+        ("darwin", (15, 6), WKWEBVIEW_BROWSER_AUTHORITY_BACKEND),
+        ("darwin", (11, 7), CHROME_NATIVE_BROWSER_AUTHORITY_BACKEND),
+        ("darwin", None, CHROME_NATIVE_BROWSER_AUTHORITY_BACKEND),
+        ("linux", None, CHROME_NATIVE_BROWSER_AUTHORITY_BACKEND),
+        ("win32", None, CHROME_NATIVE_BROWSER_AUTHORITY_BACKEND),
+    ],
+)
+def test_platform_default_browser_authority_backend_is_safe(
+    platform_name: str,
+    macos_version: tuple[int, int] | None,
+    expected: str,
+) -> None:
+    assert (
+        browser_backend._select_default_browser_authority_backend(
+            platform_name=platform_name,
+            macos_version=macos_version,
+        )
+        == expected
+    )
+
+
+def test_runtime_uses_resolved_default_browser_authority_backend(monkeypatch) -> None:
+    monkeypatch.setattr(
+        browser_backend,
+        "DEFAULT_BROWSER_AUTHORITY_BACKEND",
+        WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
+    )
+
+    runtime = assemble_product_runtime(client=_Client())
+
+    assert isinstance(runtime.write_transport.provider, WKWebViewTurnProvider)
+    assert runtime.governance()["browser_authority_backend"] == "wkwebview"
+    assert (
+        runtime.governance()["browser_authority_effective_runtime_default_policy"]
+        == "TURN_SCOPED"
+    )
+
+
+def test_explicit_chrome_native_overrides_promoted_default(monkeypatch) -> None:
+    monkeypatch.setattr(
+        browser_backend,
+        "DEFAULT_BROWSER_AUTHORITY_BACKEND",
+        WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
+    )
+
+    runtime = assemble_product_runtime(
+        client=_Client(),
+        browser_authority_backend="chrome-native",
+    )
+
+    assert not isinstance(runtime.write_transport.provider, WKWebViewTurnProvider)
+    assert runtime.governance()["browser_authority_backend"] == "chrome-native"
+
+
 def test_runtime_assembles_wkwebview_behind_browser_owned_boundary() -> None:
     runtime = assemble_product_runtime(
         client=_Client(),
@@ -103,22 +165,23 @@ def test_runtime_assembles_wkwebview_behind_browser_owned_boundary() -> None:
 
     assert isinstance(runtime.write_transport.provider, WKWebViewTurnProvider)
     assert isinstance(runtime.canonical, WKWebViewCanonicalClient)
-    assert runtime.canonical.canonical_read_plane == WKWEBVIEW_CONTEXT_CANONICAL_READ_PLANE
+    assert runtime.canonical.canonical_read_plane == WKWEBVIEW_CANONICAL_READ_PLANE
     governance = runtime.governance()
     assert governance["browser_authority_backend"] == "wkwebview"
-    assert governance["browser_authority_effective_runtime_default_policy"] == "TURN_SCOPED"
-    assert governance["model_slug_product_runtime_selection_supported"] is False
+    assert (
+        governance["browser_authority_effective_runtime_default_policy"]
+        == "TURN_SCOPED"
+    )
+    assert governance["model_slug_product_runtime_selection_supported"] is True
     assert governance["media_product_runtime_supported"] is True
     assert governance["media_semantic_default_model_profile_supported"] is True
-    assert governance["temporary_chat_product_runtime_selection_supported"] is False
+    assert governance["temporary_chat_product_runtime_selection_supported"] is True
     assert runtime.capabilities().state(IMAGES) is CapabilityState.AVAILABLE
-    assert runtime.capabilities().state(TEMPORARY_CHAT) is CapabilityState.UNIMPLEMENTED
-    assert governance["streaming_source"] == "WKWEBVIEW_PASSIVE_SSE"
+    assert runtime.capabilities().state(TEMPORARY_CHAT) is CapabilityState.AVAILABLE
+    assert governance["streaming_source"] == "WKWEBVIEW_RESUME_FENCED_PRODUCT_STREAM"
     assert governance["streaming_canonical_finality"] == (
-        WKWEBVIEW_CONTEXT_CANONICAL_READ_PLANE
+        WKWEBVIEW_CANONICAL_READ_PLANE
     )
-    with pytest.raises(ValueError, match="model selection is unavailable"):
-        runtime.send_text("hello", model="gpt-5-6")
 
 
 def test_runtime_backend_selection_rejects_conflicting_low_level_injection() -> None:
@@ -182,7 +245,30 @@ def test_wkwebview_continuation_command_fences_canonical_parent(monkeypatch) -> 
     assert "conversation-1" not in _invocation_argv(command)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="anonymous helper FD handoff is POSIX-only")
+def test_wkwebview_stop_context_stays_in_private_request_envelope(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+
+    invocation = provider._helper_command(
+        conversation_id="conversation-private",
+        text=None,
+        timeout=12,
+        stop_only=True,
+        stop_context=("conduit-test", "trace-test"),
+    )
+
+    request = _invocation_request(invocation)
+    argv = _invocation_argv(invocation)
+    assert request["stop_context_conduit"] == "conduit-test"
+    assert request["stop_context_trace"] == "trace-test"
+    assert "conduit-test" not in argv
+    assert "trace-test" not in argv
+    assert "conversation-private" not in argv
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="anonymous helper FD handoff is POSIX-only"
+)
 def test_wkwebview_helper_runner_uses_stdin_and_anonymous_resume_fd(
     monkeypatch, tmp_path
 ) -> None:
@@ -196,7 +282,10 @@ import sys
 request = json.load(sys.stdin)
 fd_index = sys.argv.index("--resume-handoff-fd") + 1
 fd = int(sys.argv[fd_index])
-os.write(fd, b"resume-secret")
+os.write(
+    fd,
+    json.dumps({"v": 1, "r": "resume-test", "c": "conduit-test", "t": "trace-test"}).encode(),
+)
 os.close(fd)
 print("WK_RESULT " + json.dumps({
     "ok": True,
@@ -228,7 +317,9 @@ print("WK_RESULT " + json.dumps({
     assert payload["request_url"].endswith("/c/conversation-private")
     assert payload["argv_contains_prompt"] is False
     assert payload["argv_contains_url"] is False
-    assert payload["stream_resume_value"] == "resume-secret"
+    assert payload["stream_resume_value"] == "resume-test"
+    assert payload["_cwa_stop_conduit_token"] == "conduit-test"
+    assert payload["_cwa_stop_turn_trace_id"] == "trace-test"
 
 
 def test_wkwebview_canonical_read_caches_current_node(monkeypatch) -> None:
@@ -250,7 +341,7 @@ def test_wkwebview_canonical_read_caches_current_node(monkeypatch) -> None:
 
 def test_wkwebview_canonical_read_prefers_curl_second_leg(monkeypatch) -> None:
     provider = WKWebViewTurnProvider()
-    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
     calls: list[tuple[str, float]] = []
 
     def fake_curl_read(conversation_id: str, *, timeout: float):
@@ -260,7 +351,9 @@ def test_wkwebview_canonical_read_prefers_curl_second_leg(monkeypatch) -> None:
     monkeypatch.setattr(provider, "_read_conversation_payload_via_curl", fake_curl_read)
 
     def fail_if_wk_helper_runs():
-        raise AssertionError("canonical pre-read should not launch WK when curl succeeds")
+        raise AssertionError(
+            "canonical pre-read should not launch WK when curl succeeds"
+        )
 
     monkeypatch.setattr(provider, "_ensure_helper", fail_if_wk_helper_runs)
 
@@ -269,13 +362,14 @@ def test_wkwebview_canonical_read_prefers_curl_second_leg(monkeypatch) -> None:
     assert payload["current_node"] == "node-curl"
     assert calls == [("conversation-curl", 7.0)]
     assert provider._cached_current_node("conversation-curl") == "node-curl"
+    assert provider._canonical_read_observation() == ("curl_cffi", None)
 
 
 def test_wkwebview_canonical_read_falls_back_to_helper_when_curl_unavailable(
     monkeypatch,
 ) -> None:
     provider = WKWebViewTurnProvider()
-    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
     monkeypatch.setattr(
         provider,
         "_read_conversation_payload_via_curl",
@@ -288,9 +382,7 @@ def test_wkwebview_canonical_read_falls_back_to_helper_when_curl_unavailable(
     def fake_run(command, *, timeout):
         commands.append(_invocation_argv(command))
         requests.append(_invocation_request(command))
-        return _helper_payload(
-            {"current_node": "node-wk", "mapping": {"node-wk": {}}}
-        )
+        return _helper_payload({"current_node": "node-wk", "mapping": {"node-wk": {}}})
 
     monkeypatch.setattr(provider, "_run_helper", fake_run)
 
@@ -299,6 +391,51 @@ def test_wkwebview_canonical_read_falls_back_to_helper_when_curl_unavailable(
     assert payload["current_node"] == "node-wk"
     assert requests[0]["canonical_conversation"] == "conversation-fallback"
     assert "conversation-fallback" not in commands[0]
+    assert provider._canonical_read_observation() == ("wkwebview", None)
+
+
+def test_wkwebview_canonical_fallback_records_reason(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+
+    class FailingLightweightTransport:
+        def read_canonical(self, conversation_id: str, *, timeout: float):
+            return None
+
+        def take_canonical_fallback_reason(self):
+            return "WKWEBVIEW_CURL_CANONICAL_HTTP:503"
+
+    provider._lightweight_transport = FailingLightweightTransport()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    monkeypatch.setattr(
+        provider,
+        "_run_helper",
+        lambda command, *, timeout: _helper_payload(
+            {"current_node": "node-wk", "mapping": {"node-wk": {}}}
+        ),
+    )
+
+    provider.read_conversation_payload("conversation-fallback", timeout=5)
+
+    assert provider._canonical_read_observation() == (
+        "wkwebview",
+        "WKWEBVIEW_CURL_CANONICAL_HTTP:503",
+    )
+
+
+def test_wkwebview_lightweight_path_is_default_with_explicit_legacy_escape_hatch(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    assert provider._lightweight_path_enabled() is True
+
+    for value in ("1", "true", "yes", "on", "TRUE"):
+        monkeypatch.setenv("CWA_WK_FORCE_LEGACY", value)
+        assert provider._lightweight_path_enabled() is False
+
+    monkeypatch.setenv("CWA_WK_FORCE_LEGACY", "0")
+    assert provider._lightweight_path_enabled() is True
 
 
 def test_wkwebview_declares_revision_safe_streaming_capability() -> None:
@@ -309,14 +446,15 @@ def test_wkwebview_declares_revision_safe_streaming_capability() -> None:
     assert callable(provider.send_text_with_stale_ui_recovery_streaming)
 
 
-def test_wkwebview_streaming_detaches_write_page_and_resumes_in_lightweight_context(
-    monkeypatch,
-) -> None:
+def test_wkwebview_force_legacy_streaming_uses_direct_wk_resume(monkeypatch) -> None:
     provider = WKWebViewTurnProvider()
+    monkeypatch.setenv("CWA_WK_FORCE_LEGACY", "1")
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
 
     def fail_if_duplicate_commit_check_runs(**kwargs):
-        raise AssertionError("helper canonical commit proof must avoid duplicate provider polling")
+        raise AssertionError(
+            "helper canonical commit proof must avoid duplicate provider polling"
+        )
 
     monkeypatch.setattr(
         provider,
@@ -408,21 +546,28 @@ def test_wkwebview_streaming_detaches_write_page_and_resumes_in_lightweight_cont
     assert [event["delta"] for event in events] == ["hello ", "world"]
     assert result.conversation_id == "conversation-1"
     assert result.passive_observer_armed is False
+    assert result.phase_a_transport == "wkwebview_full_page"
+    assert result.phase_b_transport == "wkwebview_direct_resume"
     first_command, first_request = calls[0]
     assert first_request["prompt"] == "hello"
     assert "hello" not in first_command
-    assert "--stream-probe-until-resume-token" in first_command
-    assert "--stream-probe-until-end" not in first_command
+    assert "--observe-stream-until-resume-token" in first_command
+    assert "--observe-stream-until-end" not in first_command
     second_command, second_request = calls[1]
     assert second_request["resume_value"] == "resume-secret"
     assert second_request["resume_offset"] == 0
     assert "--resume-value" not in second_command
 
     def fail_if_helper_runs(*args, **kwargs):
-        raise AssertionError("cached final canonical payload must avoid another helper read")
+        raise AssertionError(
+            "cached final canonical payload must avoid another helper read"
+        )
 
     monkeypatch.setattr(provider, "_run_helper", fail_if_helper_runs)
-    assert provider.read_conversation_payload("conversation-1", timeout=5) == final_canonical
+    assert (
+        provider.read_conversation_payload("conversation-1", timeout=5)
+        == final_canonical
+    )
     assert provider._cached_current_node("conversation-1") == "node-final"
 
 
@@ -474,17 +619,23 @@ def test_wkwebview_curl_ws_finality_rejects_stale_previous_turn() -> None:
         },
     }
 
-    assert provider._canonical_payload_is_final(previous) is True
-    assert provider._canonical_payload_matches_write(
-        previous,
-        text="same prompt",
-        baseline_current_node="assistant-old",
-    ) is False
-    assert provider._canonical_payload_matches_write(
-        current,
-        text="same prompt",
-        baseline_current_node="assistant-old",
-    ) is True
+    assert WKCanonicalState.payload_is_final(previous) is True
+    assert (
+        provider._canonical_payload_matches_write(
+            previous,
+            text="same prompt",
+            baseline_current_node="assistant-old",
+        )
+        is False
+    )
+    assert (
+        provider._canonical_payload_matches_write(
+            current,
+            text="same prompt",
+            baseline_current_node="assistant-old",
+        )
+        is True
+    )
 
 
 def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonical(
@@ -494,7 +645,9 @@ def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonic
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
 
     def fail_if_duplicate_commit_check_runs(**kwargs):
-        raise AssertionError("final canonical helper proof must avoid duplicate polling")
+        raise AssertionError(
+            "final canonical helper proof must avoid duplicate polling"
+        )
 
     monkeypatch.setattr(
         provider,
@@ -575,10 +728,15 @@ def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonic
     assert events[0]["text"] == "done"
 
     def fail_if_helper_runs(*args, **kwargs):
-        raise AssertionError("cached final canonical payload must avoid another helper read")
+        raise AssertionError(
+            "cached final canonical payload must avoid another helper read"
+        )
 
     monkeypatch.setattr(provider, "_run_helper", fail_if_helper_runs)
-    assert provider.read_conversation_payload("conversation-1", timeout=5) == final_canonical
+    assert (
+        provider.read_conversation_payload("conversation-1", timeout=5)
+        == final_canonical
+    )
 
 
 def test_wkwebview_stop_requires_canonical_client_stopped_proof(monkeypatch) -> None:
@@ -654,9 +812,13 @@ def test_wkwebview_stop_uses_worker_stopped_final_without_second_canonical_reade
     )
 
     def fail_if_fallback_reads(*args, **kwargs):
-        raise AssertionError("worker stopped-final proof must avoid fallback canonical reads")
+        raise AssertionError(
+            "worker stopped-final proof must avoid fallback canonical reads"
+        )
 
-    monkeypatch.setattr(provider, "_wait_for_canonical_stop_proof", fail_if_fallback_reads)
+    monkeypatch.setattr(
+        provider, "_wait_for_canonical_stop_proof", fail_if_fallback_reads
+    )
 
     result = provider.stop_generation("conversation-1", timeout=5)
 
@@ -665,13 +827,12 @@ def test_wkwebview_stop_uses_worker_stopped_final_without_second_canonical_reade
     assert provider.stop_requested_for("conversation-1") is True
 
 
-
 def test_wkwebview_minimal_security_shell_gate_is_narrow(monkeypatch) -> None:
     provider = WKWebViewTurnProvider()
-    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
-    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     commands: list[list[str]] = []
+    requests: list[dict[str, Any]] = []
 
     def fake_stream(
         command,
@@ -682,6 +843,7 @@ def test_wkwebview_minimal_security_shell_gate_is_narrow(monkeypatch) -> None:
         extra_env=None,
     ):
         commands.append(_invocation_argv(command))
+        requests.append(_invocation_request(command))
         return {
             "ok": True,
             "conversation_id": "conversation-1",
@@ -695,7 +857,7 @@ def test_wkwebview_minimal_security_shell_gate_is_narrow(monkeypatch) -> None:
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
-                "stream_resume_value": "resume-secret",
+            "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
@@ -715,18 +877,21 @@ def test_wkwebview_minimal_security_shell_gate_is_narrow(monkeypatch) -> None:
     provider.send_text_streaming("hello", on_text_event=lambda event: None)
     provider.send_text_streaming(
         "hello-model",
-        model_slug="custom-model",
+        model_slug="gpt-5-6-thinking",
         on_text_event=lambda event: None,
     )
 
     assert "--minimal-security-shell" in commands[0]
-    assert "--minimal-security-shell" not in commands[1]
+    assert "--minimal-security-shell" in commands[1]
+    assert "minimal_model_slug" not in requests[0]
+    assert requests[1]["minimal_model_slug"] == "gpt-5-6-thinking"
 
 
-def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(monkeypatch) -> None:
+def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(
+    monkeypatch,
+) -> None:
     provider = WKWebViewTurnProvider()
-    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
-    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     prewrite = {
         "current_node": "node-before",
@@ -741,7 +906,9 @@ def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(mon
             }
         },
     }
-    monkeypatch.setattr(provider, "read_conversation_payload", lambda *args, **kwargs: prewrite)
+    monkeypatch.setattr(
+        provider, "read_conversation_payload", lambda *args, **kwargs: prewrite
+    )
     commands: list[list[str]] = []
     requests: list[dict] = []
 
@@ -768,11 +935,13 @@ def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(mon
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
-                "stream_resume_value": "resume-secret",
+            "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
-        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="continued")
+        canonical = _final_canonical_for_prompt(
+            kwargs["text"], assistant_text="continued"
+        )
         return {
             "ok": True,
             "status": 200,
@@ -804,12 +973,214 @@ def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(mon
     assert "assistant-message-before" not in command
 
 
+def test_wkwebview_minimal_security_shell_terminal_continuation_skips_resume(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    prewrite = {
+        "current_node": "node-before",
+        "mapping": {
+            "node-before": {
+                "message": {
+                    "id": "assistant-message-before",
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["previous answer"]},
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(
+        provider, "read_conversation_payload", lambda *args, **kwargs: prewrite
+    )
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "write_commit_proof": "PHASE_A_TERMINAL",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": True,
+            "stream_terminal_observed": True,
+            "stream_resume_present": False,
+            "stream_resume_handoff_written": False,
+        }
+
+    def fail_resume(**kwargs):
+        raise AssertionError("terminal Phase A must not start a resume second leg")
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fail_resume)
+
+    with provider.require_profile("FAST"):
+        result = provider.send_text_streaming(
+            "continue",
+            conversation="conversation-1",
+            on_text_event=lambda event: None,
+        )
+
+    assert result.conversation_id == "conversation-1"
+    assert result.phase_a_transport == "wkwebview_minimal_security_shell"
+    assert result.phase_b_transport == "phase_one_terminal"
+    assert result.phase_b_fallback_reason is None
+
+
+def test_wkwebview_new_chat_recovers_identity_by_client_message_id(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    helper_calls = 0
+    identity_events: list[dict] = []
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        nonlocal helper_calls
+        helper_calls += 1
+        return {
+            "ok": True,
+            "identity_recovery_required": True,
+            "client_message_id": "client-message-1",
+            "conversation_id": "",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": False,
+            "canonical_committed": False,
+            "stream_terminal_observed": False,
+            "stream_resume_present": False,
+            "stream_resume_handoff_written": False,
+        }
+
+    canonical = _final_canonical_for_prompt("recover me", assistant_text="recovered")
+    canonical["mapping"]["user-final"]["message"]["id"] = "client-message-1"
+    provider._lightweight_transport = SimpleNamespace(
+        read_catalog=lambda *args, **kwargs: {
+            "items": [{"id": "conversation-recovered"}],
+            "total": 1,
+        }
+    )
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_via_curl",
+        lambda *args, **kwargs: canonical,
+    )
+
+    def fail_generic_recovery(*args, **kwargs):
+        raise AssertionError(
+            "identity recovery must not use generic/WK canonical fallback"
+        )
+
+    monkeypatch.setattr(provider, "read_catalog_payload", fail_generic_recovery)
+    monkeypatch.setattr(
+        provider, "_read_conversation_payload_uncached", fail_generic_recovery
+    )
+
+    def fail_resume(**kwargs):
+        raise AssertionError("canonical identity recovery must not start WS resume")
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fail_resume)
+
+    with provider.require_profile("FAST"):
+        result = provider.send_text_streaming(
+            "recover me",
+            on_text_event=lambda event: None,
+            on_write_identity=identity_events.append,
+        )
+
+    assert helper_calls == 1
+    assert result.conversation_id == "conversation-recovered"
+    assert result.phase_a_transport == "wkwebview_minimal_security_shell"
+    assert result.phase_b_transport == "canonical_message_id_recovery"
+    assert result.phase_b_fallback_reason is None
+    assert identity_events[-1]["conversation_id"] == "conversation-recovered"
+    cached = provider._canonical_state.take_final_payload("conversation-recovered")
+    assert cached == canonical
+
+
+def test_wkwebview_identity_recovery_curl_failure_fails_closed_without_wk_fallback(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        return {
+            "ok": True,
+            "identity_recovery_required": True,
+            "client_message_id": "client-message-timeout",
+            "conversation_id": "",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": False,
+            "canonical_committed": False,
+            "stream_terminal_observed": False,
+            "stream_resume_present": False,
+            "stream_resume_handoff_written": False,
+        }
+
+    provider._lightweight_transport = SimpleNamespace(
+        read_catalog=lambda *args, **kwargs: {
+            "items": [{"id": "conversation-unreadable"}],
+            "total": 1,
+        }
+    )
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_via_curl",
+        lambda *args, **kwargs: None,
+    )
+
+    def fail_generic_recovery(*args, **kwargs):
+        raise AssertionError("identity recovery must never invoke WK fallback")
+
+    monkeypatch.setattr(provider, "read_catalog_payload", fail_generic_recovery)
+    monkeypatch.setattr(
+        provider, "_read_conversation_payload_uncached", fail_generic_recovery
+    )
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+
+    with provider.require_profile("FAST"):
+        with pytest.raises(RequestError, match="WKWEBVIEW_IDENTITY_RECOVERY_TIMEOUT"):
+            provider.send_text_streaming(
+                "recover without curl",
+                timeout=0.1,
+                on_text_event=lambda event: None,
+            )
+
+
 def test_wkwebview_minimal_security_shell_continuation_preserves_canonical_selection(
     monkeypatch,
 ) -> None:
     provider = WKWebViewTurnProvider()
-    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
-    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     prewrite = {
         "current_node": "node-before",
@@ -825,7 +1196,9 @@ def test_wkwebview_minimal_security_shell_continuation_preserves_canonical_selec
             }
         },
     }
-    monkeypatch.setattr(provider, "read_conversation_payload", lambda *args, **kwargs: prewrite)
+    monkeypatch.setattr(
+        provider, "read_conversation_payload", lambda *args, **kwargs: prewrite
+    )
     commands: list[list[str]] = []
     requests: list[dict] = []
 
@@ -852,11 +1225,13 @@ def test_wkwebview_minimal_security_shell_continuation_preserves_canonical_selec
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
-                "stream_resume_value": "resume-secret",
+            "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
-        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="continued")
+        canonical = _final_canonical_for_prompt(
+            kwargs["text"], assistant_text="continued"
+        )
         return {
             "ok": True,
             "status": 200,
@@ -889,8 +1264,7 @@ def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
     monkeypatch, tmp_path
 ) -> None:
     provider = WKWebViewTurnProvider()
-    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
-    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     attachment = tmp_path / "red.png"
     attachment.write_bytes(b"fake-png")
@@ -937,11 +1311,13 @@ def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
-                "stream_resume_value": "resume-secret",
+            "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
-        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="image ok")
+        canonical = _final_canonical_for_prompt(
+            kwargs["text"], assistant_text="image ok"
+        )
         return {
             "ok": True,
             "status": 200,
@@ -978,19 +1354,18 @@ def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
     ]
 
 
-def test_wkwebview_minimal_security_attachment_upload_failure_falls_back_to_spa(
+def test_wkwebview_minimal_security_attachment_transport_failure_falls_back_to_spa(
     monkeypatch, tmp_path
 ) -> None:
     provider = WKWebViewTurnProvider()
-    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
-    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     attachment = tmp_path / "red.png"
     attachment.write_bytes(b"fake-png")
 
     class FailingSourceClient:
         def wk_transport_upload_media_files(self, media):
-            raise RuntimeError("upload unavailable")
+            raise OSError("upload transport unavailable")
 
     provider.build_canonical_client(FailingSourceClient())
     commands: list[list[str]] = []
@@ -1019,11 +1394,13 @@ def test_wkwebview_minimal_security_attachment_upload_failure_falls_back_to_spa(
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
-                "stream_resume_value": "resume-secret",
+            "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
-        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="image ok")
+        canonical = _final_canonical_for_prompt(
+            kwargs["text"], assistant_text="image ok"
+        )
         return {
             "ok": True,
             "status": 200,
@@ -1053,8 +1430,7 @@ def test_wkwebview_minimal_security_continuation_without_assistant_parent_falls_
     monkeypatch,
 ) -> None:
     provider = WKWebViewTurnProvider()
-    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
-    monkeypatch.setenv("CWA_WK_MINIMAL_SECURITY_SHELL", "1")
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     prewrite = {
         "current_node": "user-before",
@@ -1068,7 +1444,9 @@ def test_wkwebview_minimal_security_continuation_without_assistant_parent_falls_
             }
         },
     }
-    monkeypatch.setattr(provider, "read_conversation_payload", lambda *args, **kwargs: prewrite)
+    monkeypatch.setattr(
+        provider, "read_conversation_payload", lambda *args, **kwargs: prewrite
+    )
     commands: list[list[str]] = []
 
     def fake_stream(
@@ -1093,11 +1471,13 @@ def test_wkwebview_minimal_security_continuation_without_assistant_parent_falls_
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
-                "stream_resume_value": "resume-secret",
+            "stream_resume_value": "resume-secret",
         }
 
     def fake_resume(**kwargs):
-        canonical = _final_canonical_for_prompt(kwargs["text"], assistant_text="continued")
+        canonical = _final_canonical_for_prompt(
+            kwargs["text"], assistant_text="continued"
+        )
         return {
             "ok": True,
             "status": 200,
@@ -1124,7 +1504,7 @@ def test_wkwebview_minimal_security_continuation_without_assistant_parent_falls_
 
 def test_wkwebview_curl_ws_resume_runs_after_phase_one_stream_eof(monkeypatch) -> None:
     provider = WKWebViewTurnProvider()
-    monkeypatch.setenv("CWA_WK_CURL_WS_SECOND_LEG", "1")
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     final_canonical = _final_canonical_for_prompt("hello", assistant_text="hello world")
 
@@ -1152,7 +1532,7 @@ def test_wkwebview_curl_ws_resume_runs_after_phase_one_stream_eof(monkeypatch) -
             "stream_terminal_observed": False,
             "stream_resume_present": True,
             "stream_resume_handoff_written": True,
-                "stream_resume_value": "resume-secret",
+            "stream_resume_value": "resume-secret",
         }
 
     calls: list[dict] = []
@@ -1185,6 +1565,210 @@ def test_wkwebview_curl_ws_resume_runs_after_phase_one_stream_eof(monkeypatch) -
 
     assert result.conversation_id == "conversation-1"
     assert result.passive_observer_armed is False
+    assert result.canonical_read_transport is None
+    assert result.phase_a_transport == "wkwebview_minimal_security_shell"
+    assert isinstance(result.phase_a_gate_wait_ms, int)
+    assert isinstance(result.phase_a_elapsed_ms, int)
+    assert result.phase_b_transport == "curl_cffi_websocket"
+    assert result.phase_b_fallback_reason is None
+    assert isinstance(result.phase_b_elapsed_ms, int)
     assert [event["delta"] for event in events] == ["world"]
     assert len(calls) == 1
     assert calls[0]["conversation_id"] == "conversation-1"
+
+
+def test_wkwebview_curl_ws_transport_failure_arms_passive_observer(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+
+    def fake_stream(*args, **kwargs):
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "stream_terminal_observed": False,
+            "stream_resume_value": "resume-secret",
+        }
+
+    def fake_resume(**kwargs):
+        raise RequestError("ws unavailable", request_stage="transport")
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fake_resume)
+
+    result = provider.send_text_streaming("hello", on_text_event=lambda event: None)
+
+    assert result.passive_observer_armed is True
+    assert result.phase_b_transport == "passive_canonical_observer"
+    assert result.phase_b_fallback_reason == "transport"
+    assert isinstance(result.phase_b_elapsed_ms, int)
+
+
+def test_wkwebview_curl_ws_auth_failure_does_not_fallback(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+
+    def fake_stream(*args, **kwargs):
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "stream_terminal_observed": False,
+            "stream_resume_value": "resume-secret",
+        }
+
+    def fake_resume(**kwargs):
+        raise RequestError(
+            "WKWEBVIEW_CURL_WS_CANONICAL_HTTP:401",
+            request_stage="wkwebview_curl_ws_second_leg",
+            status_code=401,
+        )
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_second_leg", fake_resume)
+
+    with pytest.raises(RequestError, match="WKWEBVIEW_CURL_WS_CANONICAL_HTTP:401"):
+        provider.send_text_streaming("hello", on_text_event=lambda event: None)
+
+
+def test_minimal_security_shell_keeps_named_stage_boundaries() -> None:
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "chatgpt_web_adapter"
+        / "wkwebview_helper"
+        / "minimal_security_shell.js"
+    ).read_text(encoding="utf-8")
+
+    stages = (
+        "bootstrapProductResources",
+        "loadIntegrityRuntime",
+        "loadSession",
+        "loadModelCatalog",
+        "resolveModelSelection",
+        "acquireIntegrityBundle",
+        "prepareConversation",
+        "protectedWrite",
+    )
+    for stage_name in stages:
+        assert f"const {stage_name} =" in source
+
+    entrypoint = source.rsplit("  (async () => {", 1)[1]
+    assert "await fetch(" not in entrypoint
+    for invocation in (
+        "bootstrapProductResources()",
+        "loadIntegrityRuntime(integrityURL)",
+        "loadSession()",
+        "loadModelCatalog(accessToken)",
+        "resolveModelSelection(modelsPayload)",
+        "acquireIntegrityBundle(acquireIntegrity)",
+        "prepareConversation({",
+        "protectedWrite({",
+    ):
+        assert invocation in entrypoint
+
+
+def test_wkwebview_status_does_not_hide_programming_errors(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+
+    def fail_helper():
+        raise ValueError("broken invariant")
+
+    monkeypatch.setattr(provider, "_ensure_helper", fail_helper)
+
+    with pytest.raises(ValueError, match="broken invariant"):
+        provider.status()
+
+
+def test_wkwebview_write_commit_does_not_hide_programming_errors(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+
+    def fail_read(*args, **kwargs):
+        raise ValueError("broken canonical parser")
+
+    monkeypatch.setattr(provider, "read_conversation_payload", fail_read)
+
+    with pytest.raises(ValueError, match="broken canonical parser"):
+        provider._wait_for_canonical_write_commit(
+            conversation_id="conversation-1",
+            text="hello",
+            baseline_current_node="node-before",
+            timeout=5,
+        )
+
+
+def test_wkwebview_observer_does_not_hide_malformed_canonical_payload(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+
+    def fake_observer(invocation, **kwargs):
+        return kwargs["on_event"]({"type": "canonical_payload", "status": 200})
+
+    monkeypatch.setattr(provider._helper_runtime, "run_event_observer", fake_observer)
+
+    with pytest.raises(RequestError, match="WKWEBVIEW_CANONICAL_OBSERVER_BODY_MISSING"):
+        provider.observe_turn(
+            conversation_id="conversation-1",
+            turn_exchange_id=None,
+            browser_authority_lease_id="lease-1",
+            timeout=5,
+        )
+
+
+def test_wkwebview_dependencies_are_owned_by_cwa_packaging() -> None:
+    root = Path(__file__).resolve().parents[1]
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "wk-curl =" not in pyproject
+    assert "wkwebview = [" not in pyproject
+    assert "\"curl-cffi==0.16.3; sys_platform == 'darwin'\"" in pyproject
+    assert "\"websockets==16.1.1; sys_platform == 'darwin'\"" in pyproject
+
+
+def test_wkwebview_helper_rejects_macos_before_12(monkeypatch, tmp_path) -> None:
+    runtime = WKWebViewHelperRuntime(tmp_path, build_timeout=1)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_helper_runtime.sys.platform", "darwin"
+    )
+    monkeypatch.setattr(runtime, "macos_version", lambda: (11, 7))
+
+    with pytest.raises(RequestError, match=r"macOS 12\+ is required"):
+        runtime.ensure_helper()
+
+
+def test_wkwebview_helper_rejects_unknown_macos_version(monkeypatch, tmp_path) -> None:
+    runtime = WKWebViewHelperRuntime(tmp_path, build_timeout=1)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_helper_runtime.sys.platform", "darwin"
+    )
+    monkeypatch.setattr(runtime, "macos_version", lambda: None)
+
+    with pytest.raises(RequestError, match=r"macOS 12\+ is required"):
+        runtime.ensure_helper()
+
+
+def test_wkwebview_architecture_docs_capture_production_boundaries() -> None:
+    root = Path(__file__).resolve().parents[1]
+    architecture = (root / "docs" / "architecture.md").read_text(encoding="utf-8")
+
+    for required in (
+        "WKWebView backend — macOS 12+ pre-release path",
+        "globally serialized short-lived WK protected write",
+        "RESUME_FENCE + browser-issued resume handoff",
+        "curl_cffi/WebSocket continuation stream",
+        "inherited anonymous FD/pipe",
+        "Authentication failures, malformed canonical/schema data",
+        "CWA_WK_FORCE_LEGACY=1",
+        "WKWEBVIEW_CANONICAL_READ",
+        "actual read transport is reported separately",
+        "Fallback reasons are normalized",
+    ):
+        assert required in architecture

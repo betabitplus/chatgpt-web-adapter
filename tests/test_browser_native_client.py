@@ -111,9 +111,7 @@ def _client(provider, *, status_value="completed"):
         def __init__(self) -> None:
             self.events = []
             self.status_values = (
-                list(status_value)
-                if isinstance(status_value, (list, tuple))
-                else None
+                list(status_value) if isinstance(status_value, (list, tuple)) else None
             )
 
         def _emit_event(self, callback, event_type, **payload):
@@ -198,6 +196,12 @@ def test_streaming_write_identity_is_emitted_before_write_completed() -> None:
                 tab_id=None,
                 tab_was_active=False,
                 elapsed_ms=100,
+                canonical_read_transport="curl_cffi",
+                phase_a_transport="wkwebview_minimal_security_shell",
+                phase_a_gate_wait_ms=12,
+                phase_a_elapsed_ms=88,
+                phase_b_transport="curl_cffi_websocket",
+                phase_b_elapsed_ms=144,
             )
 
     provider = IdentityProvider()
@@ -219,6 +223,13 @@ def test_streaming_write_identity_is_emitted_before_write_completed() -> None:
     identity_payload = client.events[identity_index][1]
     assert identity_payload["conversation_id"] == "conversation-early"
     assert identity_payload["status_code"] == 200
+    completed_payload = client.events[completed_index][1]
+    assert completed_payload["canonical_read_transport"] == "curl_cffi"
+    assert completed_payload["phase_a_transport"] == "wkwebview_minimal_security_shell"
+    assert completed_payload["phase_a_gate_wait_ms"] == 12
+    assert completed_payload["phase_a_elapsed_ms"] == 88
+    assert completed_payload["phase_b_transport"] == "curl_cffi_websocket"
+    assert completed_payload["phase_b_elapsed_ms"] == 144
 
 
 def test_completed_continuation_authorizes_bounded_stale_ui_recovery() -> None:
@@ -248,7 +259,9 @@ def test_completed_continuation_authorizes_bounded_stale_ui_recovery() -> None:
     assert write_events[0]["runtime_reload_ms"] == 321
 
 
-def test_continuation_prewrite_reuses_one_canonical_payload_for_baseline_and_status() -> None:
+def test_continuation_prewrite_reuses_one_canonical_payload_for_baseline_and_status() -> (
+    None
+):
     provider = RecoveryFakeProvider()
 
     class Client:
@@ -433,7 +446,9 @@ def test_fresh_internal_commit_evidence_skips_duplicate_recovery_status_read() -
             raise AssertionError("fresh supplied commit payload must be reused")
 
         def get_status(self, _conversation):
-            raise AssertionError("fresh internal commit evidence must skip status recheck")
+            raise AssertionError(
+                "fresh internal commit evidence must skip status recheck"
+            )
 
         def _emit_event(self, callback, event_type, **payload):
             return None
@@ -467,7 +482,10 @@ def test_progress_message_cannot_finalize_long_turn(monkeypatch) -> None:
                     "id": "progress-1",
                     "author": {"role": "assistant"},
                     "recipient": "all",
-                    "content": {"content_type": "text", "parts": ["Core foundation уже не теория..."]},
+                    "content": {
+                        "content_type": "text",
+                        "parts": ["Core foundation уже не теория..."],
+                    },
                     "metadata": {
                         "is_thinking_preamble_message": True,
                         "message_status": "finished_successfully",
@@ -484,7 +502,9 @@ def test_progress_message_cannot_finalize_long_turn(monkeypatch) -> None:
 
         def _get_conversation_payload(self, conversation_id):
             self.calls += 1
-            return progress_payload if self.calls == 1 else _completed_canonical_payload()
+            return (
+                progress_payload if self.calls == 1 else _completed_canonical_payload()
+            )
 
     monkeypatch.setattr(
         "chatgpt_web_adapter.browser_native_client.time.sleep",
@@ -589,7 +609,9 @@ def test_retryable_canonical_429_backs_off_and_recovers(monkeypatch) -> None:
     assert message.text == "done"
 
 
-def test_retryable_browser_context_timeout_recovers_without_replaying_write(monkeypatch) -> None:
+def test_retryable_browser_context_timeout_recovers_without_replaying_write(
+    monkeypatch,
+) -> None:
     class Client:
         def __init__(self) -> None:
             self.calls = 0
@@ -674,7 +696,9 @@ def test_successful_canonical_polling_has_fifteen_second_floor(monkeypatch) -> N
     assert sleeps == [15.0]
 
 
-def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitive_fields() -> None:
+def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitive_fields() -> (
+    None
+):
     sensitive_key = "access_" + "token"
     sensitive_value = "hide-" + "this-value"
 
@@ -713,7 +737,14 @@ def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitiv
                 "recipient": "api_tool.call_tool",
                 "content": {
                     "content_type": "code",
-                    "text": json.dumps({"args": {"path": "/tmp/readme", sensitive_key: sensitive_value}}),
+                    "text": json.dumps(
+                        {
+                            "args": {
+                                "path": "/tmp/readme",
+                                sensitive_key: sensitive_value,
+                            }
+                        }
+                    ),
                 },
                 "metadata": {"tool_invoking_message": "Reading README…"},
                 "end_turn": False,
@@ -737,7 +768,10 @@ def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitiv
                 "id": "m-thoughts",
                 "author": {"role": "assistant"},
                 "recipient": "all",
-                "content": {"content_type": "thoughts", "parts": ["private raw reasoning"]},
+                "content": {
+                    "content_type": "thoughts",
+                    "parts": ["private raw reasoning"],
+                },
                 "metadata": {"reasoning_title": "Checking context"},
                 "end_turn": False,
             },
@@ -749,7 +783,10 @@ def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitiv
                 "id": "m-recap",
                 "author": {"role": "assistant"},
                 "recipient": "all",
-                "content": {"content_type": "reasoning_recap", "parts": ["Worked for 12s"]},
+                "content": {
+                    "content_type": "reasoning_recap",
+                    "parts": ["Worked for 12s"],
+                },
                 "end_turn": False,
             },
         ),
@@ -765,7 +802,11 @@ def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitiv
             },
         ),
     }
-    payload = {"conversation_id": "conversation-1", "current_node": "final", "mapping": mapping}
+    payload = {
+        "conversation_id": "conversation-1",
+        "current_node": "final",
+        "mapping": mapping,
+    }
     emitted = set()
 
     events = _canonical_intermediate_events(
@@ -794,7 +835,9 @@ def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitiv
     assert "m-final" not in emitted
 
 
-def test_unlabeled_tool_calls_get_concise_context_and_plain_thoughts_are_suppressed() -> None:
+def test_unlabeled_tool_calls_get_concise_context_and_plain_thoughts_are_suppressed() -> (
+    None
+):
     payload = {
         "conversation_id": "conversation-1",
         "current_node": "thoughts",
@@ -828,7 +871,10 @@ def test_unlabeled_tool_calls_get_concise_context_and_plain_thoughts_are_suppres
                     "id": "m-thoughts-plain",
                     "author": {"role": "assistant"},
                     "recipient": "all",
-                    "content": {"content_type": "thoughts", "parts": ["private raw reasoning"]},
+                    "content": {
+                        "content_type": "thoughts",
+                        "parts": ["private raw reasoning"],
+                    },
                     "metadata": {},
                     "end_turn": False,
                 },
@@ -931,7 +977,9 @@ def test_current_canonical_progress_waits_for_revision_completion() -> None:
     assert "m-progress" in emitted
 
 
-def test_passive_observer_waits_without_canonical_polling_then_reconciles_once() -> None:
+def test_passive_observer_waits_without_canonical_polling_then_reconciles_once() -> (
+    None
+):
     class Provider(FakeProvider):
         def __init__(self) -> None:
             super().__init__()
@@ -996,7 +1044,9 @@ def test_passive_observer_waits_without_canonical_polling_then_reconciles_once()
                 callback({"type": event_type, **payload})
 
         def _get_conversation_payload(self, conversation_id):
-            assert provider.observe_calls, "canonical read happened before passive terminal"
+            assert provider.observe_calls, (
+                "canonical read happened before passive terminal"
+            )
             self.reads += 1
             return _completed_canonical_payload()
 
@@ -1079,16 +1129,24 @@ def test_passive_canonical_snapshots_feed_revision_safe_text_stream() -> None:
     )
 
     assert response.text == "done"
-    snapshots = [event for event in delivered if event.get("type") == "assistant_text_snapshot"]
-    deltas = [event for event in delivered if event.get("type") == "assistant_text_delta"]
+    snapshots = [
+        event for event in delivered if event.get("type") == "assistant_text_snapshot"
+    ]
+    deltas = [
+        event for event in delivered if event.get("type") == "assistant_text_delta"
+    ]
     assert snapshots and snapshots[0]["text"] == "do"
     assert deltas and deltas[0]["delta"] == "ne"
-    finalized = [event for event in delivered if event.get("type") == "canonical_text_finalized"][-1]
+    finalized = [
+        event for event in delivered if event.get("type") == "canonical_text_finalized"
+    ][-1]
     assert finalized["streamed_text_length"] == 4
     assert finalized["reconciliation"] == "EXACT_MATCH"
 
 
-def test_streaming_write_can_handoff_to_passive_canonical_text_without_restart() -> None:
+def test_streaming_write_can_handoff_to_passive_canonical_text_without_restart() -> (
+    None
+):
     partial = _completed_canonical_payload()
     partial["mapping"]["assistant-node"]["message"]["content"]["parts"] = ["done"]
     partial["mapping"]["assistant-node"]["message"]["metadata"] = {}
@@ -1166,7 +1224,11 @@ def test_streaming_write_can_handoff_to_passive_canonical_text_without_restart()
         event
         for event in delivered
         if event.get("type")
-        in {"assistant_text_snapshot", "assistant_text_delta", "assistant_text_revision"}
+        in {
+            "assistant_text_snapshot",
+            "assistant_text_delta",
+            "assistant_text_revision",
+        }
     ]
     assert [event["type"] for event in text_events] == [
         "assistant_text_snapshot",
@@ -1176,7 +1238,9 @@ def test_streaming_write_can_handoff_to_passive_canonical_text_without_restart()
     assert text_events[0]["text"] == "do"
     assert text_events[1]["sequence"] == 2
     assert text_events[1]["delta"] == "ne"
-    finalized = [event for event in delivered if event.get("type") == "canonical_text_finalized"][-1]
+    finalized = [
+        event for event in delivered if event.get("type") == "canonical_text_finalized"
+    ][-1]
     assert finalized["streamed_text_length"] == 4
     assert finalized["stream_delivery_incomplete"] is False
     assert finalized["reconciliation"] == "EXACT_MATCH"
@@ -1227,7 +1291,9 @@ def test_explicit_stop_signal_short_circuits_non_passive_canonical_wait() -> Non
     assert provider.stopped is False
 
 
-def test_stopped_passive_observer_accepts_unfinished_canonical_partial(monkeypatch) -> None:
+def test_stopped_passive_observer_accepts_unfinished_canonical_partial(
+    monkeypatch,
+) -> None:
     class Provider(FakeProvider):
         def __init__(self) -> None:
             super().__init__()
@@ -1317,12 +1383,18 @@ def test_stopped_passive_observer_accepts_unfinished_canonical_partial(monkeypat
     assert response.request.turn_exchange_id == "turn-stopped"
     assert client.reads == 1
     assert provider.stopped is False
-    readback = [event for event in client.events if event["type"] == "browser_native_readback_completed"][-1]
+    readback = [
+        event
+        for event in client.events
+        if event["type"] == "browser_native_readback_completed"
+    ][-1]
     assert readback["stopped_by_user"] is True
     assert readback["canonical_finality_proven"] is False
 
 
-def test_stopped_passive_observer_returns_empty_when_partial_is_not_materialized(monkeypatch) -> None:
+def test_stopped_passive_observer_returns_empty_when_partial_is_not_materialized(
+    monkeypatch,
+) -> None:
     class Provider(FakeProvider):
         def send_text(self, text, *, conversation=None, timeout=None):
             return BrowserNativeTurnResult(
@@ -1433,7 +1505,11 @@ def test_passive_observer_stream_end_without_terminal_returns_incomplete_after_b
     assert response.conversation.conversation_id == "conversation-1"
     assert response.conversation.finish_reason == "incomplete"
     assert observed_timeouts and observed_timeouts[0] <= 5.0
-    readback = [event for event in client.events if event["type"] == "browser_native_readback_completed"][-1]
+    readback = [
+        event
+        for event in client.events
+        if event["type"] == "browser_native_readback_completed"
+    ][-1]
     assert readback["canonical_finality_proven"] is False
     assert readback["incomplete_without_terminal"] is True
 
@@ -1483,12 +1559,18 @@ def test_passive_stream_end_without_terminal_accepts_late_canonical_final() -> N
 
     assert response.text == "done"
     assert response.conversation.finish_reason != "incomplete"
-    readback = [event for event in client.events if event["type"] == "browser_native_readback_completed"][-1]
+    readback = [
+        event
+        for event in client.events
+        if event["type"] == "browser_native_readback_completed"
+    ][-1]
     assert readback["canonical_finality_proven"] is True
     assert readback["incomplete_without_terminal"] is False
 
 
-def test_passive_observer_stream_start_failure_falls_back_to_bounded_canonical_read() -> None:
+def test_passive_observer_stream_start_failure_falls_back_to_bounded_canonical_read() -> (
+    None
+):
     class Provider(FakeProvider):
         def __init__(self) -> None:
             super().__init__()

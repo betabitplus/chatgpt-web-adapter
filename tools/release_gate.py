@@ -18,6 +18,8 @@ EXPECTED_ENTRY_POINTS = {
 }
 EXTENSION_PACKAGE_PATTERNS = ("*.json", "*.js", "*.html", "*.css", "*.png")
 EXTENSION_PACKAGE_SUFFIXES = (".json", ".js", ".html", ".css", ".png")
+WK_HELPER_PACKAGE_PATTERNS = ("*.m", "*.plist", "*.js")
+WK_HELPER_PACKAGE_SUFFIXES = (".m", ".plist", ".js")
 REQUIRED_WHEEL_FILES = {
     # Stable CLI / diagnostics baseline retained from CWA 0.2.
     "chatgpt_web_adapter/cli_v02.py",
@@ -49,6 +51,9 @@ REQUIRED_WHEEL_FILES = {
     "chatgpt_web_adapter/browser_native_extension/icon32.png",
     "chatgpt_web_adapter/browser_native_extension/icon48.png",
     "chatgpt_web_adapter/browser_native_extension/icon128.png",
+    "chatgpt_web_adapter/wkwebview_helper/WKChatGPTAuthority.m",
+    "chatgpt_web_adapter/wkwebview_helper/Info.plist",
+    "chatgpt_web_adapter/wkwebview_helper/minimal_security_shell.js",
 }
 REQUIRED_SDIST_SUFFIXES = {
     "/pyproject.toml",
@@ -67,10 +72,34 @@ REQUIRED_SDIST_SUFFIXES = {
     "/src/chatgpt_web_adapter/browser_native_extension/popup.css",
     "/src/chatgpt_web_adapter/browser_native_extension/popup.js",
     "/src/chatgpt_web_adapter/browser_native_extension/icon128.png",
+    "/src/chatgpt_web_adapter/wkwebview_helper/WKChatGPTAuthority.m",
+    "/src/chatgpt_web_adapter/wkwebview_helper/Info.plist",
+    "/src/chatgpt_web_adapter/wkwebview_helper/minimal_security_shell.js",
 }
 _VERSION_RE = re.compile(r'^version\s*=\s*["\']([^"\']+)["\']\s*$', re.MULTILINE)
-_PROJECT_RE = re.compile(r"^\[project\]\s*$([\s\S]*?)(?=^\[[^\n]+\]\s*$|\Z)", re.MULTILINE)
+_PROJECT_RE = re.compile(
+    r"^\[project\]\s*$([\s\S]*?)(?=^\[[^\n]+\]\s*$|\Z)", re.MULTILINE
+)
 _RELEASE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+_FORBIDDEN_ARTIFACT_PATH_PARTS = ("/experiments/", "/__pycache__/", "/.pytest_cache/")
+_FORBIDDEN_ARTIFACT_BASENAMES = {".DS_Store", ".env", "auth_data.json", "cookies.json"}
+_FORBIDDEN_ARTIFACT_PREFIXES = ("cwa-wk-resume-",)
+_FORBIDDEN_WK_RUNTIME_MARKERS = (b"RunResumeBroker", b"--resume-broker", b"cwaBroker")
+_TEXT_ARTIFACT_SUFFIXES = {
+    ".css",
+    ".html",
+    ".js",
+    ".json",
+    ".m",
+    ".md",
+    ".plist",
+    ".py",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
 
 
 class ReleaseGateError(RuntimeError):
@@ -141,12 +170,80 @@ def _source_extension_files(root: Path) -> set[str]:
     return files
 
 
+def _source_wk_helper_files(root: Path) -> set[str]:
+    helper_dir = root / "src" / "chatgpt_web_adapter" / "wkwebview_helper"
+    files = {
+        path.name
+        for pattern in WK_HELPER_PACKAGE_PATTERNS
+        for path in helper_dir.glob(pattern)
+        if path.is_file()
+    }
+    if not files:
+        raise ReleaseGateError("source WKWebView helper package-data set is empty")
+    return files
+
+
+def _verify_artifact_names(names: set[str], *, artifact: str) -> None:
+    violations: list[str] = []
+    for name in sorted(names):
+        normalized = "/" + name.replace("\\", "/").lstrip("/")
+        basename = Path(normalized).name
+        if (
+            basename in _FORBIDDEN_ARTIFACT_BASENAMES
+            or any(
+                basename.startswith(prefix) for prefix in _FORBIDDEN_ARTIFACT_PREFIXES
+            )
+            or any(part in normalized for part in _FORBIDDEN_ARTIFACT_PATH_PARTS)
+        ):
+            violations.append(name)
+    if violations:
+        raise ReleaseGateError(
+            f"{artifact} contains forbidden repository artifacts: {violations[:10]}"
+        )
+
+
+def _verify_artifact_text(
+    members: list[tuple[str, bytes]],
+    *,
+    artifact: str,
+    source_root: Path,
+) -> None:
+    source_root_bytes = str(source_root.resolve()).encode("utf-8")
+    violations: list[str] = []
+    for name, payload in members:
+        if Path(name).suffix.lower() not in _TEXT_ARTIFACT_SUFFIXES:
+            continue
+        if source_root_bytes in payload:
+            violations.append(f"{name}: local checkout path")
+            continue
+        normalized = "/" + name.replace("\\", "/").lstrip("/")
+        production_runtime = normalized.startswith("/chatgpt_web_adapter/") or (
+            "/src/chatgpt_web_adapter/" in normalized
+        )
+        if production_runtime and any(
+            marker in payload for marker in _FORBIDDEN_WK_RUNTIME_MARKERS
+        ):
+            violations.append(f"{name}: removed WK broker runtime")
+    if violations:
+        raise ReleaseGateError(
+            f"{artifact} contains forbidden promotion debris: {violations[:10]}"
+        )
+
+
 def verify_wheel(wheel: Path, *, root: Path, version: str) -> dict[str, Any]:
     expected_name = f"{DIST_BASENAME}-{version}-py3-none-any.whl"
     if wheel.name != expected_name:
-        raise ReleaseGateError(f"unexpected wheel filename: {wheel.name}; expected {expected_name}")
+        raise ReleaseGateError(
+            f"unexpected wheel filename: {wheel.name}; expected {expected_name}"
+        )
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
+        _verify_artifact_names(names, artifact="wheel")
+        _verify_artifact_text(
+            [(name, archive.read(name)) for name in names if not name.endswith("/")],
+            artifact="wheel",
+            source_root=root,
+        )
         dist_info = f"{DIST_BASENAME}-{version}.dist-info"
         metadata_name = f"{dist_info}/METADATA"
         entry_points_name = f"{dist_info}/entry_points.txt"
@@ -154,12 +251,18 @@ def verify_wheel(wheel: Path, *, root: Path, version: str) -> dict[str, Any]:
             raise ReleaseGateError("wheel is missing METADATA")
         metadata = Parser().parsestr(archive.read(metadata_name).decode("utf-8"))
         if metadata.get("Name") != PROJECT_NAME:
-            raise ReleaseGateError(f"wheel metadata Name mismatch: {metadata.get('Name')!r}")
+            raise ReleaseGateError(
+                f"wheel metadata Name mismatch: {metadata.get('Name')!r}"
+            )
         if metadata.get("Version") != version:
-            raise ReleaseGateError(f"wheel metadata Version mismatch: {metadata.get('Version')!r}")
+            raise ReleaseGateError(
+                f"wheel metadata Version mismatch: {metadata.get('Version')!r}"
+            )
         missing_required = sorted(REQUIRED_WHEEL_FILES - names)
         if missing_required:
-            raise ReleaseGateError(f"wheel is missing required files: {missing_required}")
+            raise ReleaseGateError(
+                f"wheel is missing required files: {missing_required}"
+            )
         source_extension_files = _source_extension_files(root)
         wheel_extension_files = {
             Path(name).name
@@ -172,26 +275,57 @@ def verify_wheel(wheel: Path, *, root: Path, version: str) -> dict[str, Any]:
             raise ReleaseGateError(
                 f"wheel omitted packaged browser extension files: {missing_extension}"
             )
+        source_wk_helper_files = _source_wk_helper_files(root)
+        wheel_wk_helper_files = {
+            Path(name).name
+            for name in names
+            if name.startswith("chatgpt_web_adapter/wkwebview_helper/")
+            and name.endswith(WK_HELPER_PACKAGE_SUFFIXES)
+        }
+        missing_wk_helper = sorted(source_wk_helper_files - wheel_wk_helper_files)
+        if missing_wk_helper:
+            raise ReleaseGateError(
+                f"wheel omitted packaged WKWebView helper files: {missing_wk_helper}"
+            )
         if entry_points_name not in names:
             raise ReleaseGateError("wheel is missing console entry-point metadata")
-        actual_entry_points = _entry_points(archive.read(entry_points_name).decode("utf-8"))
+        actual_entry_points = _entry_points(
+            archive.read(entry_points_name).decode("utf-8")
+        )
         if actual_entry_points != EXPECTED_ENTRY_POINTS:
-            raise ReleaseGateError(f"console entry points mismatch: {actual_entry_points!r}")
+            raise ReleaseGateError(
+                f"console entry points mismatch: {actual_entry_points!r}"
+            )
     return {
         "path": str(wheel),
         "filename": wheel.name,
         "required_files": len(REQUIRED_WHEEL_FILES),
         "extension_files": len(source_extension_files),
+        "wk_helper_files": len(source_wk_helper_files),
         "entry_points": sorted(EXPECTED_ENTRY_POINTS),
     }
 
 
-def verify_sdist(sdist: Path, *, version: str) -> dict[str, Any]:
+def verify_sdist(sdist: Path, *, root: Path, version: str) -> dict[str, Any]:
     expected_name = f"{DIST_BASENAME}-{version}.tar.gz"
     if sdist.name != expected_name:
-        raise ReleaseGateError(f"unexpected sdist filename: {sdist.name}; expected {expected_name}")
+        raise ReleaseGateError(
+            f"unexpected sdist filename: {sdist.name}; expected {expected_name}"
+        )
     with tarfile.open(sdist, "r:gz") as archive:
         names = set(archive.getnames())
+        _verify_artifact_names(names, artifact="sdist")
+        text_members: list[tuple[str, bytes]] = []
+        for member in archive.getmembers():
+            if (
+                not member.isfile()
+                or Path(member.name).suffix.lower() not in _TEXT_ARTIFACT_SUFFIXES
+            ):
+                continue
+            extracted = archive.extractfile(member)
+            if extracted is not None:
+                text_members.append((member.name, extracted.read()))
+        _verify_artifact_text(text_members, artifact="sdist", source_root=root)
     missing = [
         suffix
         for suffix in sorted(REQUIRED_SDIST_SUFFIXES)
@@ -215,7 +349,7 @@ def verify_dist(root: Path, dist_dir: Path, version: str) -> dict[str, Any]:
         raise ReleaseGateError(f"expected exactly one sdist, found {len(sdists)}")
     return {
         "wheel": verify_wheel(wheels[0], root=root, version=version),
-        "sdist": verify_sdist(sdists[0], version=version),
+        "sdist": verify_sdist(sdists[0], root=root, version=version),
     }
 
 
@@ -260,15 +394,25 @@ def run_release_gate(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate the CWA release candidate contract")
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser = argparse.ArgumentParser(
+        description="Validate the CWA release candidate contract"
+    )
+    parser.add_argument(
+        "--root", type=Path, default=Path(__file__).resolve().parents[1]
+    )
     parser.add_argument("--dist-dir", type=Path)
     parser.add_argument("--tag")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
         report = run_release_gate(root=args.root, dist_dir=args.dist_dir, tag=args.tag)
-    except (OSError, ValueError, ReleaseGateError, zipfile.BadZipFile, tarfile.TarError) as error:
+    except (
+        OSError,
+        ValueError,
+        ReleaseGateError,
+        zipfile.BadZipFile,
+        tarfile.TarError,
+    ) as error:
         if args.json:
             print(json.dumps({"schema": 1, "ok": False, "error": str(error)}, indent=2))
         else:

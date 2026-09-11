@@ -8,8 +8,14 @@
       window.webkit.messageHandlers.cwaCanonical.postMessage(body);
     } catch (_) {}
   };
+  const postStream = (body) => {
+    try {
+      window.webkit.messageHandlers.cwaStream.postMessage(body);
+    } catch (_) {}
+  };
   const prompt = typeof window.__CWA_MINIMAL_PROMPT__ === "string" ? window.__CWA_MINIMAL_PROMPT__ : "";
   const profile = typeof window.__CWA_MINIMAL_PROFILE__ === "string" ? window.__CWA_MINIMAL_PROFILE__ : "";
+  const temporary = window.__CWA_MINIMAL_TEMPORARY__ === true;
   const conversationId = typeof window.__CWA_MINIMAL_CONVERSATION_ID__ === "string"
     ? window.__CWA_MINIMAL_CONVERSATION_ID__
     : "";
@@ -101,7 +107,7 @@
   const exportAlias = (source, internalName) => {
     if (!internalName) return null;
     const expression = new RegExp(
-      `\\b${escapeRegex(internalName)}\\s+as\\s+([A-Za-z_$][A-Za-z0-9_$]*)\\b`,
+      `\\b${escapeRegex(internalName)}\\s+as\\s+([A-Za-z_$][A-Za-z0-9_$]*)(?=[,};\\s])`,
       "g",
     );
     let alias = null;
@@ -218,31 +224,34 @@
     throw new Error("MINIMAL_INTEGRITY_STREAM_DISCOVERY_FAILED");
   };
 
-  (async () => {
-    if (!prompt) throw new Error("MINIMAL_PROMPT_MISSING");
-    let attachmentDescriptors = [];
-    if (attachmentsBase64) {
-      try {
-        const raw = atob(attachmentsBase64);
-        const bytes = new Uint8Array(raw.length);
-        for (let index = 0; index < raw.length; index += 1) bytes[index] = raw.charCodeAt(index);
-        const parsedAttachments = JSON.parse(new TextDecoder().decode(bytes));
-        if (!Array.isArray(parsedAttachments)) throw new Error("not_array");
-        attachmentDescriptors = parsedAttachments;
-      } catch (_) {
-        throw new Error("MINIMAL_ATTACHMENT_DESCRIPTOR_DECODE_FAILED");
-      }
-      for (const descriptor of attachmentDescriptors) {
-        if (!descriptor || typeof descriptor.file_id !== "string" || !descriptor.file_id) {
-          throw new Error("MINIMAL_ATTACHMENT_DESCRIPTOR_INVALID");
-        }
+  const decodeAttachmentDescriptors = () => {
+    if (!attachmentsBase64) return [];
+    let descriptors;
+    try {
+      const raw = atob(attachmentsBase64);
+      const bytes = new Uint8Array(raw.length);
+      for (let index = 0; index < raw.length; index += 1) bytes[index] = raw.charCodeAt(index);
+      descriptors = JSON.parse(new TextDecoder().decode(bytes));
+      if (!Array.isArray(descriptors)) throw new Error("not_array");
+    } catch (_) {
+      throw new Error("MINIMAL_ATTACHMENT_DESCRIPTOR_DECODE_FAILED");
+    }
+    for (const descriptor of descriptors) {
+      if (!descriptor || typeof descriptor.file_id !== "string" || !descriptor.file_id) {
+        throw new Error("MINIMAL_ATTACHMENT_DESCRIPTOR_INVALID");
       }
     }
+    return descriptors;
+  };
+
+  const waitForSentinel = async () => {
     for (let i = 0; i < 80 && !window.__cwaSentinelLoaded; i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     if (!window.SentinelSDK) throw new Error("MINIMAL_SENTINEL_SDK_MISSING");
+  };
 
+  const bootstrapProductResources = async () => {
     stage = "root";
     const rootResponse = await fetch("/", {
       credentials: "include",
@@ -264,7 +273,10 @@
       .map((element) => element.getAttribute("src") || element.getAttribute("href") || "")
       .find((value) => value.includes("/conversation-small-") && value.includes(".js"));
     if (!integrityAsset) throw new Error("MINIMAL_INTEGRITY_ASSET_MISSING");
-    const integrityURL = new URL(integrityAsset, location.href).href;
+    return new URL(integrityAsset, location.href).href;
+  };
+
+  const loadIntegrityRuntime = async (integrityURL) => {
     stage = "integrity_discovery";
     const integrityCacheKey = `__cwa_integrity_exports_v1:${integrityURL}`;
     let integrityExports = null;
@@ -302,7 +314,10 @@
     }
     stage = "integrity_init";
     initializeIntegrity();
+    return acquireIntegrity;
+  };
 
+  const loadSession = async () => {
     stage = "session";
     const sessionResponse = await fetch("/api/auth/session", {
       credentials: "include",
@@ -311,17 +326,23 @@
     const session = await sessionResponse.json();
     const accessToken = session && session.accessToken;
     if (!accessToken) throw new Error("MINIMAL_ACCESS_TOKEN_MISSING");
+    return accessToken;
+  };
 
+  const loadModelCatalog = async (accessToken) => {
     stage = "models";
     const modelsResponse = await fetch(
-      "/backend-api/models?history_and_training_disabled=false",
+      `/backend-api/models?history_and_training_disabled=${temporary ? "true" : "false"}`,
       {
         credentials: "include",
         cache: "no-store",
         headers: { Authorization: `Bearer ${accessToken}` },
       },
     );
-    const modelsPayload = await modelsResponse.json();
+    return modelsResponse.json();
+  };
+
+  const resolveModelSelection = (modelsPayload) => {
     const models = Array.isArray(modelsPayload.models) ? modelsPayload.models : [];
     const bySlug = new Map(
       models
@@ -376,8 +397,9 @@
             .map((item) => item && item.thinking_effort)
             .filter((value) => typeof value === "string")
         : [];
-      const supported = availableEfforts.includes(thinkingEffort);
-      if (!supported) throw new Error("MINIMAL_PROFILE_UNSUPPORTED_BY_MODEL");
+      if (!availableEfforts.includes(thinkingEffort)) {
+        throw new Error("MINIMAL_PROFILE_UNSUPPORTED_BY_MODEL");
+      }
     }
     if (!profile && selectedThinkingEffort) {
       const selected = bySlug.get(model);
@@ -393,7 +415,10 @@
     if (!model || (!bySlug.has(model) && model !== "auto")) {
       throw new Error("MINIMAL_MODEL_MISSING");
     }
+    return { model, thinkingEffort };
+  };
 
+  const acquireIntegrityBundle = async (acquireIntegrity) => {
     const deviceMatch = document.cookie.match(/(?:^|;\s*)oai-did=([^;]+)/);
     const deviceId = deviceMatch ? decodeURIComponent(deviceMatch[1]) : "";
     stage = "integrity_bundle";
@@ -422,7 +447,10 @@
       await window.SentinelSDK.token("conversation");
     } catch (_) {}
     const telemetry = window.SentinelSDK.timing?.();
+    return { chatReq, turnstileToken, proofToken, telemetry, deviceId };
+  };
 
+  const buildConversationMessage = (attachmentDescriptors) => {
     const messageId = crypto.randomUUID();
     const effectiveParentMessageId = conversationId ? parentMessageId : "client-created-root";
     if (conversationId && !effectiveParentMessageId) {
@@ -450,20 +478,32 @@
           })),
         }
       : { serialization_metadata: { custom_symbol_offsets: [] } };
-    const authorization = `Bearer ${accessToken}`;
-    const commonHeaders = (path) => {
-      const headers = {
-        authorization,
-        "content-type": "application/json",
-        origin: "https://chatgpt.com",
-        referer: location.href,
-        "x-openai-target-path": path,
-        "x-openai-target-route": path,
-      };
-      if (deviceId) headers["oai-device-id"] = deviceId;
-      return headers;
-    };
+    return { messageId, effectiveParentMessageId, messageContent, messageMetadata };
+  };
 
+  const requestHeaders = (accessToken, deviceId, path) => {
+    const headers = {
+      authorization: `Bearer ${accessToken}`,
+      "content-type": "application/json",
+      origin: "https://chatgpt.com",
+      referer: location.href,
+      "x-openai-target-path": path,
+      "x-openai-target-route": path,
+    };
+    if (deviceId) headers["oai-device-id"] = deviceId;
+    return headers;
+  };
+
+  const prepareConversation = async ({
+    accessToken,
+    deviceId,
+    model,
+    thinkingEffort,
+    attachmentDescriptors,
+    messageId,
+    effectiveParentMessageId,
+    messageContent,
+  }) => {
     const preparePayload = {
       action: "next",
       fork_from_shared_post: false,
@@ -475,6 +515,7 @@
       client_prepare_dispatch: "debounced",
       client_prepare_source: "window_focus",
       conversation_mode: { kind: "primary_assistant" },
+      ...(temporary ? { history_and_training_disabled: true } : {}),
       system_hints: [],
       supports_buffering: true,
       supported_encodings: ["v1"],
@@ -494,7 +535,7 @@
       method: "POST",
       credentials: "include",
       headers: {
-        ...commonHeaders("/backend-api/f/conversation/prepare"),
+        ...requestHeaders(accessToken, deviceId, "/backend-api/f/conversation/prepare"),
         accept: "application/json",
         "x-conduit-token": "no-token",
       },
@@ -507,7 +548,21 @@
     if (!prepareResponse.ok || !conduitToken) {
       throw new Error(`MINIMAL_PREPARE_HTTP_${prepareResponse.status}`);
     }
+    return conduitToken;
+  };
 
+  const protectedWrite = async ({
+    accessToken,
+    deviceId,
+    model,
+    thinkingEffort,
+    messageId,
+    effectiveParentMessageId,
+    messageContent,
+    messageMetadata,
+    conduitToken,
+    integrityBundle,
+  }) => {
     const message = {
       id: messageId,
       author: { role: "user" },
@@ -522,6 +577,7 @@
       model,
       ...(thinkingEffort ? { thinking_effort: thinkingEffort } : {}),
       conversation_mode: { kind: "primary_assistant" },
+      ...(temporary ? { history_and_training_disabled: true } : {}),
       enable_message_followups: false,
       supports_buffering: true,
       supported_encodings: ["v1"],
@@ -530,20 +586,29 @@
       client_contextual_info: { app_name: "chatgpt.com" },
       system_hints: [],
     };
+    const turnTraceId = crypto.randomUUID();
     const writeHeaders = {
-      ...commonHeaders("/backend-api/f/conversation"),
+      ...requestHeaders(accessToken, deviceId, "/backend-api/f/conversation"),
       accept: "text/event-stream",
       "x-conduit-token": conduitToken,
-      "x-oai-turn-trace-id": crypto.randomUUID(),
+      "x-oai-turn-trace-id": turnTraceId,
     };
-    if (chatReq.token) {
-      writeHeaders["OpenAI-Sentinel-Chat-Requirements-Token"] = chatReq.token;
+    postStream({
+      phase: "stop_context",
+      conduit_token: conduitToken,
+      turn_trace_id: turnTraceId,
+    });
+    if (integrityBundle.chatReq.token) {
+      writeHeaders["OpenAI-Sentinel-Chat-Requirements-Token"] = integrityBundle.chatReq.token;
     } else {
-      writeHeaders["OpenAI-Sentinel-Chat-Requirements-Prepare-Token"] = chatReq.prepare_token;
+      writeHeaders["OpenAI-Sentinel-Chat-Requirements-Prepare-Token"] =
+        integrityBundle.chatReq.prepare_token;
     }
-    writeHeaders["OpenAI-Sentinel-Turnstile-Token"] = turnstileToken;
-    writeHeaders["OpenAI-Sentinel-Proof-Token"] = proofToken;
-    if (typeof telemetry === "string" && telemetry) writeHeaders["OAI-Telemetry"] = telemetry;
+    writeHeaders["OpenAI-Sentinel-Turnstile-Token"] = integrityBundle.turnstileToken;
+    writeHeaders["OpenAI-Sentinel-Proof-Token"] = integrityBundle.proofToken;
+    if (typeof integrityBundle.telemetry === "string" && integrityBundle.telemetry) {
+      writeHeaders["OAI-Telemetry"] = integrityBundle.telemetry;
+    }
 
     stage = "write";
     const writeResponse = await fetch("/backend-api/f/conversation", {
@@ -562,6 +627,41 @@
         await writeResponse.body?.cancel();
       } catch (_) {}
     }
+  };
+
+  (async () => {
+    if (!prompt) throw new Error("MINIMAL_PROMPT_MISSING");
+    const attachmentDescriptors = decodeAttachmentDescriptors();
+    await waitForSentinel();
+    const integrityURL = await bootstrapProductResources();
+    const acquireIntegrity = await loadIntegrityRuntime(integrityURL);
+
+    const accessToken = await loadSession();
+    const modelsPayload = await loadModelCatalog(accessToken);
+    const { model, thinkingEffort } = resolveModelSelection(modelsPayload);
+    const integrityBundle = await acquireIntegrityBundle(acquireIntegrity);
+
+    const message = buildConversationMessage(attachmentDescriptors);
+    postStream({ phase: "client_message", message_id: message.messageId });
+    const conduitToken = await prepareConversation({
+      accessToken,
+      deviceId: integrityBundle.deviceId,
+      model,
+      thinkingEffort,
+      attachmentDescriptors,
+      messageId: message.messageId,
+      effectiveParentMessageId: message.effectiveParentMessageId,
+      messageContent: message.messageContent,
+    });
+    await protectedWrite({
+      accessToken,
+      deviceId: integrityBundle.deviceId,
+      model,
+      thinkingEffort,
+      ...message,
+      conduitToken,
+      integrityBundle,
+    });
   })().catch((error) => post({
     ok: false,
     status: 0,

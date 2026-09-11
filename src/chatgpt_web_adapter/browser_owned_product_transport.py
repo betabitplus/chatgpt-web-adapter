@@ -150,45 +150,50 @@ def _build_browser_owned_capabilities(
     profile_selection_supported: bool = True,
     temporary_chat_supported: bool = True,
     media_supported: bool = False,
+    files_supported: bool = False,
+    multimodal_continuation_supported: bool = False,
 ) -> ProductCapabilities:
+    provider_available = {
+        IMAGES: media_supported,
+        FILES: files_supported,
+        MULTIMODAL_CONTINUATION: multimodal_continuation_supported,
+    }
+    provider_evidence = {
+        IMAGES: "configured browser authority provider has live-proven execution-local image attachment support",
+        FILES: "configured browser authority provider has live-proven general-file attachment support",
+        MULTIMODAL_CONTINUATION: "configured browser authority provider has live-proven multimodal continuation support",
+    }
+
+    def capability_state(name: str) -> CapabilityState:
+        if name == TEMPORARY_CHAT and not temporary_chat_supported:
+            return CapabilityState.UNIMPLEMENTED
+        if provider_available.get(name, False):
+            return CapabilityState.AVAILABLE
+        if profile_selection_supported or name not in _PROFILE_SELECTION_CAPABILITIES:
+            return _BROWSER_OWNED_CAPABILITY_STATES[name]
+        return CapabilityState.UNKNOWN
+
+    def capability_evidence(name: str) -> str | None:
+        if name == TEMPORARY_CHAT and not temporary_chat_supported:
+            return "configured browser authority provider does not implement Temporary Chat"
+        if provider_available.get(name, False):
+            return provider_evidence[name]
+        if profile_selection_supported or name not in _PROFILE_SELECTION_CAPABILITIES:
+            return _BROWSER_OWNED_CAPABILITY_EVIDENCE.get(name)
+        return "configured browser-native provider does not expose PR8.10 profile requirements"
+
     return ProductCapabilities.from_entries(
         transport=BROWSER_OWNED_PRODUCT_TRANSPORT,
         product_semantics=ORDINARY_CHATGPT_PRODUCT_SEMANTICS,
         entries=(
             ProductCapability(
                 name=name,
-                state=(
-                    CapabilityState.UNIMPLEMENTED
-                    if name == TEMPORARY_CHAT and not temporary_chat_supported
-                    else (
-                        CapabilityState.AVAILABLE
-                        if name == IMAGES and media_supported
-                        else (
-                            _BROWSER_OWNED_CAPABILITY_STATES[name]
-                            if profile_selection_supported
-                            or name not in _PROFILE_SELECTION_CAPABILITIES
-                            else CapabilityState.UNKNOWN
-                        )
-                    )
-                ),
+                state=capability_state(name),
                 owner=_BROWSER_OWNED_CAPABILITY_OWNERS.get(
                     name,
                     CapabilityOwner.TRANSPORT,
                 ),
-                evidence=(
-                    "configured browser authority provider does not implement Temporary Chat"
-                    if name == TEMPORARY_CHAT and not temporary_chat_supported
-                    else (
-                        "configured browser authority provider accepts execution-local attachment paths"
-                        if name == IMAGES and media_supported
-                        else (
-                            _BROWSER_OWNED_CAPABILITY_EVIDENCE.get(name)
-                            if profile_selection_supported
-                            or name not in _PROFILE_SELECTION_CAPABILITIES
-                            else "configured browser-native provider does not expose PR8.10 profile requirements"
-                        )
-                    )
-                ),
+                evidence=capability_evidence(name),
             )
             for name in PRODUCT_CAPABILITY_NAMES
         ),
@@ -224,7 +229,9 @@ def _serialize_submission_operation(method: Any) -> Any:
     """Serialize every browser-owned write/finality operation on one transport."""
 
     @wraps(method)
-    def serialized(self: "BrowserOwnedProductTransport", *args: Any, **kwargs: Any) -> Any:
+    def serialized(
+        self: "BrowserOwnedProductTransport", *args: Any, **kwargs: Any
+    ) -> Any:
         with self._submission_dispatch_lock:
             return method(self, *args, **kwargs)
 
@@ -251,10 +258,9 @@ class BrowserOwnedProductTransport:
             provider = ProductModelProfileProvider()
         self.provider = provider
         canonical_builder = getattr(self.provider, "build_canonical_client", None)
-        self._browser_context_canonical_enabled = (
-            isinstance(self.provider, BrowserNativeTurnProvider)
-            or callable(canonical_builder)
-        )
+        self._browser_context_canonical_enabled = isinstance(
+            self.provider, BrowserNativeTurnProvider
+        ) or callable(canonical_builder)
         if isinstance(source_canonical, BrowserContextCanonicalClient):
             self.canonical_client = source_canonical
         elif callable(canonical_builder):
@@ -269,16 +275,36 @@ class BrowserOwnedProductTransport:
         self._model_profile_selection_supported = callable(
             getattr(self.provider, "require_profile", None)
         )
-        self._temporary_chat_supported = getattr(
+        temporary_provider_builder = getattr(
             self.provider,
-            "temporary_chat_supported",
-            True,
-        ) is True
-        self._media_supported = getattr(
-            self.provider,
-            "supports_attachment_paths",
-            False,
-        ) is True
+            "build_temporary_chat_provider",
+            None,
+        )
+        self._temporary_provider = (
+            temporary_provider_builder()
+            if callable(temporary_provider_builder)
+            else self.provider
+        )
+        self._temporary_chat_supported = (
+            getattr(
+                self.provider,
+                "temporary_chat_supported",
+                True,
+            )
+            is True
+        )
+        self._media_supported = (
+            getattr(
+                self.provider,
+                "supports_attachment_paths",
+                False,
+            )
+            is True
+        )
+        self._files_supported = getattr(self.provider, "supports_files", False) is True
+        self._multimodal_continuation_supported = (
+            getattr(self.provider, "supports_multimodal_continuation", False) is True
+        )
         self._browser_authority_runtime_policy = browser_authority_policy
         self._browser_authority_runtime_ttl_ms = browser_authority_ttl_ms
         self._browser_authority_default_resolution = resolve_browser_authority_policy(
@@ -299,7 +325,7 @@ class BrowserOwnedProductTransport:
         )
         self._submission_dispatch_lock = threading.RLock()
         self._submission_lifecycle = BrowserOwnedSubmissionLifecycle(self._runtime)
-        self._temporary_runtime = TemporaryProductWriteRuntime(self.provider)
+        self._temporary_runtime = TemporaryProductWriteRuntime(self._temporary_provider)
 
     @staticmethod
     def _health_from_runtime(
@@ -395,12 +421,16 @@ class BrowserOwnedProductTransport:
             self._model_profile_selection_supported
             and self._temporary_chat_supported
             and not self._media_supported
+            and not self._files_supported
+            and not self._multimodal_continuation_supported
         ):
             return _BROWSER_OWNED_CAPABILITIES
         return _build_browser_owned_capabilities(
             profile_selection_supported=self._model_profile_selection_supported,
             temporary_chat_supported=self._temporary_chat_supported,
             media_supported=self._media_supported,
+            files_supported=self._files_supported,
+            multimodal_continuation_supported=self._multimodal_continuation_supported,
         )
 
     def stop_generation(
@@ -530,7 +560,9 @@ class BrowserOwnedProductTransport:
         if not isinstance(submission, ProductSubmissionAck):
             raise TypeError("submission must be ProductSubmissionAck")
         if submission.transport != self.transport_id:
-            raise ValueError("submission transport does not match browser-owned transport")
+            raise ValueError(
+                "submission transport does not match browser-owned transport"
+            )
         return self._submission_lifecycle.await_final(submission.submission_id)
 
     def submission_lifecycle_snapshot(self) -> dict[str, Any]:

@@ -48,6 +48,14 @@ class BrowserNativeTurnResult:
     browser_authority_lease_id: str | None = None
     attachment_count: int = 0
     passive_observer_armed: bool = False
+    canonical_read_transport: str | None = None
+    canonical_read_fallback_reason: str | None = None
+    phase_a_transport: str | None = None
+    phase_a_gate_wait_ms: int | None = None
+    phase_a_elapsed_ms: int | None = None
+    phase_b_transport: str | None = None
+    phase_b_fallback_reason: str | None = None
+    phase_b_elapsed_ms: int | None = None
 
 
 @dataclass(frozen=True)

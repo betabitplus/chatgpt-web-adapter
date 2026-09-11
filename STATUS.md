@@ -1,6 +1,6 @@
 # Project Status
 
-_Last updated: 2026-09-02_
+_Last updated: 2026-09-10_
 
 This file is the compact current-state view for `chatgpt-web-adapter` (CWA). Use [`ROADMAP.md`](ROADMAP.md) for direction and [`docs/README.md`](docs/README.md) for the documentation map.
 
@@ -9,14 +9,14 @@ This file is the compact current-state view for `chatgpt-web-adapter` (CWA). Use
 ```text
 latest public release   v0.3.0
 release date            2026-09-01
-package version         0.3.0
-current main            post-0.3 development
+package version         0.3.1 (unreleased candidate)
+current main            post-0.3 / 0.3.1 candidate
 post-release milestones PR10.0 + PR10.1 merged; PR11.0 complete
 license                 MIT
 python                   3.10-3.14
 ```
 
-Current `main` contains product/runtime work newer than the `v0.3.0` tag. Do not assume every post-0.3 behavior is present in the published 0.3.0 wheel until a later release includes it.
+Current `main` contains product/runtime work staged in the unreleased 0.3.1 candidate and newer than the `v0.3.0` tag. Do not assume these post-0.3 behaviors are present in the published 0.3.0 wheel until 0.3.1 is finalized and published.
 
 ## Product role
 

@@ -72,7 +72,9 @@ _SENSITIVE_LINE_RE = re.compile(
 )
 
 
-def set_browser_native_turn_provider(self: Any, provider: BrowserNativeTurnProvider | None) -> None:
+def set_browser_native_turn_provider(
+    self: Any, provider: BrowserNativeTurnProvider | None
+) -> None:
     if provider is not None and not callable(getattr(provider, "send_text", None)):
         raise TypeError("provider must expose a callable send_text() or be None")
     self._browser_native_turn_provider = provider
@@ -194,10 +196,14 @@ def _redact_intermediate_value(value: Any, *, depth: int = 0) -> Any:
             if _SENSITIVE_KEY_RE.search(rendered_key):
                 redacted[rendered_key] = "[REDACTED]"
             else:
-                redacted[rendered_key] = _redact_intermediate_value(item, depth=depth + 1)
+                redacted[rendered_key] = _redact_intermediate_value(
+                    item, depth=depth + 1
+                )
         return redacted
     if isinstance(value, list):
-        items = [_redact_intermediate_value(item, depth=depth + 1) for item in value[:128]]
+        items = [
+            _redact_intermediate_value(item, depth=depth + 1) for item in value[:128]
+        ]
         if len(value) > 128:
             items.append("[TRUNCATED]")
         return items
@@ -233,7 +239,9 @@ def _sanitize_intermediate_text(value: str) -> str:
     return text
 
 
-def _tool_call_label(raw_message: dict[str, Any], metadata: dict[str, Any], recipient: str) -> str | None:
+def _tool_call_label(
+    raw_message: dict[str, Any], metadata: dict[str, Any], recipient: str
+) -> str | None:
     explicit = metadata.get("tool_invoking_message")
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
@@ -343,7 +351,11 @@ def _canonical_intermediate_events(
         elif role == "tool":
             kind = "tool_result"
             raw_name = author.get("name")
-            tool_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else recipient
+            tool_name = (
+                raw_name.strip()
+                if isinstance(raw_name, str) and raw_name.strip()
+                else recipient
+            )
             label = metadata.get("tool_invoked_message")
             text = _sanitize_intermediate_text(extract_message_text(raw_message))
         elif role == "assistant" and content_type == "reasoning_recap":
@@ -384,8 +396,12 @@ def _canonical_intermediate_events(
             "message_id": message_id,
             "message_kind": kind,
             "text": text,
-            "label": label.strip() if isinstance(label, str) and label.strip() else None,
-            "tool_name": tool_name.strip() if isinstance(tool_name, str) and tool_name.strip() else None,
+            "label": label.strip()
+            if isinstance(label, str) and label.strip()
+            else None,
+            "tool_name": tool_name.strip()
+            if isinstance(tool_name, str) and tool_name.strip()
+            else None,
         }
         if submission_id is not None:
             event["submission_id"] = submission_id
@@ -438,7 +454,9 @@ def _assistant_candidates_from_payload(
         if content_type in {"thoughts", "reasoning_recap"}:
             continue
         finish_reason = getattr(message, "finish_reason", None)
-        has_finish_reason = isinstance(finish_reason, str) and bool(finish_reason.strip())
+        has_finish_reason = isinstance(finish_reason, str) and bool(
+            finish_reason.strip()
+        )
         if (
             not allow_unfinished
             and raw_message.get("end_turn") is not True
@@ -512,7 +530,11 @@ def _wait_for_new_final_assistant(
                 # without turning backend throttling into a semantic turn failure.
                 transient_400 = error.status_code == 400 and retry_400_until_timeout
                 retryable_error = bool(getattr(error, "retryable", False))
-                if error.status_code != 404 and not transient_400 and not retryable_error:
+                if (
+                    error.status_code != 404
+                    and not transient_400
+                    and not retryable_error
+                ):
                     raise
                 rate_limited_read_failure = error.status_code == 429
                 payload = None
@@ -687,7 +709,11 @@ def submit_browser_native(
     self: Any,
     prompt: str,
     *,
-    conversation: ConversationRef | ChatConversation | dict[str, Any] | str | None = None,
+    conversation: ConversationRef
+    | ChatConversation
+    | dict[str, Any]
+    | str
+    | None = None,
     timeout: float = 150.0,
     poll_interval: float = 0.5,
     on_token: Callable[[str], None] | None = None,
@@ -715,7 +741,9 @@ def submit_browser_native(
         if scoped_paths is not None:
             attachment_paths = scoped_paths
     normalized_attachment_paths = tuple(attachment_paths or ())
-    if normalized_attachment_paths and not _callable_accepts_attachment_paths(provider.send_text):
+    if normalized_attachment_paths and not _callable_accepts_attachment_paths(
+        provider.send_text
+    ):
         raise RequestError(
             "BROWSER_NATIVE_RICH_INPUT_PROVIDER_UNSUPPORTED",
             request_stage="browser_native_turn_preflight",
@@ -781,13 +809,17 @@ def submit_browser_native(
             and not isinstance(_prewrite_canonical_completed_at_ms, bool)
             and _prewrite_canonical_completed_at_ms > 0
         ):
-            supplied_completion_age_ms = int(time.time() * 1000) - _prewrite_canonical_completed_at_ms
+            supplied_completion_age_ms = (
+                int(time.time() * 1000) - _prewrite_canonical_completed_at_ms
+            )
         reusable_commit_completion = (
             is_continuation
             and canonical_status_before_turn == "completed"
             and isinstance(_prewrite_canonical_payload, dict)
             and isinstance(supplied_completion_age_ms, int)
-            and 0 <= supplied_completion_age_ms <= _PREWRITE_CANONICAL_COMPLETION_MAX_AGE_MS
+            and 0
+            <= supplied_completion_age_ms
+            <= _PREWRITE_CANONICAL_COMPLETION_MAX_AGE_MS
         )
         if (
             is_continuation
@@ -799,7 +831,9 @@ def submit_browser_native(
                 recovery_authorized = True
                 recovery_completed_at_ms = _prewrite_canonical_completed_at_ms
             else:
-                canonical_status_recovery_confirm = _canonical_status_value(self, conversation)
+                canonical_status_recovery_confirm = _canonical_status_value(
+                    self, conversation
+                )
                 recovery_authorized = canonical_status_recovery_confirm == "completed"
                 if recovery_authorized:
                     recovery_completed_at_ms = int(time.time() * 1000)
@@ -827,7 +861,10 @@ def submit_browser_native(
             _emit_revision_safe_event(self, on_event, normalized)
 
     def handle_write_identity(event: dict[str, Any]) -> None:
-        if not isinstance(event, dict) or event.get("type") != "write_identity_resolved":
+        if (
+            not isinstance(event, dict)
+            or event.get("type") != "write_identity_resolved"
+        ):
             return
         conversation_id = event.get("conversation_id")
         if not isinstance(conversation_id, str) or not conversation_id.strip():
@@ -854,7 +891,9 @@ def submit_browser_native(
         if normalized_attachment_paths
         else {}
     )
-    model_kwargs = {"model_slug": normalized_model_slug} if normalized_model_slug else {}
+    model_kwargs = (
+        {"model_slug": normalized_model_slug} if normalized_model_slug else {}
+    )
     provider_kwargs = {**attachment_kwargs, **model_kwargs}
     if recovery_authorized:
         canonical_completed_at_ms = recovery_completed_at_ms or int(time.time() * 1000)
@@ -896,7 +935,9 @@ def submit_browser_native(
                 **provider_kwargs,
             )
     elif streaming_requested and callable(stream_send):
-        if normalized_attachment_paths and not _callable_accepts_attachment_paths(stream_send):
+        if normalized_attachment_paths and not _callable_accepts_attachment_paths(
+            stream_send
+        ):
             raise RequestError(
                 "BROWSER_NATIVE_RICH_INPUT_STREAM_PROVIDER_UNSUPPORTED",
                 request_stage="browser_native_turn_preflight",
@@ -964,6 +1005,16 @@ def submit_browser_native(
         tab_activated_during_turn=turn.tab_activated_during_turn,
         foreground_activation_observed=turn.foreground_activation_observed,
         attachment_count=attachment_count,
+        canonical_read_transport=getattr(turn, "canonical_read_transport", None),
+        canonical_read_fallback_reason=getattr(
+            turn, "canonical_read_fallback_reason", None
+        ),
+        phase_a_transport=getattr(turn, "phase_a_transport", None),
+        phase_a_gate_wait_ms=getattr(turn, "phase_a_gate_wait_ms", None),
+        phase_a_elapsed_ms=getattr(turn, "phase_a_elapsed_ms", None),
+        phase_b_transport=getattr(turn, "phase_b_transport", None),
+        phase_b_fallback_reason=getattr(turn, "phase_b_fallback_reason", None),
+        phase_b_elapsed_ms=getattr(turn, "phase_b_elapsed_ms", None),
         revision_safe_stream_observation_count=stream_state.observation_count,
         canonical_finality_proven=False,
     )
@@ -1007,7 +1058,9 @@ def await_browser_native_final(
     stop_requested_for = getattr(provider, "stop_requested_for", None)
 
     def provider_stop_requested() -> bool:
-        return bool(callable(stop_requested_for) and stop_requested_for(turn.conversation_id))
+        return bool(
+            callable(stop_requested_for) and stop_requested_for(turn.conversation_id)
+        )
 
     authority_lease_id = getattr(turn, "browser_authority_lease_id", None)
     observed_turn_exchange_id = getattr(turn, "turn_exchange_id", None)
@@ -1032,8 +1085,12 @@ def await_browser_native_final(
         and isinstance(authority_lease_id, str)
         and authority_lease_id
     ):
+
         def handle_passive_event(event: dict[str, Any]) -> None:
-            nonlocal passive_text_sequence, passive_text_message_id, passive_text_snapshot
+            nonlocal \
+                passive_text_sequence, \
+                passive_text_message_id, \
+                passive_text_snapshot
             if not isinstance(event, dict):
                 return
             event_type = event.get("type")
@@ -1117,7 +1174,10 @@ def await_browser_native_final(
                 if isinstance(observe_result, dict)
                 else None
             )
-            if isinstance(learned_turn_exchange_id, str) and learned_turn_exchange_id.strip():
+            if (
+                isinstance(learned_turn_exchange_id, str)
+                and learned_turn_exchange_id.strip()
+            ):
                 observed_turn_exchange_id = learned_turn_exchange_id.strip()
             learned_finish_reason = (
                 observe_result.get("finishReason")
@@ -1146,7 +1206,8 @@ def await_browser_native_final(
                 time.sleep(settle_seconds)
                 remaining = max(
                     1.0,
-                    submission.timeout - (time.monotonic() - submission.started_monotonic),
+                    submission.timeout
+                    - (time.monotonic() - submission.started_monotonic),
                 )
         except (RequestError, OSError, EOFError, ValueError) as error:
             reason = str(error)
@@ -1168,27 +1229,35 @@ def await_browser_native_final(
     stopped_by_user = passive_stopped or provider_stop_requested()
     readback_timeout = min(remaining, 1.0) if stopped_by_user else remaining
     try:
-        final_message, canonical_payload, canonical_payload_read_count = _wait_for_new_final_assistant(
-            self,
-            turn.conversation_id,
-            baseline_assistant_ids=submission.baseline_assistant_ids,
-            baseline_message_ids=submission.baseline_message_ids,
-            timeout=readback_timeout,
-            interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS if passive_observer_used else submission.poll_interval,
-            include_readback=True,
-            turn_exchange_id=observed_turn_exchange_id,
-            retry_400_until_timeout=retry_400_until_timeout,
-            on_event=None if passive_observer_used else submission.on_event,
-            submission_id=submission.submission_id,
-            minimum_poll_interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS if passive_observer_used else None,
-            allow_unfinished=stopped_by_user,
-            stop_requested=None if passive_stopped else provider_stop_requested,
+        final_message, canonical_payload, canonical_payload_read_count = (
+            _wait_for_new_final_assistant(
+                self,
+                turn.conversation_id,
+                baseline_assistant_ids=submission.baseline_assistant_ids,
+                baseline_message_ids=submission.baseline_message_ids,
+                timeout=readback_timeout,
+                interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS
+                if passive_observer_used
+                else submission.poll_interval,
+                include_readback=True,
+                turn_exchange_id=observed_turn_exchange_id,
+                retry_400_until_timeout=retry_400_until_timeout,
+                on_event=None if passive_observer_used else submission.on_event,
+                submission_id=submission.submission_id,
+                minimum_poll_interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS
+                if passive_observer_used
+                else None,
+                allow_unfinished=stopped_by_user,
+                stop_requested=None if passive_stopped else provider_stop_requested,
+            )
         )
     except ConversationTimeoutError:
         stopped_by_user = stopped_by_user or provider_stop_requested()
         if not stopped_by_user and not passive_stream_ended_without_terminal:
             raise
-        incomplete_without_terminal = passive_stream_ended_without_terminal and not stopped_by_user
+        incomplete_without_terminal = (
+            passive_stream_ended_without_terminal and not stopped_by_user
+        )
         final_message = ChatMessage(
             message_id=passive_message_id,
             role="assistant",
@@ -1276,7 +1345,8 @@ def await_browser_native_final(
         revision_safe_stream_observation_count=submission.stream_state.observation_count,
         revision_safe_stream_revision_count=submission.stream_state.revision_count,
         revision_safe_stream_delivery_incomplete=submission.stream_state.delivery_incomplete,
-        canonical_finality_proven=not stopped_by_user and not incomplete_without_terminal,
+        canonical_finality_proven=not stopped_by_user
+        and not incomplete_without_terminal,
         stopped_by_user=stopped_by_user,
         incomplete_without_terminal=incomplete_without_terminal,
     )
@@ -1292,7 +1362,11 @@ def send_browser_native(
     self: Any,
     prompt: str,
     *,
-    conversation: ConversationRef | ChatConversation | dict[str, Any] | str | None = None,
+    conversation: ConversationRef
+    | ChatConversation
+    | dict[str, Any]
+    | str
+    | None = None,
     timeout: float = 150.0,
     poll_interval: float = 0.5,
     on_token: Callable[[str], None] | None = None,

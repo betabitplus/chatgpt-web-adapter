@@ -66,7 +66,9 @@ class BrowserContextCanonicalReadError(RequestError):
             if isinstance(content_type, str) and content_type
             else None
         )
-        self.retryable = bool(retryable) or normalized_reason in _RETRYABLE_CANONICAL_READ_REASONS
+        self.retryable = (
+            bool(retryable) or normalized_reason in _RETRYABLE_CANONICAL_READ_REASONS
+        )
         details = [f"reason={self.reason_code}"]
         if status_code is not None:
             details.append(f"status={status_code}")
@@ -373,7 +375,11 @@ class BrowserContextCanonicalTransport:
             raise ValueError("catalog must be conversations or models")
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be a non-negative int")
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 100
+        ):
             raise ValueError("limit must be an int between 1 and 100")
         read_timeout = self.read_timeout if timeout is None else float(timeout)
         if read_timeout <= 0:
@@ -546,7 +552,11 @@ class BrowserContextCanonicalClient:
                     total = payload.get("total")
                     if not valid or len(valid) < page_size:
                         break
-                    if isinstance(total, int) and not isinstance(total, bool) and offset >= total:
+                    if (
+                        isinstance(total, int)
+                        and not isinstance(total, bool)
+                        and offset >= total
+                    ):
                         break
         return sorted(
             conversations.values(),
@@ -576,7 +586,9 @@ class BrowserContextCanonicalClient:
         payload = self._get_conversation_payload(ref.conversation_id)
 
         class _SnapshotReader:
-            def _get_conversation_payload(self, _conversation_id: str) -> dict[str, Any]:
+            def _get_conversation_payload(
+                self, _conversation_id: str
+            ) -> dict[str, Any]:
                 return payload
 
         reader = _SnapshotReader()

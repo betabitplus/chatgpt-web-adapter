@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
@@ -11,12 +10,11 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from pr10_1_artifact_topology_v3_live_gate import (  # noqa: E402
+    _EXPECTED_SUPPORT,
     PROBE_FILENAME,
     ProductArtifactTopologyV3Provider,
-    _EXPECTED_SUPPORT,
     _safe_candidate,
 )
-
 
 EXTENSION = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
 WORKER = EXTENSION / "service_worker_generated_artifact_topology_v3_pr10_1.js"
@@ -37,10 +35,14 @@ def test_topology_v3_loads_after_surface_v2_without_replacing_chain() -> None:
     observability = OBSERVABILITY.read_text(encoding="utf-8")
     v2 = 'importScripts("service_worker_generated_artifact_surface_v2_overlay_pr10_1.js");'
     v3 = 'importScripts("service_worker_generated_artifact_topology_v3_pr10_1.js");'
-    patch = 'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    patch = (
+        'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    )
     assert v2 in observability
     assert v3 in observability
-    assert observability.index(v2) < observability.index(v3) < observability.index(patch)
+    assert (
+        observability.index(v2) < observability.index(v3) < observability.index(patch)
+    )
 
 
 def test_topology_v3_requires_proven_assistant_probe_turn() -> None:
@@ -78,7 +80,7 @@ def test_topology_v3_exports_names_not_values() -> None:
     assert "Object.keys(handles.props)" in source
     assert "Object.keys(memoized)" in source
     assert "getAttribute('href')" not in source
-    assert "getAttribute(\"href\")" not in source
+    assert 'getAttribute("href")' not in source
     assert ".href" not in source
     assert "rawDomExported: false" in source
     assert "rawTextExported: false" in source
@@ -227,7 +229,9 @@ def test_topology_v3_snapshot_contract_and_shape(monkeypatch) -> None:
     assert diagnostic["failure_reason"] is None
     assert snapshot["probe_placement_proven"] is True
     assert snapshot["filename_candidate_count"] == 1
-    assert snapshot["candidate_summaries"][0]["identity_like_react_prop_names"] == ["fileId"]
+    assert snapshot["candidate_summaries"][0]["identity_like_react_prop_names"] == [
+        "fileId"
+    ]
     assert snapshot["react_prop_values_exported"] is False
     assert snapshot["locator_values_exported"] is False
 

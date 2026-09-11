@@ -169,7 +169,9 @@ def test_runtime_canonical_methods_do_not_route_through_write_transport() -> Non
     assert transport.send_calls == []
 
 
-def test_runtime_canonical_methods_use_transport_canonical_client_when_available() -> None:
+def test_runtime_canonical_methods_use_transport_canonical_client_when_available() -> (
+    None
+):
     source_canonical = _Canonical()
     transport_canonical = _Canonical()
     transport = _FakeTransport()

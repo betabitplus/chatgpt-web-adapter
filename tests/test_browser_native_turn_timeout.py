@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 EXTENSION = (
     Path(__file__).resolve().parents[1]
     / "src"
@@ -13,7 +12,9 @@ EXTENSION = (
 
 def test_browser_native_turn_timeout_is_not_capped_at_five_minutes() -> None:
     worker = (EXTENSION / "service_worker.js").read_text(encoding="utf-8")
-    rich_input = (EXTENSION / "service_worker_rich_input_pr9_2.js").read_text(encoding="utf-8")
+    rich_input = (EXTENSION / "service_worker_rich_input_pr9_2.js").read_text(
+        encoding="utf-8"
+    )
     host = (
         Path(__file__).resolve().parents[1]
         / "src"

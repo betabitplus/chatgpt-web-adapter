@@ -3,7 +3,9 @@ from __future__ import annotations
 import chatgpt_web_adapter.browser_native_host as subject
 
 
-def test_broker_forwards_release_runtime_tab_under_authority_lock(monkeypatch, tmp_path):
+def test_broker_forwards_release_runtime_tab_under_authority_lock(
+    monkeypatch, tmp_path
+):
     broker = subject.BrowserNativeBroker(state_dir=tmp_path)
     broker.extension_connected = True
 
@@ -65,7 +67,9 @@ def test_broker_rejects_release_while_turn_authority_lock_busy(tmp_path):
     assert result["error"] == "BROWSER_NATIVE_BRIDGE_BUSY"
 
 
-def test_observe_turn_uses_reserved_lease_without_claiming_new_authority_lane(monkeypatch, tmp_path):
+def test_observe_turn_uses_reserved_lease_without_claiming_new_authority_lane(
+    monkeypatch, tmp_path
+):
     broker = subject.BrowserNativeBroker(state_dir=tmp_path)
     broker.extension_connected = True
     broker.turn_lock.acquire()

@@ -71,7 +71,9 @@ def test_stop_generation_bypasses_active_turn_lock(tmp_path, monkeypatch) -> Non
         broker.close()
 
 
-def test_stop_generation_wakes_matching_pending_observe_turn(tmp_path, monkeypatch) -> None:
+def test_stop_generation_wakes_matching_pending_observe_turn(
+    tmp_path, monkeypatch
+) -> None:
     broker = BrowserNativeBroker(state_dir=tmp_path)
     broker.start()
     broker.extension_connected = True

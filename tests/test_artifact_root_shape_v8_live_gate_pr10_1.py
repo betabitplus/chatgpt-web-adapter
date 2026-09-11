@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
@@ -11,12 +10,11 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from pr10_1_artifact_root_shape_v8_live_gate import (  # noqa: E402
+    _EXPECTED_SUPPORT,
     ARTIFACT_ROOT_SHAPE_SCHEMA,
     ProductArtifactRootShapeV8Provider,
-    _EXPECTED_SUPPORT,
     _safe_candidate,
 )
-
 
 EXTENSION = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
 WORKER = EXTENSION / "service_worker_generated_artifact_root_shape_v8_pr10_1.js"
@@ -27,7 +25,10 @@ GATE = TOOLS / "pr10_1_artifact_root_shape_v8_live_gate.py"
 
 def test_root_shape_v8_preserves_historical_manifest_entrypoint() -> None:
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    assert manifest["background"]["service_worker"] == "service_worker_browser_runtime_v2.js"
+    assert (
+        manifest["background"]["service_worker"]
+        == "service_worker_browser_runtime_v2.js"
+    )
     assert manifest["version"] == "0.1.13"
 
 
@@ -35,10 +36,14 @@ def test_root_shape_v8_loads_after_v7_without_replacing_chain() -> None:
     observability = OBSERVABILITY.read_text(encoding="utf-8")
     v7 = 'importScripts("service_worker_generated_artifact_subtree_v7_pr10_1.js");'
     v8 = 'importScripts("service_worker_generated_artifact_root_shape_v8_pr10_1.js");'
-    patch = 'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    patch = (
+        'importScripts("service_worker_normalized_activity_patch_protocol_pr8_12.js");'
+    )
     assert v7 in observability
     assert v8 in observability
-    assert observability.index(v7) < observability.index(v8) < observability.index(patch)
+    assert (
+        observability.index(v7) < observability.index(v8) < observability.index(patch)
+    )
 
 
 def test_root_shape_v8_requires_probe_placement_and_exact_structural_roots() -> None:
@@ -49,7 +54,10 @@ def test_root_shape_v8_requires_probe_placement_and_exact_structural_roots() -> 
     assert "probePlacementProven" in source
     assert "structuralArtifactRoot" in source
     assert "text.includes('.')" in source
-    assert "'attachment', 'attachments', 'file', 'files', 'artifact', 'artifacts'" in source
+    assert (
+        "'attachment', 'attachments', 'file', 'files', 'artifact', 'artifacts'"
+        in source
+    )
     assert "FileTile.removeFile" not in source
 
 

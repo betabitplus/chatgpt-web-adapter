@@ -15,7 +15,9 @@ LEASE_ID = "lease-retained-forensics"
 
 
 class FakeHealth:
-    def __init__(self, *, ready=True, canonical_status="completed", runtime_tab_id=TAB_ID):
+    def __init__(
+        self, *, ready=True, canonical_status="completed", runtime_tab_id=TAB_ID
+    ):
         self.ready = ready
         self.canonical_status = canonical_status
         self.runtime_tab_id = runtime_tab_id
@@ -111,7 +113,9 @@ class FakeProvider:
             },
         )
 
-    def retained_picker_surface_forensics(self, conversation, *, expected_runtime_tab_id, timeout=20.0):
+    def retained_picker_surface_forensics(
+        self, conversation, *, expected_runtime_tab_id, timeout=20.0
+    ):
         assert conversation == CONVERSATION
         assert expected_runtime_tab_id == TAB_ID
         return dict(self.forensic)
@@ -123,8 +127,12 @@ class FakeProvider:
             runtime_tab_id=self.runtime_tab_id,
         )
 
-    def release_runtime_tab(self, *, expected_runtime_tab_id, browser_authority_lease_id, timeout):
-        self.release_calls.append((expected_runtime_tab_id, browser_authority_lease_id, timeout))
+    def release_runtime_tab(
+        self, *, expected_runtime_tab_id, browser_authority_lease_id, timeout
+    ):
+        self.release_calls.append(
+            (expected_runtime_tab_id, browser_authority_lease_id, timeout)
+        )
         assert expected_runtime_tab_id == TAB_ID
         assert browser_authority_lease_id == LEASE_ID
         self.runtime_tab_id = None
@@ -170,10 +178,17 @@ def test_extension_forensics_layer_is_additive_and_contains_no_product_ui_mutati
     root = browser_native_extension_dir()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["version"] == "0.1.13"
-    assert manifest["background"]["service_worker"] == "service_worker_browser_runtime_v2.js"
+    assert (
+        manifest["background"]["service_worker"]
+        == "service_worker_browser_runtime_v2.js"
+    )
 
-    observability = (root / "service_worker_observability.js").read_text(encoding="utf-8")
-    worker = (root / "service_worker_retained_picker_forensics_pr8_8.js").read_text(encoding="utf-8")
+    observability = (root / "service_worker_observability.js").read_text(
+        encoding="utf-8"
+    )
+    worker = (root / "service_worker_retained_picker_forensics_pr8_8.js").read_text(
+        encoding="utf-8"
+    )
     imports = [
         'importScripts("service_worker_phase_timing_pr8_8.js")',
         'importScripts("service_worker_instant_mode_pr8_8.js")',
@@ -181,7 +196,9 @@ def test_extension_forensics_layer_is_additive_and_contains_no_product_ui_mutati
         'importScripts("service_worker_retained_picker_forensics_pr8_8.js")',
     ]
     assert all(token in observability for token in imports)
-    assert [observability.index(token) for token in imports] == sorted(observability.index(token) for token in imports)
+    assert [observability.index(token) for token in imports] == sorted(
+        observability.index(token) for token in imports
+    )
     for token in (
         "characterizeRetainedPickerForensicsSupport",
         "characterizeRetainedPickerSurfaceForensics",
@@ -241,7 +258,9 @@ def test_provider_parses_bounded_dom_and_ax_topology(monkeypatch):
             "candidates": [{"role": "menuitemradio", "mode": "INSTANT"}],
         },
     }
-    monkeypatch.setattr(provider, "_characterization_rpc", lambda payload, *, timeout: response)
+    monkeypatch.setattr(
+        provider, "_characterization_rpc", lambda payload, *, timeout: response
+    )
     record = provider.retained_picker_surface_forensics(
         CONVERSATION,
         expected_runtime_tab_id=TAB_ID,

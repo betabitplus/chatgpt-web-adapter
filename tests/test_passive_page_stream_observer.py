@@ -14,7 +14,9 @@ RUNTIME_OBSERVATION = EXTENSION / "service_worker_runtime_observation.js"
 BOOTSTRAP = EXTENSION / "service_worker_browser_runtime_v2.js"
 
 
-def test_manifest_installs_passive_bridge_and_main_world_tap_at_document_start() -> None:
+def test_manifest_installs_passive_bridge_and_main_world_tap_at_document_start() -> (
+    None
+):
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     scripts = manifest["content_scripts"]
     assert scripts == [
@@ -72,7 +74,7 @@ def test_passive_layer_is_terminal_after_stable_runtime_assembly() -> None:
     connector = 'importScripts("service_worker_connector_support_pr10_0.js");'
     liveness = 'importScripts("service_worker_ui_liveness.js");'
     assert source.index(connector) < source.index(liveness)
-    assert 'service_worker_passive_stream_observer.js' not in source
+    assert "service_worker_passive_stream_observer.js" not in source
 
     bootstrap = BOOTSTRAP.read_text(encoding="utf-8")
     runtime = 'importScripts("service_worker_runtime.js");'
@@ -86,7 +88,7 @@ def test_passive_layer_is_terminal_after_stable_runtime_assembly() -> None:
     assert "CWA_PASSIVE_MAX_BUFFERED_EVENTS = 128" in worker
     assert "_cwaPassiveSessionsByObserverId" in worker
     assert "_cwaPassiveNewObserverId" in worker
-    assert 'chrome.tabs.sendMessage(tabId, { type, observerId })' in worker
+    assert "chrome.tabs.sendMessage(tabId, { type, observerId })" in worker
     assert "chrome.debugger" not in worker
     assert "fetch(" not in worker
 
@@ -183,7 +185,10 @@ onMessage({{
         "passive_turn_terminal",
         "passive_stream_ended",
     ]
-    assert payload["events"][1]["text"] == "Первый нюанс уже появился: читаю workspace последовательно."
+    assert (
+        payload["events"][1]["text"]
+        == "Первый нюанс уже появился: читаю workspace последовательно."
+    )
     assert payload["events"][2]["tool_name"] == "api_tool.call_tool"
     assert payload["events"][2]["label"] == "Reading git status..."
     assert payload["events"][3]["message_id"] == "final-1"
@@ -200,14 +205,19 @@ def test_passive_worker_requires_real_stream_start_before_long_observation() -> 
     assert "session.handoffPending = true" in worker
     assert "session.streamObserved = true" in worker
     assert "session.activeStreamCount += 1" in worker
-    assert "session.activeStreamCount = Math.max(0, session.activeStreamCount - 1)" in worker
+    assert (
+        "session.activeStreamCount = Math.max(0, session.activeStreamCount - 1)"
+        in worker
+    )
     assert 'error: "PASSIVE_OBSERVER_STREAM_NOT_OBSERVED"' in worker
     assert 'error: "PASSIVE_OBSERVER_STREAM_ENDED_WITHOUT_TERMINAL"' in worker
     assert "session.startupTimer = setTimeout" in worker
     assert "_cwaPassiveScheduleEndedFallback(session)" in worker
 
 
-def test_passive_tap_follows_existing_page_websocket_handoff_without_new_network() -> None:
+def test_passive_tap_follows_existing_page_websocket_handoff_without_new_network() -> (
+    None
+):
     harness = f"""
 const fs = require('fs');
 const vm = require('vm');

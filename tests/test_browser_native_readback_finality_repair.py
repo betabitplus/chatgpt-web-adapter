@@ -60,19 +60,24 @@ def _assistant(*, message_id: str, text: str, finish_reason=None):
     )
 
 
-def test_matching_completed_status_finalizes_nonempty_assistant_without_finish_reason() -> None:
+def test_matching_completed_status_finalizes_nonempty_assistant_without_finish_reason() -> (
+    None
+):
     message = _assistant(message_id="assistant-new", text="done", finish_reason=None)
     client = _ReadbackClient(
         status=SimpleNamespace(status="completed", message_id="assistant-new"),
         messages=[message],
     )
-    assert _wait_for_new_final_assistant(
-        client,
-        "conversation-1",
-        baseline_assistant_ids=set(),
-        timeout=0.01,
-        interval=0.001,
-    ) is message
+    assert (
+        _wait_for_new_final_assistant(
+            client,
+            "conversation-1",
+            baseline_assistant_ids=set(),
+            timeout=0.01,
+            interval=0.001,
+        )
+        is message
+    )
 
 
 def test_stale_completed_status_cannot_finalize_new_partial_assistant() -> None:
@@ -113,13 +118,16 @@ def test_finish_reason_remains_fast_path_without_status_message_id() -> None:
         status=SimpleNamespace(status="completed", message_id=None),
         messages=[message],
     )
-    assert _wait_for_new_final_assistant(
-        client,
-        "conversation-1",
-        baseline_assistant_ids=set(),
-        timeout=0.01,
-        interval=0.001,
-    ) is message
+    assert (
+        _wait_for_new_final_assistant(
+            client,
+            "conversation-1",
+            baseline_assistant_ids=set(),
+            timeout=0.01,
+            interval=0.001,
+        )
+        is message
+    )
 
 
 def _canonical_node(

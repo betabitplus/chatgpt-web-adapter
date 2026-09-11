@@ -61,7 +61,9 @@ class FakeProvider:
         self.release_calls = []
 
     def send_text(self, *args, **kwargs):
-        raise AssertionError("low-level provider call is replaced by submit_browser_native")
+        raise AssertionError(
+            "low-level provider call is replaced by submit_browser_native"
+        )
 
     def status(self):
         self.status_count += 1

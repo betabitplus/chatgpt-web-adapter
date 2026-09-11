@@ -80,7 +80,9 @@ def test_provider_round_trip_uses_loopback_token_and_safe_result(tmp_path) -> No
     assert result.runtime_reload_ms == 321
 
 
-def test_provider_serializes_fresh_canonical_completion_recovery_evidence(tmp_path) -> None:
+def test_provider_serializes_fresh_canonical_completion_recovery_evidence(
+    tmp_path,
+) -> None:
     _, captured, result = _round_trip(
         tmp_path,
         lambda provider: provider.send_text_with_stale_ui_recovery(

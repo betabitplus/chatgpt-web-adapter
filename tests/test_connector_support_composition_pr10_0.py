@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 EXT = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
 BOOTSTRAP = EXT / "service_worker_browser_runtime_v2.js"
@@ -45,8 +44,8 @@ def test_connector_support_remains_outermost_turn_wrapper() -> None:
 def test_outer_support_probes_are_direct_no_write_and_other_turns_delegate() -> None:
     source = SUPPORT.read_text(encoding="utf-8")
 
-    connector_flag = 'message?.characterizeConnectorObservationSupport === true'
-    surface_flag = 'message?.characterizeRequiredActionSurface === true'
+    connector_flag = "message?.characterizeConnectorObservationSupport === true"
+    surface_flag = "message?.characterizeRequiredActionSurface === true"
     delegation = "return _pr100SupportPriorExecuteNativeTurn(message);"
     contract = "connectorObservationSupported: true"
 

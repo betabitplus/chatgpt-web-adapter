@@ -4,7 +4,6 @@ import json
 import struct
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 EXT = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
 
@@ -32,7 +31,12 @@ def test_manifest_presents_a_product_popup_without_expanding_permissions() -> No
     assert manifest["background"]["service_worker"] == (
         "service_worker_browser_runtime_v2.js"
     )
-    assert set(manifest["permissions"]) == {"debugger", "tabs", "storage", "nativeMessaging"}
+    assert set(manifest["permissions"]) == {
+        "debugger",
+        "tabs",
+        "storage",
+        "nativeMessaging",
+    }
     assert manifest["host_permissions"] == ["https://chatgpt.com/*"]
     assert manifest["action"]["default_popup"] == "popup.html"
     assert manifest["action"]["default_title"] == "ChatGPT Web Adapter"
@@ -112,9 +116,9 @@ def test_service_worker_status_surface_is_local_sanitized_and_non_mutating() -> 
     assert "chrome.tabs.create" not in worker
 
     assert 'importScripts("service_worker_product_surface_pr11_0.js");' in observability
-    assert observability.index('importScripts("service_worker_product_surface_pr11_0.js");') > (
-        observability.index("_executeNativeTurnWithProvisioningObservability")
-    )
+    assert observability.index(
+        'importScripts("service_worker_product_surface_pr11_0.js");'
+    ) > (observability.index("_executeNativeTurnWithProvisioningObservability"))
 
 
 def test_popup_clipboard_contract_is_explicitly_sanitized() -> None:
@@ -161,7 +165,10 @@ def test_package_and_release_gate_include_product_assets() -> None:
     ):
         assert pattern in pyproject
 
-    assert 'EXTENSION_PACKAGE_PATTERNS = ("*.json", "*.js", "*.html", "*.css", "*.png")' in release_gate
+    assert (
+        'EXTENSION_PACKAGE_PATTERNS = ("*.json", "*.js", "*.html", "*.css", "*.png")'
+        in release_gate
+    )
     for required in (
         "browser_native_extension/popup.html",
         "browser_native_extension/popup.css",

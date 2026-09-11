@@ -134,6 +134,22 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             )
         return [dict(item) for item in helper()]
 
+    def list_models(self) -> list[dict[str, Any]]:
+        helper = getattr(self.canonical, "list_models", None)
+        if not callable(helper):
+            raise RuntimeError(
+                "canonical model catalog is unavailable on the selected canonical client"
+            )
+        return [dict(item) for item in helper()]
+
+    def conversation_snapshot(self, conversation: Any, **kwargs: Any) -> dict[str, Any]:
+        helper = getattr(self.canonical, "conversation_snapshot", None)
+        if not callable(helper):
+            raise RuntimeError(
+                "canonical conversation snapshot is unavailable on the selected canonical client"
+            )
+        return dict(helper(conversation, **kwargs))
+
     def get_conversation_payload(self, conversation: Any) -> dict[str, Any]:
         helper = getattr(self.canonical, "get_conversation_payload", None)
         if not callable(helper):

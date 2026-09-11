@@ -126,6 +126,61 @@ def test_runtime_exposes_canonical_conversation_catalog(monkeypatch) -> None:
     assert result[0] is not catalog[0]
 
 
+def test_runtime_exposes_canonical_model_catalog(monkeypatch) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    models = [{"slug": "gpt-5-6-thinking", "title": "GPT-5.6"}]
+    monkeypatch.setattr(
+        runtime.canonical,
+        "list_models",
+        lambda: models,
+        raising=False,
+    )
+
+    result = runtime.list_models()
+
+    assert result == models
+    assert result is not models
+    assert result[0] is not models[0]
+
+
+def test_runtime_exposes_canonical_conversation_snapshot(monkeypatch) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    snapshot = {"status": object(), "messages": [object()]}
+    calls = []
+
+    def fake_snapshot(conversation, **kwargs):
+        calls.append((conversation, kwargs))
+        return snapshot
+
+    monkeypatch.setattr(
+        runtime.canonical,
+        "conversation_snapshot",
+        fake_snapshot,
+        raising=False,
+    )
+
+    result = runtime.conversation_snapshot("conversation-1", limit=25)
+
+    assert result == snapshot
+    assert result is not snapshot
+    assert calls == [("conversation-1", {"limit": 25})]
+
+
+def test_runtime_exposes_complete_gptty_read_surface() -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+
+    for name in (
+        "attach_conversation",
+        "get_messages",
+        "get_status",
+        "list_conversations",
+        "list_models",
+        "conversation_snapshot",
+        "get_conversation_payload",
+    ):
+        assert callable(getattr(runtime, name, None)), name
+
+
 def test_runtime_exposes_raw_canonical_conversation_payload(monkeypatch) -> None:
     runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
     payload = {"title": "Graph", "mapping": {"node": {}}}

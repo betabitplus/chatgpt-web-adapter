@@ -330,6 +330,14 @@ Append concise entries here whenever a tracker state changes. Reference task IDs
 - Exact live verification used the installed gptty environment and the same conversation: snapshot returned 2047 messages with status `tool_calling`, model catalog returned 17 models, and the real enhanced `gptty chat` path `/resume 6aa33498-f770-83ed-a42b-4fe22f438807` reached `Resumed:` and rendered the conversation. A wider read-only check also passed catalog, status, messages and attach against the same conversation.
 - Full post-fix suites: CWA 2256/2256 and gptty 289/289. The fix was pushed to both the public fork integration branch and private backup before this evidence entry was recorded.
 
+### 2026-09-12 — resumed-chat live-follow regression repair
+
+- A second real first-use check exposed a separate regression: `/resume` loaded the canonical snapshot, but an already-running browser turn stopped updating in gptty after the first visible reasoning entries while ChatGPT Web continued adding reasoning/tool activity. The regression traced to gptty commit `fcd409b` (`Make resumed chats non-blocking`), which correctly removed the old blocking follow loop but also removed live follow entirely.
+- CWA commit `d61b039` adds `conversation_follow_snapshot()`: one canonical payload read produces status, bounded visible messages and revision-safe canonical intermediate events using the same classifier as normal browser-owned sends. The first snapshot seeds already-seen event IDs; later polls therefore emit only new reasoning/tool/activity nodes.
+- gptty commit `0218ef6` restores follow as a non-blocking enhanced-loop state machine rather than reverting the old blocker. The prompt remains usable while an unfinished resumed turn is followed; user text queues until that turn completes, commands run between canonical reads, Ctrl-C maps to `/stop`, and polling stops on completion/context change/approval/timeout. Older CWA clients fall back to the ordinary snapshot path.
+- Exact live verification used active conversation `6aa4861b-475c-83eb-b7da-4406ce8c8b3b`. A canonical seed recorded 601 historical intermediate nodes and the next poll returned exactly one new tool call without replaying the old events. Source enhanced `gptty chat` then reached `Resumed:` and rendered a new post-resume tool block. Finally, the installed `/Users/stas/.local/bin/gptty` was replaced with a clean wheel built from exact commit `0218ef6` and repeated the same check successfully (`GPTTY_INSTALLED_LIVE_FOLLOW_OK tool`).
+- Full post-fix suites: CWA 2257/2257 and gptty 291/291; targeted Ruff checks and `git diff --check` passed. CWA `d61b039` is pushed to the public integration branch and private backup; gptty `0218ef6` is pushed to the user's `origin/feature/wkwebview-authority-e2e`.
+
 ## Rules for maintaining this tracker
 
 - Never mark an item `DONE` from code inspection alone when its acceptance criterion requires a live or installed-artifact test.

@@ -13,7 +13,10 @@ from chatgpt_web_adapter.browserless_request_transport import (
 from chatgpt_web_adapter.exceptions import RequestError
 from chatgpt_web_adapter.product_capabilities import CapabilityState
 from chatgpt_web_adapter.product_contract import product_runtime_contract
-from chatgpt_web_adapter.product_runtime import ChatGPTProductRuntime, assemble_product_runtime
+from chatgpt_web_adapter.product_runtime import (
+    ChatGPTProductRuntime,
+    assemble_product_runtime,
+)
 from chatgpt_web_adapter.sentinel_bundle import prepared_send_active
 from chatgpt_web_adapter.types import ChatConversation, ChatMessage, ChatResponse
 
@@ -94,12 +97,16 @@ class _DirectClient:
         )
 
     def _get_chat_requirements(self):
-        raise AssertionError("browserless transport must not call legacy single-step requirements")
+        raise AssertionError(
+            "browserless transport must not call legacy single-step requirements"
+        )
 
     def _build_proof_header(self, requirements):
         raise AssertionError("browserless transport must not generate proof-of-work")
 
-    def send(self, prompt, *, conversation=None, on_token=None, on_event=None, **kwargs):
+    def send(
+        self, prompt, *, conversation=None, on_token=None, on_event=None, **kwargs
+    ):
         self.send_calls += 1
         self.prepared_state_seen.append(prepared_send_active())
         assert prepared_send_active() is True
@@ -125,7 +132,10 @@ class _DirectClient:
                 "x-openai-target-route": "/backend-api/f/conversation",
             }
         )
-        assert prepared_headers["x-oai-turn-trace-id"] == final_headers["x-oai-turn-trace-id"]
+        assert (
+            prepared_headers["x-oai-turn-trace-id"]
+            == final_headers["x-oai-turn-trace-id"]
+        )
         if on_token is not None:
             on_token("stream ")
             on_token("answer")
@@ -208,7 +218,10 @@ def test_happy_path_is_one_current_prepared_write_with_canonical_finality() -> N
     assert execution.provenance is not None
     assert execution.provenance.completion.canonical_completion_proven is True
     assert execution.observation.sentinel_protocol == "TWO_PHASE_PREPARE_FINALIZE"
-    assert execution.observation.conversation_prepare_protocol == "PREPARE_CONDUIT_FINAL_WRITE"
+    assert (
+        execution.observation.conversation_prepare_protocol
+        == "PREPARE_CONDUIT_FINAL_WRITE"
+    )
     assert execution.observation.reconciliation == "STREAM_REVISED_BY_CANONICAL"
     assert [event["type"] for event in events] == [
         "assistant_text_delta",
@@ -288,7 +301,9 @@ def test_unknown_future_non_boolean_required_descriptor_is_protocol_drift() -> N
         }
     )
 
-    with pytest.raises(BrowserlessProtocolDriftError, match="future_protection.required"):
+    with pytest.raises(
+        BrowserlessProtocolDriftError, match="future_protection.required"
+    ):
         BrowserlessRequestTransport(client).send_text("hello")
 
     assert client.finalize_calls == 0
@@ -414,7 +429,9 @@ def test_complete_caller_conversation_is_still_canonically_reattached() -> None:
 def test_canonical_readback_must_advance_beyond_prewrite_parent() -> None:
     client = _DirectClient(canonical_message_id="attached-parent")
 
-    with pytest.raises(BrowserlessRequestTransportError, match="did not advance") as captured:
+    with pytest.raises(
+        BrowserlessRequestTransportError, match="did not advance"
+    ) as captured:
         BrowserlessRequestTransport(client).send_text(
             "continue",
             conversation="conversation-from-caller",
@@ -465,14 +482,18 @@ def test_unknown_write_outcome_requires_reconciliation_and_is_not_retried() -> N
 
 
 def test_canonical_finality_failure_requires_reconciliation() -> None:
-    client = _DirectClient(status="running")
+    client = _DirectClient()
 
-    with pytest.raises(BrowserlessRequestTransportError) as captured:
-        BrowserlessRequestTransport(client).send_text(
-            "hello",
-            timeout=0.01,
-            poll_interval=0.005,
-        )
+    def fail_canonical_status(_conversation):
+        raise RuntimeError("canonical status unavailable")
+
+    client.get_status = fail_canonical_status
+
+    with pytest.raises(
+        BrowserlessRequestTransportError,
+        match="canonical status read failed after browserless write",
+    ) as captured:
+        BrowserlessRequestTransport(client).send_text("hello")
 
     assert captured.value.request_stage == "canonical_reconciliation"
     assert captured.value.write_may_have_been_submitted is True
@@ -502,9 +523,14 @@ def test_capabilities_are_feature_scoped_while_transport_stays_experimental() ->
 
     governance = runtime.governance()
     assert governance["browserless_sentinel_protocol"] == "TWO_PHASE_PREPARE_FINALIZE"
-    assert governance["browserless_conversation_write_protocol"] == "PREPARE_CONDUIT_FINAL_WRITE"
+    assert (
+        governance["browserless_conversation_write_protocol"]
+        == "PREPARE_CONDUIT_FINAL_WRITE"
+    )
     assert governance["browserless_legacy_single_step_requirements_fallback"] is False
-    assert governance["browserless_legacy_unprepared_conversation_write_fallback"] is False
+    assert (
+        governance["browserless_legacy_unprepared_conversation_write_fallback"] is False
+    )
 
 
 def test_profile_temporary_and_browser_authority_requests_fail_before_network() -> None:
@@ -515,7 +541,9 @@ def test_profile_temporary_and_browser_authority_requests_fail_before_network() 
         runtime.send_text("hello", model_profile="DEEP")
     with pytest.raises(RuntimeError, match="PRODUCT_CONVERSATION_MODE_UNAVAILABLE"):
         runtime.send_text("hello", conversation_mode="temporary")
-    with pytest.raises(ValueError, match="browser authority policy overrides are unavailable"):
+    with pytest.raises(
+        ValueError, match="browser authority policy overrides are unavailable"
+    ):
         runtime.send_text("hello", browser_authority_policy="TURN_SCOPED")
 
     assert client.prepare_calls == 0

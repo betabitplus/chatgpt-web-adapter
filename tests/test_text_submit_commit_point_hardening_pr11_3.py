@@ -16,29 +16,33 @@ READ = EXTENSION / "service_worker_runtime_read.js"
 RUNTIME = EXTENSION / "service_worker_runtime.js"
 
 
-def test_text_submit_hardening_loads_after_rich_authority_before_observation_layers() -> None:
+def test_text_submit_hardening_loads_after_rich_authority_before_observation_layers() -> (
+    None
+):
     schema_loader = SCHEMA_LOADER.read_text(encoding="utf-8")
     write = WRITE.read_text(encoding="utf-8")
     read = READ.read_text(encoding="utf-8")
     runtime = RUNTIME.read_text(encoding="utf-8")
     rich = 'importScripts("service_worker_rich_input_schema29_repair_pr9_2.js");'
-    hardening = 'importScripts("service_worker_text_submit_commit_hardening_pr11_3.js");'
+    hardening = (
+        'importScripts("service_worker_text_submit_commit_hardening_pr11_3.js");'
+    )
     observation = 'importScripts("service_worker_product_source_citations_pr9_3.js");'
-    canonical_read = 'importScripts("service_worker_canonical_read.js");'
+    canonical_read = 'importScripts("service_worker_canonical_read_v2.js");'
 
     assert rich in schema_loader
     assert hardening in write
     assert read.index(observation) < read.index(canonical_read)
-    assert runtime.index('importScripts("service_worker_runtime_write.js");') < runtime.index(
-        'importScripts("service_worker_runtime_read.js");'
-    )
+    assert runtime.index(
+        'importScripts("service_worker_runtime_write.js");'
+    ) < runtime.index('importScripts("service_worker_runtime_read.js");')
 
 
 def test_text_submit_hardening_declares_exact_protected_boundaries() -> None:
     text = OVERLAY.read_text(encoding="utf-8")
 
-    assert 'PR11_3_TEXT_MOUSE_RELEASE_OUTCOME_UNCONFIRMED' in text
-    assert 'PR11_3_TEXT_ENTER_KEYDOWN_OUTCOME_UNCONFIRMED' in text
+    assert "PR11_3_TEXT_MOUSE_RELEASE_OUTCOME_UNCONFIRMED" in text
+    assert "PR11_3_TEXT_ENTER_KEYDOWN_OUTCOME_UNCONFIRMED" in text
     assert 'type: "mouseReleased"' in text
     assert 'type: "keyDown"' in text
     assert 'type: "keyUp"' in text

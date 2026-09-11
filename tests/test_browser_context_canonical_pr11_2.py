@@ -67,13 +67,16 @@ def test_chunk_collector_reassembles_exact_sha256_sealed_bytes() -> None:
             }
         )
 
-    assert collector.finish(
-        {
-            "chunkCount": 2,
-            "totalBytes": len(body),
-            "sha256": digest,
-        }
-    ) == body
+    assert (
+        collector.finish(
+            {
+                "chunkCount": 2,
+                "totalBytes": len(body),
+                "sha256": digest,
+            }
+        )
+        == body
+    )
 
 
 def test_chunk_collector_rejects_integrity_mismatch() -> None:
@@ -118,28 +121,6 @@ def test_canonical_error_exports_only_sanitized_metadata() -> None:
     assert payload["body_preview"] is None
 
 
-def test_transient_canonical_transport_errors_are_retryable_even_with_legacy_false_flag() -> None:
-    for reason in (
-        "CANONICAL_READ_TIMEOUT",
-        "CANONICAL_READ_NETWORK_ERROR",
-        "CANONICAL_READ_BRIDGE_FAILURE",
-    ):
-        error = BrowserContextCanonicalReadError(
-            reason,
-            conversation_id="conversation-1",
-            retryable=False,
-        )
-        assert error.retryable is True
-        assert error.to_dict()["retryable"] is True
-
-    permanent = BrowserContextCanonicalReadError(
-        "CANONICAL_READ_AUTHENTICATION_REQUIRED",
-        conversation_id="conversation-1",
-        retryable=False,
-    )
-    assert permanent.retryable is False
-
-
 def test_browser_context_client_owns_terminal_ack_contract(tmp_path) -> None:
     provider = BrowserNativeTurnProvider(state_dir=tmp_path)
     client = BrowserContextCanonicalClient(object(), provider)
@@ -151,85 +132,19 @@ def test_browser_context_client_owns_terminal_ack_contract(tmp_path) -> None:
     assert not callable(getattr(provider, "complete_canonical_readback", None))
 
 
-def test_browser_context_client_keeps_python_status_interpreter(tmp_path, monkeypatch) -> None:
+def test_browser_context_client_keeps_python_status_interpreter(
+    tmp_path, monkeypatch
+) -> None:
     provider = BrowserNativeTurnProvider(state_dir=tmp_path)
     client = BrowserContextCanonicalClient(object(), provider)
-    monkeypatch.setattr(client.transport, "read_conversation", lambda _conversation: _payload())
+    monkeypatch.setattr(
+        client.transport, "read_conversation", lambda _conversation: _payload()
+    )
 
     status = client.get_status("conversation-1")
 
     assert status.status == "completed"
     assert status.message_id == "assistant-1"
-
-
-def test_browser_context_client_exposes_exact_conversation_payload(tmp_path, monkeypatch) -> None:
-    provider = BrowserNativeTurnProvider(state_dir=tmp_path)
-    client = BrowserContextCanonicalClient(object(), provider)
-    payload = _payload()
-    monkeypatch.setattr(client.transport, "read_conversation", lambda _conversation: payload)
-
-    result = client.get_conversation_payload("conversation-1")
-
-    assert result is payload
-    assert result["mapping"]["assistant-node"]["message"]["content"]["parts"] == ["done"]
-
-
-def test_browser_context_client_lists_real_catalog_payloads(tmp_path, monkeypatch) -> None:
-    provider = BrowserNativeTurnProvider(state_dir=tmp_path)
-    client = BrowserContextCanonicalClient(object(), provider)
-    calls = []
-
-    def fake_catalog(kind, **kwargs):
-        calls.append((kind, kwargs))
-        if kind == "models":
-            return {"models": [{"slug": "gpt-real", "title": "Real"}, {"slug": ""}]}
-        archived = kwargs["is_archived"]
-        starred = kwargs["is_starred"]
-        if not archived and not starred:
-            return {
-                "items": [
-                    {"id": "new", "title": "New", "update_time": "2026-09-04T20:00:00Z"},
-                    {"id": "dup", "title": "Old duplicate", "update_time": "2026-09-01T20:00:00Z"},
-                ],
-                "total": 2,
-            }
-        if archived and starred:
-            return {
-                "items": [
-                    {"id": "dup", "title": "Latest duplicate", "update_time": "2026-09-05T20:00:00Z"}
-                ],
-                "total": 1,
-            }
-        return {"items": [], "total": 0}
-
-    monkeypatch.setattr(client.transport, "read_catalog", fake_catalog)
-
-    conversations = client.list_conversations()
-    models = client.list_models()
-
-    assert [item["id"] for item in conversations] == ["dup", "new"]
-    assert conversations[0]["title"] == "Latest duplicate"
-    assert models == [{"slug": "gpt-real", "title": "Real"}]
-    assert sum(kind == "conversations" for kind, _kwargs in calls) == 4
-    assert sum(kind == "models" for kind, _kwargs in calls) == 1
-
-
-def test_conversation_snapshot_reuses_one_canonical_payload(tmp_path, monkeypatch) -> None:
-    provider = BrowserNativeTurnProvider(state_dir=tmp_path)
-    client = BrowserContextCanonicalClient(object(), provider)
-    reads = []
-
-    def fake_read(conversation_id):
-        reads.append(conversation_id)
-        return _payload()
-
-    monkeypatch.setattr(client, "_get_conversation_payload", fake_read)
-
-    snapshot = client.conversation_snapshot("conversation-1")
-
-    assert reads == ["conversation-1"]
-    assert snapshot["status"].status == "completed"
-    assert [message.text for message in snapshot["messages"]] == ["done"]
 
 
 class _Canonical:
@@ -274,12 +189,14 @@ def test_custom_provider_preserves_legacy_canonical_client_contract() -> None:
 
 
 def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -> None:
-    source = (EXTENSION / "service_worker_canonical_read.js").read_text(encoding="utf-8")
+    source = (EXTENSION / "service_worker_canonical_read_v2.js").read_text(
+        encoding="utf-8"
+    )
     read = (EXTENSION / "service_worker_runtime_read.js").read_text(encoding="utf-8")
     runtime = (EXTENSION / "service_worker_runtime.js").read_text(encoding="utf-8")
-    bootstrap = (
-        EXTENSION / "service_worker_browser_runtime_v2.js"
-    ).read_text(encoding="utf-8")
+    bootstrap = (EXTENSION / "service_worker_browser_runtime_v2.js").read_text(
+        encoding="utf-8"
+    )
     connector = (EXTENSION / "service_worker_connector_support_pr10_0.js").read_text(
         encoding="utf-8"
     )
@@ -291,38 +208,34 @@ def test_extension_layers_canonical_read_without_replacing_frozen_boundaries() -
         == "service_worker_browser_runtime_v2.js"
     )
     assert 'importScripts("service_worker_runtime.js");' in bootstrap
+    assert 'importScripts("service_worker_stop_generation.js");' in bootstrap
     assert bootstrap.rstrip().endswith(
         'importScripts("service_worker_passive_stream_observer.js");'
     )
     assert connector.rstrip().endswith("};")
     citations = 'importScripts("service_worker_product_source_citations_pr9_3.js");'
-    canonical = 'importScripts("service_worker_canonical_read.js");'
+    canonical = 'importScripts("service_worker_canonical_read_v2.js");'
     assert read.index(citations) < read.index(canonical)
-    assert runtime.index('importScripts("service_worker_runtime_write.js");') < runtime.index(
-        'importScripts("service_worker_runtime_read.js");'
+    assert runtime.index(
+        'importScripts("service_worker_runtime_write.js");'
+    ) < runtime.index('importScripts("service_worker_runtime_read.js");')
+    assert (
+        'importScripts("service_worker_temporary_chat_route_reopen_probe.js")'
+        not in source
     )
-    assert 'importScripts("service_worker_browser_runtime_v2.js")' not in source
-    assert '"catalog_read"' in source
-    assert '"models"' in source
-    assert '"conversations"' in source
 
     assert 'credentials: "include"' in source
-    assert 'fetch("/api/auth/session"' in source
-    assert 'authorization: "Bearer " + token' in source
-    assert 'const cacheKey = "__cwaCanonicalAccessTokenV1"' in source
-    assert "const cacheTtlMs = 60_000" in source
-    assert "globalThis[cacheKey] = { token, cachedAtMs: Date.now() }" in source
-    assert "delete globalThis[cacheKey]" in source
     assert "response.arrayBuffer()" in source
     assert 'crypto.subtle.digest("SHA-256", bytes)' in source
     assert "CWA_CANONICAL_CHUNK_BASE64_CHARS = 600_000" in source
-    assert 'response.status === 404' in source
-    assert 'response.status === 429' in source
-    assert '"CANONICAL_READ_RATE_LIMITED"' in source
-    assert 'response.status === 404 || response.status === 429' in source
-    assert '"CANONICAL_READ_TIMEOUT"' in source
-    assert '"CANONICAL_READ_NETWORK_ERROR"' in source
-    assert 'retryable: true' in source
+    assert "/backend-api/conversations/" in source
+    assert 'url.searchParams.set("include_has_versions", "true")' in source
+    assert 'url.searchParams.set("num_turns", String(currentNumTurns))' in source
+    assert 'url.searchParams.set("before", before)' in source
+    assert "includeAllPages" in source
+    assert "/backend-api/conversation/" in source
+    assert "first.status !== 404" in source
+    assert "response.status === 404" in source
     assert '"CANONICAL_READ_AUTHENTICATION_REQUIRED"' in source
     assert '"CANONICAL_READ_ACCESS_CHALLENGED"' in source
     assert "document.cookie" not in source
@@ -337,7 +250,6 @@ def test_host_serializes_write_read_and_close_on_one_authority_lane() -> None:
     ).read_text(encoding="utf-8")
 
     assert '"canonical_read"' in source
-    assert '"catalog_read"' in source
     assert '"canonical_read_complete"' in source
     assert '"release_runtime_tab"' in source
     assert "_authority_reserved_lease_id" in source

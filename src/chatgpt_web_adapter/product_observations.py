@@ -141,7 +141,9 @@ def _safe_source_url(value: Any) -> str | None:
     if parsed.username is not None or parsed.password is not None:
         return None
     try:
-        query_items = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
+        query_items = parse_qsl(
+            parsed.query, keep_blank_values=True, strict_parsing=False
+        )
     except ValueError:
         return None
     if any(_sensitive_query_key(key) for key, _ in query_items):
@@ -163,9 +165,15 @@ def _activity_observation_kind(
     activity_kind: str | None,
     operation: str | None,
 ) -> ProductObservationKind:
-    if operation in _SEARCH_OPERATIONS or activity_kind in _SEARCH_ACTIVITY_KINDS:
+    """Prefer explicit normalized operations over coarse activity kinds."""
+
+    if operation is not None:
+        if operation in _SEARCH_OPERATIONS:
+            return ProductObservationKind.SEARCH
+        return ProductObservationKind.TOOL
+    if activity_kind in _SEARCH_ACTIVITY_KINDS:
         return ProductObservationKind.SEARCH
-    if activity_kind in _TOOL_ACTIVITY_KINDS or operation is not None:
+    if activity_kind in _TOOL_ACTIVITY_KINDS:
         return ProductObservationKind.TOOL
     return ProductObservationKind.ACTIVITY
 
@@ -293,7 +301,9 @@ class ProductObservationCollector:
     def _drop(self) -> None:
         self.dropped_event_count += 1
 
-    def _append(self, observation: StructuredProductObservation) -> StructuredProductObservation:
+    def _append(
+        self, observation: StructuredProductObservation
+    ) -> StructuredProductObservation:
         self._observations.append(observation)
         return observation
 
@@ -424,7 +434,9 @@ class ProductObservationCollector:
         self._source_url_by_id[source_id] = url
         return self._append(observation)
 
-    def _consume_citation(self, event: dict[str, Any]) -> ProductCitationObservation | None:
+    def _consume_citation(
+        self, event: dict[str, Any]
+    ) -> ProductCitationObservation | None:
         observation_id = _optional_text(event.get("observation_id"))
         citation_id = _optional_text(event.get("citation_id"))
         source_id = _optional_text(event.get("source_id"))

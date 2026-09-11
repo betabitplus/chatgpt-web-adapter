@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 EXT = ROOT / "src" / "chatgpt_web_adapter" / "browser_native_extension"
 MANIFEST = EXT / "manifest.json"
@@ -116,6 +115,7 @@ def test_write_domain_owns_rich_and_text_write_assembly_only() -> None:
     assert positions == sorted(positions)
     assert len(_active_imports(source)) == len(ordered)
     assert "service_worker_canonical_read.js" not in source
+    assert "service_worker_canonical_read_v2.js" not in source
     assert "service_worker_ui_liveness.js" not in source
     assert "service_worker_connector_support_pr10_0.js" not in source
 
@@ -127,6 +127,7 @@ def test_write_domain_owns_rich_and_text_write_assembly_only() -> None:
         "service_worker_text_submit_commit_hardening_pr11_3.js",
         "service_worker_product_source_citations_pr9_3.js",
         "service_worker_canonical_read.js",
+        "service_worker_canonical_read_v2.js",
     ):
         assert cross_domain_import not in rich
 
@@ -134,7 +135,7 @@ def test_write_domain_owns_rich_and_text_write_assembly_only() -> None:
 def test_read_domain_is_explicit_and_excludes_write_and_observation() -> None:
     source = _source(READ)
     citations = 'importScripts("service_worker_product_source_citations_pr9_3.js");'
-    canonical = 'importScripts("service_worker_canonical_read.js");'
+    canonical = 'importScripts("service_worker_canonical_read_v2.js");'
 
     assert source.index(citations) < source.index(canonical)
     assert len(_active_imports(source)) == 2

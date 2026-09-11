@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .browser_native_provider import BrowserNativeTurnProvider
+from .canonical_product_observation_gate_pr9_3 import (
+    _gate_send_browser_native,
+    _gate_wait_for_new_final_assistant,
+)
 from .exceptions import ConversationTimeoutError, RequestError
 from .message_text import extract_message_text
 from .messages import _chat_message_from_node, _current_branch_nodes
@@ -472,6 +476,7 @@ def _assistant_candidates_from_payload(
     return candidates
 
 
+@_gate_wait_for_new_final_assistant
 def _wait_for_new_final_assistant(
     self: Any,
     conversation_id: str,
@@ -1358,6 +1363,7 @@ def await_browser_native_final(
     return response
 
 
+@_gate_send_browser_native
 def send_browser_native(
     self: Any,
     prompt: str,

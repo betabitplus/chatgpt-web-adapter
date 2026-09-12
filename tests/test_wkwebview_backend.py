@@ -201,6 +201,47 @@ def test_runtime_backend_selection_rejects_conflicting_low_level_injection() -> 
         )
 
 
+def test_wkwebview_provider_text_attachment_download_is_cached() -> None:
+    provider = WKWebViewTurnProvider()
+
+    class _AttachmentTransport:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, float]] = []
+
+        def download_attachment(self, file_id: str, *, timeout: float):
+            self.calls.append((file_id, timeout))
+            return b"# Instructions\nFull text.", {"mime_type": "text/markdown"}
+
+    transport = _AttachmentTransport()
+    provider._lightweight_transport = transport
+    attachment = {
+        "id": "file-1",
+        "name": "instructions.md",
+        "mime_type": "text/markdown",
+        "size": 25,
+    }
+
+    assert provider.read_text_attachment(attachment, timeout=7) == (
+        "# Instructions\nFull text."
+    )
+    assert provider.read_text_attachment(attachment, timeout=9) == (
+        "# Instructions\nFull text."
+    )
+    assert transport.calls == [("file-1", 7)]
+
+    assert (
+        provider.read_text_attachment(
+            {
+                "id": "file-2",
+                "name": "diagram.pdf",
+                "mime_type": "application/pdf",
+            }
+        )
+        is None
+    )
+    assert transport.calls == [("file-1", 7)]
+
+
 def test_wkwebview_catalog_read_uses_helper_and_decodes_json(monkeypatch) -> None:
     provider = WKWebViewTurnProvider()
     commands: list[list[str]] = []

@@ -190,6 +190,114 @@ def test_runtime_exposes_canonical_conversation_snapshot(monkeypatch) -> None:
     assert calls == [("conversation-1", {"limit": 25})]
 
 
+def test_runtime_full_resume_includes_attachment_only_user_text(monkeypatch) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    payload = {
+        "conversation_id": "conversation-1",
+        "current_node": "user-attachment",
+        "mapping": {
+            "user-attachment": {
+                "id": "user-attachment",
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": "user-attachment",
+                    "author": {"role": "user"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "content": {"content_type": "text", "parts": [""]},
+                    "metadata": {
+                        "attachments": [
+                            {
+                                "id": "file-1",
+                                "name": "instructions.md",
+                                "mime_type": "text/markdown",
+                                "size": 23,
+                            }
+                        ]
+                    },
+                },
+            }
+        },
+    }
+    monkeypatch.setattr(
+        runtime.canonical,
+        "get_conversation_payload",
+        lambda _conversation: payload,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime.canonical,
+        "read_text_attachment",
+        lambda attachment: "# Instructions\nFull text.",
+        raising=False,
+    )
+
+    snapshot = runtime.conversation_follow_snapshot(
+        "conversation-1",
+        emitted_message_ids=(),
+        limit=None,
+    )
+
+    assert len(snapshot["messages"]) == 1
+    message = snapshot["messages"][0]
+    assert message.role == "user"
+    assert message.text == (
+        "[attachment: instructions.md · text/markdown · 23 bytes]\n"
+        "# Instructions\nFull text."
+    )
+
+
+def test_runtime_full_resume_keeps_attachment_metadata_when_text_read_fails(
+    monkeypatch,
+) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    payload = {
+        "conversation_id": "conversation-1",
+        "current_node": "user-attachment",
+        "mapping": {
+            "user-attachment": {
+                "id": "user-attachment",
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": "user-attachment",
+                    "author": {"role": "user"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "content": {"content_type": "text", "parts": [""]},
+                    "metadata": {
+                        "attachments": [
+                            {
+                                "id": "file-1",
+                                "name": "diagram.pdf",
+                                "mime_type": "application/pdf",
+                                "size": 42,
+                            }
+                        ]
+                    },
+                },
+            }
+        },
+    }
+    monkeypatch.setattr(
+        runtime.canonical,
+        "get_conversation_payload",
+        lambda _conversation: payload,
+        raising=False,
+    )
+
+    snapshot = runtime.conversation_follow_snapshot(
+        "conversation-1",
+        emitted_message_ids=(),
+        limit=None,
+    )
+
+    assert snapshot["messages"][0].text == (
+        "[attachment: diagram.pdf · application/pdf · 42 bytes]"
+    )
+
+
 def test_runtime_follow_snapshot_reuses_one_canonical_payload(monkeypatch) -> None:
     runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
     payload = {"current_node": "node-2", "mapping": {}}

@@ -20,9 +20,10 @@ def test_production_client_exposes_wk_lightweight_source_contract() -> None:
 
 
 class _Response:
-    def __init__(self, status_code: int, payload: dict) -> None:
+    def __init__(self, status_code: int, payload: dict, *, content: bytes = b"") -> None:
         self.status_code = status_code
         self._payload = payload
+        self.content = content
 
     def json(self) -> dict:
         return self._payload
@@ -163,6 +164,46 @@ def test_lightweight_transport_reads_canonical_through_explicit_contract(
         }
     ]
     assert len(curl.sessions) == 1
+
+
+def test_lightweight_transport_downloads_attachment_with_authenticated_content_fetch(
+    monkeypatch,
+) -> None:
+    source = _SourceClient()
+    transport, _ = _transport(source)
+    curl = _CurlRequests(
+        [
+            [
+                _Response(
+                    200,
+                    {
+                        "download_url": "https://files.example.invalid/content",
+                        "file_name": "instructions.md",
+                        "mime_type": "text/markdown",
+                    },
+                ),
+                _Response(200, {}, content=b"# Instructions\nFull text."),
+            ]
+        ]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+
+    content, metadata = transport.download_attachment("file-1", timeout=9)
+
+    assert content == b"# Instructions\nFull text."
+    assert metadata["file_name"] == "instructions.md"
+    assert source.header_calls == [
+        {
+            "accept": "application/json",
+            "referer": "https://chatgpt.com/",
+        },
+        {
+            "accept": "*/*",
+            "referer": "https://chatgpt.com/",
+        },
+    ]
+    assert [call[0] for call in curl.sessions[0].calls] == ["GET", "GET"]
+    assert curl.sessions[0].calls[1][2]["headers"]["authorization"] == "Bearer test"
 
 
 def test_lightweight_transport_reads_catalog_through_explicit_contract(

@@ -93,6 +93,8 @@ class WKWebViewTurnProvider:
         self._pending_stop_contexts: set[str] = set()
         self._stop_contexts: dict[str, tuple[str, str]] = {}
         self._lightweight_transport: WKLightweightTransport | None = None
+        self._attachment_text_lock = threading.Lock()
+        self._attachment_text_cache: dict[str, str | None] = {}
         self._turn_observer = WKTurnObserver(self)
         self._turn_orchestrator = WKTurnOrchestrator(self)
         self._temporary_runtime = WKTemporaryTurnRuntime(self)
@@ -168,6 +170,71 @@ class WKWebViewTurnProvider:
             stop_requested=self.stop_requested_for,
         )
         return WKWebViewCanonicalClient(source_client, self)
+
+    def read_text_attachment(
+        self,
+        attachment: dict[str, Any],
+        *,
+        timeout: float = 30.0,
+    ) -> str | None:
+        file_id = attachment.get("id")
+        if not isinstance(file_id, str) or not file_id.strip():
+            return None
+        normalized_file_id = file_id.strip()
+        name = str(attachment.get("name") or "").strip().lower()
+        mime_type = str(attachment.get("mime_type") or "").strip().lower()
+        text_like = (
+            mime_type.startswith("text/")
+            or mime_type in {
+                "application/json",
+                "application/ld+json",
+                "application/xml",
+                "application/yaml",
+                "application/x-yaml",
+                "application/toml",
+            }
+            or Path(name).suffix
+            in {
+                ".cfg",
+                ".csv",
+                ".ini",
+                ".js",
+                ".json",
+                ".log",
+                ".md",
+                ".py",
+                ".rst",
+                ".sh",
+                ".toml",
+                ".ts",
+                ".txt",
+                ".xml",
+                ".yaml",
+                ".yml",
+            }
+        )
+        if not text_like:
+            return None
+
+        with self._attachment_text_lock:
+            if normalized_file_id in self._attachment_text_cache:
+                return self._attachment_text_cache[normalized_file_id]
+
+        transport = self._lightweight_transport
+        if transport is None:
+            return None
+        raw, _metadata = transport.download_attachment(
+            normalized_file_id,
+            timeout=timeout,
+        )
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", errors="replace")
+
+        with self._attachment_text_lock:
+            self._attachment_text_cache[normalized_file_id] = text
+        return text
 
     def _canonical_payload_matches_write(
         self,

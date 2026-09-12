@@ -408,6 +408,87 @@ class WKLightweightTransport:
             "height": None,
         }
 
+    def download_attachment(
+        self,
+        file_id: str,
+        *,
+        timeout: float = 30.0,
+    ) -> tuple[bytes, dict[str, Any]]:
+        normalized_file_id = str(file_id).strip()
+        if not normalized_file_id:
+            raise ValueError("file_id is required")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        try:
+            headers = self.source_client.wk_transport_headers(
+                {
+                    "accept": "application/json",
+                    "referer": "https://chatgpt.com/",
+                }
+            )
+        except AttributeError as error:
+            raise RequestError(
+                "WKWEBVIEW_ATTACHMENT_SOURCE_CONTRACT_MISSING",
+                request_stage="wkwebview_attachment_download",
+            ) from error
+        curl_requests = self._curl_requests()
+        try:
+            with curl_requests.Session(impersonate="safari") as session:
+                resolver = session.get(
+                    f"{_CHAT_FILES_URL}/{normalized_file_id}/download",
+                    headers=headers,
+                    timeout=timeout,
+                )
+                if resolver.status_code >= 400:
+                    raise RequestError(
+                        f"WKWEBVIEW_ATTACHMENT_RESOLVE_HTTP:{resolver.status_code}",
+                        request_stage="wkwebview_attachment_download",
+                        status_code=resolver.status_code,
+                    )
+                try:
+                    metadata = resolver.json()
+                except (TypeError, ValueError) as error:
+                    raise RequestError(
+                        "WKWEBVIEW_ATTACHMENT_RESOLVE_INVALID_JSON",
+                        request_stage="wkwebview_attachment_download",
+                    ) from error
+                if not isinstance(metadata, dict):
+                    raise RequestError(
+                        "WKWEBVIEW_ATTACHMENT_RESOLVE_INVALID_SCHEMA",
+                        request_stage="wkwebview_attachment_download",
+                    )
+                download_url = metadata.get("download_url")
+                if not isinstance(download_url, str) or not download_url:
+                    raise RequestError(
+                        "WKWEBVIEW_ATTACHMENT_DOWNLOAD_URL_MISSING",
+                        request_stage="wkwebview_attachment_download",
+                    )
+                content_headers = self.source_client.wk_transport_headers(
+                    {
+                        "accept": "*/*",
+                        "referer": "https://chatgpt.com/",
+                    }
+                )
+                content = session.get(
+                    download_url,
+                    headers=content_headers,
+                    timeout=timeout,
+                )
+                if content.status_code >= 400:
+                    raise RequestError(
+                        f"WKWEBVIEW_ATTACHMENT_CONTENT_HTTP:{content.status_code}",
+                        request_stage="wkwebview_attachment_download",
+                        status_code=content.status_code,
+                    )
+                return bytes(content.content), metadata
+        except RequestError:
+            raise
+        except curl_requests.RequestsError as error:
+            raise RequestError(
+                "WKWEBVIEW_ATTACHMENT_DOWNLOAD_TRANSPORT",
+                request_stage="transport",
+            ) from error
+
     def upload_attachments(
         self,
         attachment_paths: Sequence[str],

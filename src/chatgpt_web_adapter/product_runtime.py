@@ -164,6 +164,79 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             )
         return dict(helper(conversation, **kwargs))
 
+    def _full_resume_messages(
+        self,
+        reader: Any,
+        ref: ConversationRef,
+        payload: dict[str, Any],
+    ) -> list[Any]:
+        messages = get_messages(
+            reader,
+            ref,
+            limit=None,
+            include_empty=True,
+        )
+        mapping = payload.get("mapping")
+        mapping = mapping if isinstance(mapping, dict) else {}
+        attachment_reader = getattr(self.canonical, "read_text_attachment", None)
+
+        for message in messages:
+            if getattr(message, "role", None) != "user":
+                continue
+            node_id = getattr(message, "node_id", None)
+            node = mapping.get(node_id) if isinstance(node_id, str) else None
+            raw_message = node.get("message") if isinstance(node, dict) else None
+            metadata = (
+                raw_message.get("metadata")
+                if isinstance(raw_message, dict)
+                and isinstance(raw_message.get("metadata"), dict)
+                else {}
+            )
+            attachments = metadata.get("attachments")
+            if not isinstance(attachments, list) or not attachments:
+                continue
+
+            blocks: list[str] = []
+            for attachment in attachments:
+                if not isinstance(attachment, dict):
+                    continue
+                name = str(attachment.get("name") or "attachment").strip()
+                mime_type = str(
+                    attachment.get("mime_type") or "application/octet-stream"
+                ).strip()
+                size = attachment.get("size")
+                details = [name, mime_type]
+                if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+                    details.append(f"{size} bytes")
+                header = f"[attachment: {' · '.join(details)}]"
+
+                attachment_text: str | None = None
+                if callable(attachment_reader):
+                    try:
+                        attachment_text = attachment_reader(attachment)
+                    except Exception:  # noqa: BLE001 - resume history must degrade to metadata.
+                        attachment_text = None
+                if attachment_text:
+                    blocks.append(f"{header}\n{attachment_text}")
+                else:
+                    blocks.append(header)
+
+            if not blocks:
+                continue
+            current_text = str(getattr(message, "text", "") or "").strip()
+            attachment_text = "\n\n".join(blocks)
+            message.text = (
+                f"{current_text}\n\n{attachment_text}"
+                if current_text
+                else attachment_text
+            )
+
+        return [
+            message
+            for message in messages
+            if str(getattr(message, "text", "") or "").strip()
+        ]
+
     def conversation_follow_snapshot(
         self,
         conversation: Any,
@@ -203,9 +276,14 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             payload,
             turn_exchange_id=turn_exchange_id,
         )
+        messages = (
+            self._full_resume_messages(reader, ref, payload)
+            if limit is None
+            else get_messages(reader, ref, limit=limit)
+        )
         return {
             "status": get_status(reader, ref),
-            "messages": get_messages(reader, ref, limit=limit),
+            "messages": messages,
             "events": events,
             "emitted_message_ids": sorted(emitted),
             "current_turn_event_ids": current_turn_event_ids,

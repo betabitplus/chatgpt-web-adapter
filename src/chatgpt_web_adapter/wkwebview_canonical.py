@@ -276,6 +276,17 @@ class WKWebViewCanonicalClient(BrowserContextCanonicalClient):
         self.canonical_read_plane = WKWEBVIEW_CANONICAL_READ_PLANE
         self._browser_native_turn_provider = provider
 
+    def read_text_attachment(
+        self,
+        attachment: dict[str, Any],
+        *,
+        timeout: float = 30.0,
+    ) -> str | None:
+        reader = getattr(self.provider, "read_text_attachment", None)
+        if not callable(reader):
+            return None
+        return reader(attachment, timeout=timeout)
+
 
 __all__ = [
     "WKCanonicalState",

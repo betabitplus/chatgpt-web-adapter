@@ -413,6 +413,476 @@ def _canonical_intermediate_events(
     return events
 
 
+def _canonical_stream_identity(
+    payload: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Return the latest stream topic and turn exchange id from canonical history."""
+
+    for _node_id, node in reversed(_current_branch_nodes(payload)):
+        raw_message = node.get("message")
+        if not isinstance(raw_message, dict):
+            continue
+        metadata = raw_message.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        stream_topic_id = metadata.get("stream_topic_id")
+        turn_exchange_id = None
+        for key in ("turn_exchange_id", "working_turn_id"):
+            candidate = metadata.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                turn_exchange_id = candidate.strip()
+                break
+        if isinstance(stream_topic_id, str) and stream_topic_id.strip():
+            return stream_topic_id.strip(), turn_exchange_id
+        if turn_exchange_id is not None:
+            return f"conversation-turn-{turn_exchange_id}", turn_exchange_id
+    return None, None
+
+
+def _canonical_stream_answer_seed(
+    payload: dict[str, Any],
+    *,
+    turn_exchange_id: str | None,
+) -> tuple[str | None, str]:
+    for node_id, node in reversed(_current_branch_nodes(payload)):
+        if turn_exchange_id is not None:
+            node_turn_id = _node_turn_exchange_id(node)
+            if node_turn_id is not None and node_turn_id != turn_exchange_id:
+                continue
+        raw_message = node.get("message")
+        if not isinstance(raw_message, dict):
+            continue
+        author = raw_message.get("author")
+        if not isinstance(author, dict) or author.get("role") != "assistant":
+            continue
+        recipient = raw_message.get("recipient")
+        if isinstance(recipient, str) and recipient.strip() not in {"", "all"}:
+            continue
+        metadata = raw_message.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if metadata.get("is_thinking_preamble_message") is True:
+            continue
+        content = raw_message.get("content")
+        if not isinstance(content, dict) or content.get("content_type") != "text":
+            continue
+        message_id = raw_message.get("id")
+        if not isinstance(message_id, str) or not message_id.strip():
+            message_id = node_id
+        return message_id, extract_message_text(raw_message)
+    return None, ""
+
+
+def _stream_message_completed(message: dict[str, Any]) -> bool:
+    if message.get("end_turn") is True:
+        return True
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    values = (
+        message.get("status"),
+        message.get("async_status"),
+        metadata.get("message_status"),
+        metadata.get("status"),
+        metadata.get("async_status"),
+    )
+    completed = {
+        "completed",
+        "complete",
+        "finished",
+        "done",
+        "success",
+        "succeeded",
+        "finished_successfully",
+    }
+    if any(isinstance(value, str) and value.strip().lower() in completed for value in values):
+        return True
+    finish_details = metadata.get("finish_details")
+    if isinstance(finish_details, dict):
+        finish_type = finish_details.get("type")
+        if isinstance(finish_type, str) and finish_type.strip():
+            return True
+    for value in (metadata.get("finish_reason"), message.get("finish_reason")):
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _clone_stream_message(message: dict[str, Any]) -> dict[str, Any]:
+    cloned = dict(message)
+    content = message.get("content")
+    if isinstance(content, dict):
+        cloned_content = dict(content)
+        parts = content.get("parts")
+        if isinstance(parts, list):
+            cloned_content["parts"] = list(parts)
+        cloned["content"] = cloned_content
+    metadata = message.get("metadata")
+    if isinstance(metadata, dict):
+        cloned["metadata"] = dict(metadata)
+    author = message.get("author")
+    if isinstance(author, dict):
+        cloned["author"] = dict(author)
+    return cloned
+
+
+class CanonicalTopicStreamNormalizer:
+    """Normalize Celsius topic frames into the same live events gptty already renders."""
+
+    _CHILD_KEYS = ("message", "messages", "data", "result", "payload", "turn", "v", "value")
+
+    def __init__(
+        self,
+        *,
+        emitted_message_ids: Sequence[str] = (),
+        answer_message_id: str | None = None,
+        answer_text: str = "",
+    ) -> None:
+        self.emitted_message_ids = {
+            str(message_id).strip()
+            for message_id in emitted_message_ids
+            if str(message_id).strip()
+        }
+        self.answer_message_id = (
+            answer_message_id.strip()
+            if isinstance(answer_message_id, str) and answer_message_id.strip()
+            else None
+        )
+        self.answer_text = answer_text if isinstance(answer_text, str) else ""
+        self.sequence = 0
+        self.current_patch_message: dict[str, Any] | None = None
+        self.pending_thinking: dict[str, dict[str, Any]] = {}
+        self.catchup_remaining = 0
+
+    def feed_transport_event(self, event: Any) -> list[dict[str, Any]]:
+        if not isinstance(event, dict):
+            return []
+        if event.get("type") == "stream_handoff_ws_subscribed":
+            catchup_count = event.get("catchup_count")
+            self.catchup_remaining = (
+                max(0, catchup_count)
+                if isinstance(catchup_count, int) and not isinstance(catchup_count, bool)
+                else 0
+            )
+            return []
+        if event.get("type") != "raw_ws_event":
+            return []
+        payload = event.get("parsed")
+        if not isinstance(payload, dict):
+            return []
+        output: list[dict[str, Any]] = []
+        self._process_payload(payload, output)
+        if self.catchup_remaining > 0:
+            self.catchup_remaining -= 1
+        return output
+
+    def _message_id(self, message: dict[str, Any]) -> str | None:
+        message_id = message.get("id")
+        return message_id.strip() if isinstance(message_id, str) and message_id.strip() else None
+
+    def _flush_pending_thinking(
+        self,
+        output: list[dict[str, Any]],
+        *,
+        except_id: str | None = None,
+    ) -> None:
+        for message_id, entry in list(self.pending_thinking.items()):
+            if message_id == except_id or message_id in self.emitted_message_ids:
+                continue
+            text = entry.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            self.emitted_message_ids.add(message_id)
+            self.pending_thinking.pop(message_id, None)
+            output.append(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_id": message_id,
+                    "message_kind": "assistant_progress",
+                    "text": _sanitize_intermediate_text(text),
+                    "label": None,
+                    "tool_name": None,
+                }
+            )
+
+    def _emit_answer(
+        self,
+        message: dict[str, Any],
+        output: list[dict[str, Any]],
+    ) -> None:
+        message_id = self._message_id(message)
+        if message_id is None:
+            return
+        text = extract_message_text(message)
+        if message_id != self.answer_message_id:
+            self.answer_message_id = message_id
+            self.answer_text = ""
+        if text == self.answer_text:
+            return
+        if (
+            self.catchup_remaining > 0
+            and self.answer_text
+            and self.answer_text.startswith(text)
+        ):
+            return
+        self.sequence += 1
+        if text.startswith(self.answer_text):
+            delta = text[len(self.answer_text) :]
+            self.answer_text = text
+            if delta:
+                output.append(
+                    {
+                        "type": ASSISTANT_TEXT_DELTA,
+                        "message_id": message_id,
+                        "sequence": self.sequence,
+                        "delta": delta,
+                    }
+                )
+            return
+        self.answer_text = text
+        output.append(
+            {
+                "type": ASSISTANT_TEXT_REVISION,
+                "message_id": message_id,
+                "sequence": self.sequence,
+                "text": text,
+            }
+        )
+
+    def _inspect_message(
+        self,
+        message: dict[str, Any],
+        output: list[dict[str, Any]],
+    ) -> None:
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if metadata.get("is_visually_hidden_from_conversation") is True:
+            return
+        message_id = self._message_id(message)
+        if message_id is None:
+            return
+        author = message.get("author")
+        if not isinstance(author, dict):
+            author = {}
+        role = author.get("role")
+        recipient = message.get("recipient")
+        recipient = recipient.strip() if isinstance(recipient, str) else "all"
+        content = message.get("content")
+        if not isinstance(content, dict):
+            content = {}
+        content_type = content.get("content_type")
+
+        if (
+            role == "assistant"
+            and recipient in {"", "all"}
+            and metadata.get("is_thinking_preamble_message") is True
+        ):
+            text = extract_message_text(message)
+            if text.strip():
+                self.pending_thinking[message_id] = {"text": text}
+            return
+
+        if role == "assistant" and recipient in {"", "all"} and content_type == "reasoning_recap":
+            self._flush_pending_thinking(output, except_id=message_id)
+            text = _sanitize_intermediate_text(extract_message_text(message))
+            if text and _stream_message_completed(message) and message_id not in self.emitted_message_ids:
+                self.emitted_message_ids.add(message_id)
+                output.append(
+                    {
+                        "type": "canonical_intermediate_message",
+                        "message_id": message_id,
+                        "message_kind": "reasoning",
+                        "text": text,
+                        "label": metadata.get("reasoning_title") or "Reasoning summary",
+                        "tool_name": None,
+                    }
+                )
+            return
+
+        if role == "assistant" and recipient in {"", "all"} and content_type == "thoughts":
+            reasoning_title = metadata.get("reasoning_title")
+            if (
+                isinstance(reasoning_title, str)
+                and reasoning_title.strip()
+                and _stream_message_completed(message)
+                and message_id not in self.emitted_message_ids
+            ):
+                self.emitted_message_ids.add(message_id)
+                output.append(
+                    {
+                        "type": "canonical_intermediate_message",
+                        "message_id": message_id,
+                        "message_kind": "reasoning",
+                        "text": _sanitize_intermediate_text(extract_message_text(message)),
+                        "label": reasoning_title.strip(),
+                        "tool_name": None,
+                    }
+                )
+            return
+
+        if role == "assistant" and recipient not in {"", "all"}:
+            self._flush_pending_thinking(output)
+            if message_id in self.emitted_message_ids:
+                return
+            label = _tool_call_label(message, metadata, recipient)
+            if label is None and not _stream_message_completed(message):
+                return
+            self.emitted_message_ids.add(message_id)
+            output.append(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_id": message_id,
+                    "message_kind": "tool_call",
+                    "text": _sanitize_intermediate_text(extract_message_text(message)),
+                    "label": label or "Using tool...",
+                    "tool_name": recipient,
+                }
+            )
+            return
+
+        if role == "tool":
+            self._flush_pending_thinking(output)
+            if message_id in self.emitted_message_ids or not _stream_message_completed(message):
+                return
+            self.emitted_message_ids.add(message_id)
+            raw_name = author.get("name")
+            tool_name = (
+                raw_name.strip()
+                if isinstance(raw_name, str) and raw_name.strip()
+                else recipient
+            )
+            output.append(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_id": message_id,
+                    "message_kind": "tool_result",
+                    "text": _sanitize_intermediate_text(extract_message_text(message)),
+                    "label": metadata.get("tool_invoked_message"),
+                    "tool_name": tool_name,
+                }
+            )
+            return
+
+        if content_type == "tether_browsing_display":
+            if message_id in self.emitted_message_ids or not _stream_message_completed(message):
+                return
+            self.emitted_message_ids.add(message_id)
+            output.append(
+                {
+                    "type": "canonical_intermediate_message",
+                    "message_id": message_id,
+                    "message_kind": "activity",
+                    "text": _sanitize_intermediate_text(extract_message_text(message)),
+                    "label": "Browsing update",
+                    "tool_name": None,
+                }
+            )
+            return
+
+        if (
+            role == "assistant"
+            and recipient in {"", "all"}
+            and content_type == "text"
+            and metadata.get("is_thinking_preamble_message") is not True
+        ):
+            self._flush_pending_thinking(output)
+            self._emit_answer(message, output)
+
+    def _collect_messages(
+        self,
+        value: Any,
+        output: list[dict[str, Any]],
+        *,
+        depth: int = 0,
+        seen: set[int] | None = None,
+    ) -> None:
+        if value is None or depth > 7:
+            return
+        if seen is None:
+            seen = set()
+        if isinstance(value, list):
+            for item in value[:128]:
+                self._collect_messages(item, output, depth=depth + 1, seen=seen)
+            return
+        if not isinstance(value, dict):
+            return
+        identity = id(value)
+        if identity in seen:
+            return
+        seen.add(identity)
+        if isinstance(value.get("author"), dict) and isinstance(value.get("content"), dict):
+            self._inspect_message(value, output)
+        for key in self._CHILD_KEYS:
+            if key in value:
+                self._collect_messages(value[key], output, depth=depth + 1, seen=seen)
+
+    def _select_patch_message(
+        self,
+        message: dict[str, Any],
+        output: list[dict[str, Any]],
+    ) -> None:
+        self.current_patch_message = _clone_stream_message(message)
+        self._inspect_message(self.current_patch_message, output)
+
+    def _apply_patch_item(
+        self,
+        item: Any,
+        output: list[dict[str, Any]],
+    ) -> None:
+        if not isinstance(item, dict):
+            return
+        value = item.get("v")
+        if isinstance(value, dict) and isinstance(value.get("message"), dict):
+            self._select_patch_message(value["message"], output)
+            return
+        message = self.current_patch_message
+        if message is None:
+            return
+        path = item.get("p")
+        if (path in {None, "", "/message/content/parts/0"}) and isinstance(value, str):
+            content = message.get("content")
+            if not isinstance(content, dict):
+                content = {"content_type": "text", "parts": []}
+                message["content"] = content
+            parts = content.get("parts")
+            if not isinstance(parts, list):
+                parts = []
+            parts = list(parts)
+            previous = parts[0] if parts and isinstance(parts[0], str) else ""
+            if parts:
+                parts[0] = previous + value
+            else:
+                parts.append(value)
+            content["parts"] = parts
+        elif path == "/message/content" and isinstance(value, dict):
+            message["content"] = dict(value)
+        elif path == "/message/status":
+            message["status"] = value
+        elif path == "/message/end_turn":
+            message["end_turn"] = value
+        elif path == "/message/metadata" and isinstance(value, dict):
+            metadata = message.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            message["metadata"] = {**metadata, **value}
+        else:
+            return
+        self._inspect_message(message, output)
+
+    def _process_payload(
+        self,
+        payload: dict[str, Any],
+        output: list[dict[str, Any]],
+    ) -> None:
+        self._collect_messages(payload, output)
+        self._apply_patch_item(payload, output)
+        value = payload.get("v")
+        if isinstance(value, list):
+            for item in value[:128]:
+                self._apply_patch_item(item, output)
+
+
 def _assistant_candidates_from_payload(
     payload: dict[str, Any],
     *,

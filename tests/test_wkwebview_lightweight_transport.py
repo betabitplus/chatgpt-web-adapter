@@ -88,12 +88,32 @@ class _SourceClient:
         *,
         websocket_url: str,
         state: dict,
-        on_token,
+        on_event=None,
+        on_token=None,
         should_stop=None,
     ) -> None:
         self.stream_calls.append((topic_id, websocket_url))
         state["message_id"] = "assistant-1"
-        on_token("hello")
+        if on_event is not None:
+            on_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "v": {
+                            "message": {
+                                "id": "assistant-1",
+                                "author": {"role": "assistant"},
+                                "recipient": "all",
+                                "content": {"content_type": "text", "parts": ["hello"]},
+                                "metadata": {"turn_exchange_id": "turn-1"},
+                            }
+                        }
+                    },
+                }
+            )
+            on_event({"type": "raw_ws_done", "topic_id": topic_id})
+        if on_token is not None:
+            on_token("hello")
 
     def wk_transport_upload_media_files(self, media):
         items = list(media)
@@ -174,6 +194,37 @@ def test_lightweight_transport_reads_catalog_through_explicit_contract(
         "https://chatgpt.com/backend-api/conversations"
         "?offset=0&limit=20&order=updated&is_archived=false&is_starred=false"
     )
+
+
+def test_lightweight_follow_topic_uses_one_celsius_bootstrap_and_forwards_events(
+    monkeypatch,
+) -> None:
+    source = _SourceClient()
+    transport, _ = _transport(source)
+    curl = _CurlRequests(
+        [[_Response(200, {"websocket_url": "wss://example.invalid/celsius"})]]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    events = []
+
+    result = transport.follow_topic(
+        conversation_id="conversation-1",
+        topic_id="conversation-turn-turn-1",
+        timeout=30,
+        on_event=events.append,
+    )
+
+    assert result["completed"] is True
+    assert result["topic_id"] == "conversation-turn-turn-1"
+    assert source.stream_calls == [
+        ("conversation-turn-turn-1", "wss://example.invalid/celsius")
+    ]
+    assert [event["type"] for event in events] == ["raw_ws_event", "raw_ws_done"]
+    assert len(curl.sessions) == 1
+    assert len(curl.sessions[0].calls) == 1
+    method, url, _kwargs = curl.sessions[0].calls[0]
+    assert method == "GET"
+    assert url == "https://chatgpt.com/backend-api/celsius/ws/user"
 
 
 def test_lightweight_transport_uploads_attachments_through_explicit_contract(

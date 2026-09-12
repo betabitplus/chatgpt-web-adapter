@@ -11,7 +11,12 @@ from .browser_authority_backend import (
     normalize_browser_authority_backend,
     resolve_browser_authority_backend,
 )
-from .browser_native_client import _canonical_intermediate_events
+from .browser_native_client import (
+    CanonicalTopicStreamNormalizer,
+    _canonical_intermediate_events,
+    _canonical_stream_answer_seed,
+    _canonical_stream_identity,
+)
 from .client import DEFAULT_TIMEOUT_SECONDS, ChatGPTWebClient
 from .messages import get_messages
 from .product_runtime_observation_gate import gate_product_runtime_send_text_observed
@@ -185,12 +190,77 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             emitted_message_ids=emitted,
             submission_id=None,
         )
+        stream_topic_id, turn_exchange_id = _canonical_stream_identity(payload)
+        answer_message_id, answer_text = _canonical_stream_answer_seed(
+            payload,
+            turn_exchange_id=turn_exchange_id,
+        )
         return {
             "status": get_status(reader, ref),
             "messages": get_messages(reader, ref, limit=limit),
             "events": events,
             "emitted_message_ids": sorted(emitted),
+            "stream_topic_id": stream_topic_id,
+            "turn_exchange_id": turn_exchange_id,
+            "stream_answer_message_id": answer_message_id,
+            "stream_answer_text": answer_text,
         }
+
+    def conversation_follow_stream(
+        self,
+        conversation: Any,
+        *,
+        topic_id: str,
+        emitted_message_ids: Sequence[str] = (),
+        answer_message_id: str | None = None,
+        answer_text: str = "",
+        timeout: float = 2 * 60 * 60,
+        limit: int | None = 128,
+        on_event: Any = None,
+        should_stop: Any = None,
+    ) -> dict[str, Any]:
+        ref = ConversationRef.from_any(conversation)
+        provider = getattr(self.write_transport, "provider", None)
+        helper = getattr(provider, "follow_stream_topic", None)
+        if not callable(helper):
+            raise RuntimeError(
+                "live topic follow is unavailable on the selected browser authority provider"
+            )
+        normalizer = CanonicalTopicStreamNormalizer(
+            emitted_message_ids=emitted_message_ids,
+            answer_message_id=answer_message_id,
+            answer_text=answer_text,
+        )
+
+        def relay_transport_event(event: dict[str, Any]) -> None:
+            for normalized in normalizer.feed_transport_event(event):
+                if on_event is not None:
+                    on_event(normalized)
+
+        result = helper(
+            conversation_id=ref.conversation_id,
+            topic_id=topic_id,
+            timeout=timeout,
+            on_event=relay_transport_event,
+            should_stop=should_stop,
+        )
+        completed = isinstance(result, dict) and result.get("completed") is True
+        if not completed:
+            return {
+                "stream_completed": False,
+                "stream_cancelled": should_stop is not None and bool(should_stop()),
+                "stream_topic_id": topic_id,
+                "emitted_message_ids": sorted(normalizer.emitted_message_ids),
+            }
+
+        final_snapshot = self.conversation_follow_snapshot(
+            ref,
+            emitted_message_ids=tuple(normalizer.emitted_message_ids),
+            limit=limit,
+        )
+        final_snapshot["stream_completed"] = True
+        final_snapshot["stream_topic_id"] = topic_id
+        return final_snapshot
 
     def get_conversation_payload(self, conversation: Any) -> dict[str, Any]:
         helper = getattr(self.canonical, "get_conversation_payload", None)

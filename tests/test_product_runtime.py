@@ -250,6 +250,109 @@ def test_runtime_follow_snapshot_reuses_one_canonical_payload(monkeypatch) -> No
     assert result["emitted_message_ids"] == ["m1", "m2"]
 
 
+def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -> None:
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    provider_calls = []
+    final_calls = []
+
+    def follow_stream_topic(
+        *,
+        conversation_id,
+        topic_id,
+        timeout,
+        on_event,
+        should_stop,
+    ):
+        provider_calls.append((conversation_id, topic_id, timeout, should_stop))
+        on_event(
+            {
+                "type": "raw_ws_event",
+                "parsed": {
+                    "v": {
+                        "message": {
+                            "id": "tool-1",
+                            "author": {"role": "assistant"},
+                            "recipient": "api_tool.call_tool",
+                            "status": "finished_successfully",
+                            "content": {
+                                "content_type": "code",
+                                "parts": ['{"path":"search","args":{"query":"needle"}}'],
+                            },
+                            "metadata": {"turn_exchange_id": "turn-1"},
+                        }
+                    }
+                },
+            }
+        )
+        on_event({"type": "raw_ws_done", "topic_id": topic_id})
+        return {"completed": True}
+
+    provider.follow_stream_topic = follow_stream_topic
+    monkeypatch.setattr(
+        runtime,
+        "conversation_follow_snapshot",
+        lambda conversation, *, emitted_message_ids, limit: (
+            final_calls.append((conversation, tuple(emitted_message_ids), limit))
+            or {
+                "status": SimpleNamespace(status="completed"),
+                "messages": [],
+                "events": [],
+                "emitted_message_ids": list(emitted_message_ids),
+            }
+        ),
+    )
+    events = []
+
+    result = runtime.conversation_follow_stream(
+        "conversation-1",
+        topic_id="conversation-turn-turn-1",
+        emitted_message_ids=(),
+        timeout=90,
+        limit=64,
+        on_event=events.append,
+    )
+
+    assert provider_calls == [
+        ("conversation-1", "conversation-turn-turn-1", 90, None)
+    ]
+    assert len(events) == 1
+    assert events[0]["message_kind"] == "tool_call"
+    assert events[0]["message_id"] == "tool-1"
+    assert len(final_calls) == 1
+    final_ref, final_ids, final_limit = final_calls[0]
+    assert getattr(final_ref, "conversation_id", None) == "conversation-1"
+    assert final_ids == ("tool-1",)
+    assert final_limit == 64
+    assert result["stream_completed"] is True
+    assert result["stream_topic_id"] == "conversation-turn-turn-1"
+
+
+def test_runtime_topic_follow_cancelled_skips_final_canonical_read(monkeypatch) -> None:
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    canonical_reads = []
+
+    provider.follow_stream_topic = lambda **_kwargs: {"completed": False}
+    monkeypatch.setattr(
+        runtime,
+        "conversation_follow_snapshot",
+        lambda *args, **kwargs: canonical_reads.append((args, kwargs)),
+    )
+    def stop():
+        return True
+
+    result = runtime.conversation_follow_stream(
+        "conversation-1",
+        topic_id="conversation-turn-turn-1",
+        should_stop=stop,
+    )
+
+    assert canonical_reads == []
+    assert result["stream_completed"] is False
+    assert result["stream_cancelled"] is True
+
+
 def test_runtime_exposes_complete_gptty_read_surface() -> None:
     runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
 
@@ -262,6 +365,7 @@ def test_runtime_exposes_complete_gptty_read_surface() -> None:
         "list_models",
         "conversation_snapshot",
         "conversation_follow_snapshot",
+        "conversation_follow_stream",
         "get_conversation_payload",
     ):
         assert callable(getattr(runtime, name, None)), name

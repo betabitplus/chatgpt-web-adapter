@@ -10,7 +10,10 @@ from chatgpt_web_adapter.browser_context_canonical import (
     BrowserContextCanonicalReadError,
 )
 from chatgpt_web_adapter.browser_native_client import (
+    CanonicalTopicStreamNormalizer,
     _canonical_intermediate_events,
+    _canonical_stream_answer_seed,
+    _canonical_stream_identity,
     _wait_for_new_final_assistant,
     await_browser_native_final,
     send_browser_native,
@@ -694,6 +697,275 @@ def test_successful_canonical_polling_has_fifteen_second_floor(monkeypatch) -> N
     assert message.text == "done"
     assert client.calls == 2
     assert sleeps == [15.0]
+
+
+def test_canonical_stream_identity_reconstructs_topic_from_latest_turn_exchange_id() -> None:
+    payload = {
+        "current_node": "assistant-new",
+        "mapping": {
+            "user-old": {
+                "parent": None,
+                "children": ["assistant-old"],
+                "message": {
+                    "id": "user-old",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["old"]},
+                    "metadata": {},
+                },
+            },
+            "assistant-old": {
+                "parent": "user-old",
+                "children": ["user-new"],
+                "message": {
+                    "id": "assistant-old",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["old answer"]},
+                    "metadata": {"turn_exchange_id": "turn-old"},
+                },
+            },
+            "user-new": {
+                "parent": "assistant-old",
+                "children": ["assistant-new"],
+                "message": {
+                    "id": "user-new",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["new"]},
+                    "metadata": {},
+                },
+            },
+            "assistant-new": {
+                "parent": "user-new",
+                "children": [],
+                "message": {
+                    "id": "assistant-new",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["partial"]},
+                    "metadata": {
+                        "turn_exchange_id": "turn-new",
+                        "working_turn_id": "turn-new",
+                    },
+                },
+            },
+        },
+    }
+
+    topic_id, turn_exchange_id = _canonical_stream_identity(payload)
+    answer_message_id, answer_text = _canonical_stream_answer_seed(
+        payload,
+        turn_exchange_id=turn_exchange_id,
+    )
+
+    assert topic_id == "conversation-turn-turn-new"
+    assert turn_exchange_id == "turn-new"
+    assert answer_message_id == "assistant-new"
+    assert answer_text == "partial"
+
+
+def test_canonical_stream_identity_prefers_explicit_stream_topic_id() -> None:
+    payload = {
+        "current_node": "assistant-1",
+        "mapping": {
+            "assistant-1": {
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": "assistant-1",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["partial"]},
+                    "metadata": {
+                        "stream_topic_id": "custom-topic",
+                        "turn_exchange_id": "turn-1",
+                    },
+                },
+            }
+        },
+    }
+
+    assert _canonical_stream_identity(payload) == ("custom-topic", "turn-1")
+
+
+def test_topic_stream_normalizer_replays_only_new_answer_delta_and_live_tool() -> None:
+    normalizer = CanonicalTopicStreamNormalizer(
+        emitted_message_ids=("tool-old",),
+        answer_message_id="assistant-1",
+        answer_text="Hello",
+    )
+
+    initial = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "assistant-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "content": {"content_type": "text", "parts": ["Hello"]},
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                    }
+                }
+            },
+        }
+    )
+    delta = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {"p": "/message/content/parts/0", "v": " world"},
+        }
+    )
+    tool = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "tool-new",
+                        "author": {"role": "assistant"},
+                        "recipient": "api_tool.call_tool",
+                        "content": {
+                            "content_type": "code",
+                            "parts": ['{"path":"search","args":{"query":"needle"}}'],
+                        },
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                    }
+                }
+            },
+        }
+    )
+    duplicate_tool = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "tool-new",
+                        "author": {"role": "assistant"},
+                        "recipient": "api_tool.call_tool",
+                        "status": "finished_successfully",
+                        "content": {
+                            "content_type": "code",
+                            "parts": ['{"path":"search","args":{"query":"needle"}}'],
+                        },
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                    }
+                }
+            },
+        }
+    )
+
+    assert initial == []
+    assert delta == [
+        {
+            "type": "assistant_text_delta",
+            "message_id": "assistant-1",
+            "sequence": 1,
+            "delta": " world",
+        }
+    ]
+    assert len(tool) == 1
+    assert tool[0]["type"] == "canonical_intermediate_message"
+    assert tool[0]["message_kind"] == "tool_call"
+    assert tool[0]["message_id"] == "tool-new"
+    assert tool[0]["tool_name"] == "api_tool.call_tool"
+    assert tool[0]["label"] == "Searching needle..."
+    assert duplicate_tool == []
+
+
+def test_topic_stream_normalizer_does_not_rewind_seeded_answer_during_catchup() -> None:
+    normalizer = CanonicalTopicStreamNormalizer(
+        answer_message_id="assistant-1",
+        answer_text="Hello world",
+    )
+
+    assert normalizer.feed_transport_event(
+        {
+            "type": "stream_handoff_ws_subscribed",
+            "catchup_count": 2,
+        }
+    ) == []
+    assert normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "assistant-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "content": {"content_type": "text", "parts": ["Hello"]},
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                    }
+                }
+            },
+        }
+    ) == []
+    assert normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {"p": "/message/content/parts/0", "v": " world"},
+        }
+    ) == []
+    assert normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {"p": "/message/content/parts/0", "v": "!"},
+        }
+    ) == [
+        {
+            "type": "assistant_text_delta",
+            "message_id": "assistant-1",
+            "sequence": 1,
+            "delta": "!",
+        }
+    ]
+
+
+def test_topic_stream_normalizer_flushes_completed_thinking_before_tool() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+
+    thinking = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "thinking-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "content": {"content_type": "text", "parts": ["Inspecting state"]},
+                        "metadata": {
+                            "is_thinking_preamble_message": True,
+                            "turn_exchange_id": "turn-1",
+                        },
+                    }
+                }
+            },
+        }
+    )
+    tool = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "tool-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "functions.exec",
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["{}"]},
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                    }
+                }
+            },
+        }
+    )
+
+    assert thinking == []
+    assert [event["message_kind"] for event in tool] == ["assistant_progress", "tool_call"]
+    assert tool[0]["text"] == "Inspecting state"
 
 
 def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitive_fields() -> (

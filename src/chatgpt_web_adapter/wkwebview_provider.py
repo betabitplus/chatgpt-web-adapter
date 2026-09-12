@@ -659,6 +659,29 @@ class WKWebViewTurnProvider:
             on_event=on_event,
         )
 
+    def follow_stream_topic(
+        self,
+        *,
+        conversation_id: str,
+        topic_id: str,
+        timeout: float,
+        on_event: Any = None,
+        should_stop: Any = None,
+    ) -> dict[str, Any]:
+        if not self._lightweight_path_enabled() or self._lightweight_transport is None:
+            raise RequestError(
+                "WKWEBVIEW_STREAM_FOLLOW_LIGHTWEIGHT_UNAVAILABLE",
+                request_stage="wkwebview_stream_follow",
+            )
+        return self._lightweight_transport.follow_topic(
+            conversation_id=conversation_id,
+            topic_id=topic_id,
+            timeout=timeout,
+            on_event=on_event,
+            on_token=None,
+            should_stop=should_stop,
+        )
+
     def _resume_via_direct_wk(
         self,
         *,

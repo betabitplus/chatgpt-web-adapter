@@ -278,7 +278,8 @@ class ChatGPTWebClient(_core.ChatGPTWebClient):
         *,
         websocket_url: str,
         state: dict[str, Any],
-        on_token: Callable[[str], None] | None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+        on_token: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> None:
         """Stream one resume topic using a caller-provided Celsius WS URL."""
@@ -292,7 +293,7 @@ class ChatGPTWebClient(_core.ChatGPTWebClient):
         ws_client._stream_handoff_via_ws_topic(
             topic_id,
             state=state,
-            on_event=None,
+            on_event=on_event,
             on_token=on_token,
             cancel_check=should_stop,
         )

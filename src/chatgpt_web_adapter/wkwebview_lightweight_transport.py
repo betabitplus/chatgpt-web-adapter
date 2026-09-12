@@ -26,7 +26,8 @@ class WKLightweightSourceClient(Protocol):
         *,
         websocket_url: str,
         state: dict[str, Any],
-        on_token: Callable[[str], None] | None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+        on_token: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> None: ...
 
@@ -479,30 +480,7 @@ class WKLightweightTransport:
             )
         return tuple(descriptors)
 
-    def _stream_resume_topic(
-        self,
-        *,
-        conversation_id: str,
-        resume_value: str,
-        timeout: float,
-        relay_text_event: Callable[[dict[str, Any]], None],
-    ) -> tuple[Any, dict[str, Any], int, float]:
-        try:
-            topic_id, state = self.source_client.wk_transport_resume_state(
-                resume_value,
-                conversation_id=conversation_id,
-            )
-        except AttributeError as error:
-            raise RequestError(
-                "WKWEBVIEW_CURL_WS_SOURCE_CONTRACT_MISSING",
-                request_stage="wkwebview_curl_ws_second_leg",
-            ) from error
-        if not isinstance(topic_id, str) or not topic_id:
-            raise RequestError(
-                "WKWEBVIEW_CURL_WS_TOPIC_UNRESOLVED",
-                request_stage="wkwebview_curl_ws_second_leg",
-            )
-
+    def _resolve_celsius_websocket_url(self, *, timeout: float) -> tuple[Any, str]:
         curl_requests = self._curl_requests()
         celsius_path = "/backend-api/celsius/ws/user"
         try:
@@ -554,6 +532,33 @@ class WKLightweightTransport:
                 "WKWEBVIEW_CURL_WS_URL_MISSING",
                 request_stage="wkwebview_curl_ws_second_leg",
             )
+        return curl_requests, websocket_url
+
+    def _stream_resume_topic(
+        self,
+        *,
+        conversation_id: str,
+        resume_value: str,
+        timeout: float,
+        relay_text_event: Callable[[dict[str, Any]], None],
+    ) -> tuple[Any, dict[str, Any], int, float]:
+        try:
+            topic_id, state = self.source_client.wk_transport_resume_state(
+                resume_value,
+                conversation_id=conversation_id,
+            )
+        except AttributeError as error:
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_SOURCE_CONTRACT_MISSING",
+                request_stage="wkwebview_curl_ws_second_leg",
+            ) from error
+        if not isinstance(topic_id, str) or not topic_id:
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_TOPIC_UNRESOLVED",
+                request_stage="wkwebview_curl_ws_second_leg",
+            )
+
+        curl_requests, websocket_url = self._resolve_celsius_websocket_url(timeout=timeout)
 
         raw_sequence = 0
 
@@ -598,6 +603,62 @@ class WKLightweightTransport:
                 request_stage="transport",
             ) from error
         return curl_requests, state, raw_sequence, started
+
+    def follow_topic(
+        self,
+        *,
+        conversation_id: str,
+        topic_id: str,
+        timeout: float,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+        on_token: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        normalized_topic = topic_id.strip() if isinstance(topic_id, str) else ""
+        if not normalized_topic:
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_TOPIC_UNRESOLVED",
+                request_stage="wkwebview_curl_ws_follow",
+            )
+        _curl_requests, websocket_url = self._resolve_celsius_websocket_url(timeout=timeout)
+        state: dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "resume_turn_topic_id": normalized_topic,
+        }
+        completed = False
+
+        def relay_event(event: dict[str, Any]) -> None:
+            nonlocal completed
+            if isinstance(event, dict) and event.get("type") == "raw_ws_done":
+                completed = True
+            if on_event is not None:
+                on_event(event)
+
+        started = time.monotonic()
+        try:
+            self.source_client.wk_transport_stream_topic(
+                normalized_topic,
+                websocket_url=websocket_url,
+                state=state,
+                on_event=relay_event,
+                on_token=on_token,
+                should_stop=should_stop,
+            )
+        except AttributeError as error:
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_SOURCE_CONTRACT_MISSING",
+                request_stage="wkwebview_curl_ws_follow",
+            ) from error
+        return {
+            "ok": True,
+            "conversation_id": conversation_id,
+            "topic_id": normalized_topic,
+            "message_id": state.get("message_id"),
+            "turn_exchange_id": state.get("turn_exchange_id"),
+            "finish_reason": state.get("finish_reason"),
+            "completed": completed,
+            "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+        }
 
     def stream_temporary_turn(
         self,

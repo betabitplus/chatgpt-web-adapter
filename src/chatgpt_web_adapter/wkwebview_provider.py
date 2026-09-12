@@ -189,6 +189,8 @@ class WKWebViewTurnProvider:
         resume_value: str,
         timeout: float,
         relay_text_event: Any,
+        on_transport_event: Any = None,
+        stream_should_stop: Any = None,
         text: str,
         baseline_current_node: str | None,
     ) -> dict[str, Any]:
@@ -203,6 +205,8 @@ class WKWebViewTurnProvider:
             resume_value=resume_value,
             timeout=timeout,
             relay_text_event=relay_text_event,
+            on_transport_event=on_transport_event,
+            stream_should_stop=stream_should_stop,
             text=text,
             baseline_current_node=baseline_current_node,
         )
@@ -726,11 +730,17 @@ class WKWebViewTurnProvider:
         model_slug: str | None = None,
         on_text_event: Any = None,
         on_write_identity: Any = None,
+        on_transport_event: Any = None,
+        stream_should_stop: Any = None,
     ) -> BrowserNativeTurnResult:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text is required")
         if on_write_identity is not None and not callable(on_write_identity):
             raise TypeError("on_write_identity must be callable")
+        if on_transport_event is not None and not callable(on_transport_event):
+            raise TypeError("on_transport_event must be callable")
+        if stream_should_stop is not None and not callable(stream_should_stop):
+            raise TypeError("stream_should_stop must be callable")
         total_timeout = self.turn_timeout if timeout is None else float(timeout)
         if total_timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -826,6 +836,8 @@ class WKWebViewTurnProvider:
                     if make_stream_relay is not None
                     else lambda: lambda _event: None
                 ),
+                on_transport_event=on_transport_event,
+                stream_should_stop=stream_should_stop,
             )
             return self._turn_orchestrator.build_turn_result(
                 payload,
@@ -872,6 +884,8 @@ class WKWebViewTurnProvider:
         model_slug: str | None = None,
         on_text_event: Any,
         on_write_identity: Any = None,
+        on_transport_event: Any = None,
+        stream_should_stop: Any = None,
     ) -> BrowserNativeTurnResult:
         return self._send_text_impl(
             text,
@@ -881,6 +895,8 @@ class WKWebViewTurnProvider:
             model_slug=model_slug,
             on_text_event=on_text_event,
             on_write_identity=on_write_identity,
+            on_transport_event=on_transport_event,
+            stream_should_stop=stream_should_stop,
         )
 
     def send_text_with_stale_ui_recovery(
@@ -920,6 +936,8 @@ class WKWebViewTurnProvider:
         model_slug: str | None = None,
         on_text_event: Any,
         on_write_identity: Any = None,
+        on_transport_event: Any = None,
+        stream_should_stop: Any = None,
     ) -> BrowserNativeTurnResult:
         if (
             isinstance(canonical_completed_at_ms, bool)
@@ -934,6 +952,8 @@ class WKWebViewTurnProvider:
             model_slug=model_slug,
             on_text_event=on_text_event,
             on_write_identity=on_write_identity,
+            on_transport_event=on_transport_event,
+            stream_should_stop=stream_should_stop,
         )
 
     def _mark_stop_context_pending(self, conversation_id: str) -> None:

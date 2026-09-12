@@ -591,6 +591,8 @@ class WKTurnOrchestrator:
         started: float,
         streaming: bool,
         make_stream_relay: Callable[[], Callable[[dict[str, Any]], None]],
+        on_transport_event: Callable[[dict[str, Any]], None] | None = None,
+        stream_should_stop: Callable[[], bool] | None = None,
     ) -> bool:
         provider = self.provider
         phase_b_started = time.monotonic()
@@ -637,6 +639,8 @@ class WKTurnOrchestrator:
                     resume_value=resume_value,
                     timeout=remaining,
                     relay_text_event=make_stream_relay(),
+                    on_transport_event=on_transport_event,
+                    stream_should_stop=stream_should_stop,
                     text=text,
                     baseline_current_node=prepared.baseline_current_node,
                 )

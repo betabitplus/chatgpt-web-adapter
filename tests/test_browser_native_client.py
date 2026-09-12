@@ -161,6 +161,129 @@ def test_client_returns_canonical_readback_not_native_body() -> None:
     assert provider.normal_calls == [("hello", "existing-conversation", 2)]
 
 
+def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn() -> None:
+    class Provider(FakeProvider):
+        revision_safe_streaming_supported = True
+
+        def send_text_streaming(
+            self,
+            text,
+            *,
+            conversation=None,
+            timeout=None,
+            on_text_event,
+            on_transport_event,
+            stream_should_stop,
+        ):
+            assert stream_should_stop() is False
+            on_transport_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "v": {
+                            "message": {
+                                "id": "reasoning-1",
+                                "author": {"role": "assistant"},
+                                "recipient": "all",
+                                "status": "finished_successfully",
+                                "content": {
+                                    "content_type": "thoughts",
+                                    "parts": ["internal-only-parts"],
+                                    "thoughts": [
+                                        {
+                                            "summary": "Checking state",
+                                            "content": "internal-only-content",
+                                            "finished": True,
+                                        }
+                                    ],
+                                },
+                                "metadata": {"turn_exchange_id": "turn-1"},
+                            }
+                        }
+                    },
+                }
+            )
+            assert stream_should_stop() is False
+            on_transport_event(
+                {"type": "raw_ws_done", "topic_id": "conversation-turn-turn-1"}
+            )
+            assert stream_should_stop() is False
+            on_transport_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "v": {
+                            "message": {
+                                "id": "assistant-1",
+                                "author": {"role": "assistant"},
+                                "recipient": "all",
+                                "content": {
+                                    "content_type": "text",
+                                    "parts": ["done"],
+                                },
+                                "metadata": {"turn_exchange_id": "turn-1"},
+                                "end_turn": True,
+                            }
+                        }
+                    },
+                }
+            )
+            assert stream_should_stop() is True
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-1",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=100,
+            )
+
+    provider = Provider()
+    client = _client(provider)
+    delivered: list[dict] = []
+
+    def emit(callback, event_type, **payload):
+        client.events.append((event_type, payload))
+        if callback is not None:
+            callback({"type": event_type, **payload})
+
+    client._emit_event = emit
+
+    submit_browser_native(
+        client,
+        "hello",
+        conversation="existing-conversation",
+        timeout=2,
+        poll_interval=0.01,
+        on_event=delivered.append,
+    )
+
+    reasoning = [
+        event
+        for event in delivered
+        if event.get("type") == "canonical_intermediate_message"
+        and event.get("message_id") == "reasoning-1"
+    ]
+    assert len(reasoning) == 1
+    assert reasoning[0]["message_kind"] == "reasoning"
+    assert reasoning[0]["text"] == "Checking state"
+    assert "internal-only" not in repr(reasoning)
+    answer_events = [
+        event
+        for event in delivered
+        if event.get("type") in {
+            "assistant_text_snapshot",
+            "assistant_text_delta",
+            "assistant_text_revision",
+        }
+        and event.get("message_id") == "assistant-1"
+    ]
+    assert answer_events
+    assert answer_events[-1].get("delta") == "done" or answer_events[-1].get("text") == "done"
+
+
 def test_streaming_write_identity_is_emitted_before_write_completed() -> None:
     class IdentityProvider(FakeProvider):
         revision_safe_streaming_supported = True

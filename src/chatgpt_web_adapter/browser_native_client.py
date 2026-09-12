@@ -1229,6 +1229,34 @@ def _callable_accepts_write_identity(value: Any) -> bool:
     )
 
 
+def _callable_accepts_stream_transport_event(value: Any) -> bool:
+    if not callable(value):
+        return False
+    try:
+        parameters = inspect.signature(value).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "on_transport_event"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _callable_accepts_stream_should_stop(value: Any) -> bool:
+    if not callable(value):
+        return False
+    try:
+        parameters = inspect.signature(value).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "stream_should_stop"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def submit_browser_native(
     self: Any,
     prompt: str,
@@ -1377,12 +1405,43 @@ def submit_browser_native(
     )
 
     stream_state = RevisionSafeTextAccumulator()
+    topic_normalizer = CanonicalTopicStreamNormalizer(
+        emitted_message_ids=tuple(baseline_message_ids),
+    )
+    transport_sequence = 0
 
     def handle_text_event(event: dict[str, Any]) -> None:
         normalized = stream_state.apply(event)
         if normalized is not None:
             normalized = {**normalized, "submission_id": submission_id}
             _emit_revision_safe_event(self, on_event, normalized)
+        topic_normalizer.answer_message_id = stream_state.message_id
+        topic_normalizer.answer_text = stream_state.text
+
+    def handle_transport_event(event: dict[str, Any]) -> None:
+        nonlocal transport_sequence
+        topic_normalizer.answer_message_id = stream_state.message_id
+        topic_normalizer.answer_text = stream_state.text
+        for normalized in topic_normalizer.feed_transport_event(event):
+            if normalized.get("type") in {
+                ASSISTANT_TEXT_SNAPSHOT,
+                ASSISTANT_TEXT_DELTA,
+                ASSISTANT_TEXT_REVISION,
+            }:
+                transport_sequence = max(
+                    transport_sequence + 1,
+                    stream_state.last_sequence + 1,
+                )
+                handle_text_event({**normalized, "sequence": transport_sequence})
+                continue
+            _emit_revision_safe_event(
+                self,
+                on_event,
+                {**normalized, "submission_id": submission_id},
+            )
+
+    def stream_should_stop() -> bool:
+        return topic_normalizer.turn_completed
 
     def handle_write_identity(event: dict[str, Any]) -> None:
         if (
@@ -1434,6 +1493,11 @@ def submit_browser_native(
                 if _callable_accepts_write_identity(recovery_stream_send)
                 else {}
             )
+            transport_stream_kwargs: dict[str, Any] = {}
+            if _callable_accepts_stream_transport_event(recovery_stream_send):
+                transport_stream_kwargs["on_transport_event"] = handle_transport_event
+            if _callable_accepts_stream_should_stop(recovery_stream_send):
+                transport_stream_kwargs["stream_should_stop"] = stream_should_stop
             turn = recovery_stream_send(
                 prompt,
                 conversation=conversation,
@@ -1441,6 +1505,7 @@ def submit_browser_native(
                 canonical_completed_at_ms=canonical_completed_at_ms,
                 on_text_event=handle_text_event,
                 **write_identity_kwargs,
+                **transport_stream_kwargs,
                 **provider_kwargs,
             )
         else:
@@ -1471,12 +1536,18 @@ def submit_browser_native(
             if _callable_accepts_write_identity(stream_send)
             else {}
         )
+        transport_stream_kwargs = {}
+        if _callable_accepts_stream_transport_event(stream_send):
+            transport_stream_kwargs["on_transport_event"] = handle_transport_event
+        if _callable_accepts_stream_should_stop(stream_send):
+            transport_stream_kwargs["stream_should_stop"] = stream_should_stop
         turn = stream_send(
             prompt,
             conversation=conversation,
             timeout=timeout,
             on_text_event=handle_text_event,
             **write_identity_kwargs,
+            **transport_stream_kwargs,
             **provider_kwargs,
         )
     else:

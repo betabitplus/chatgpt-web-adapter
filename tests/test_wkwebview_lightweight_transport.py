@@ -377,6 +377,88 @@ def test_lightweight_transport_resumes_and_finalizes_through_explicit_contract(
     assert result["ws_token_events"] == 1
 
 
+def test_lightweight_resume_raw_observer_crosses_segment_done_until_turn_stop(monkeypatch) -> None:
+    class RawSource(_SourceClient):
+        def wk_transport_stream_topic(
+            self,
+            topic_id: str,
+            *,
+            websocket_url: str,
+            state: dict,
+            on_event=None,
+            on_token=None,
+            should_stop=None,
+            stop_on_done=True,
+        ) -> None:
+            self.stream_calls.append((topic_id, websocket_url))
+            self.stop_on_done = stop_on_done
+            assert on_event is not None
+            assert should_stop is not None
+            on_event({"type": "raw_ws_done", "topic_id": topic_id})
+            assert should_stop() is False
+            on_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "v": {
+                            "message": {
+                                "id": "assistant-final",
+                                "author": {"role": "assistant"},
+                                "recipient": "all",
+                                "content": {"content_type": "text", "parts": ["done"]},
+                                "end_turn": True,
+                                "metadata": {"turn_exchange_id": "turn-1"},
+                            }
+                        }
+                    },
+                }
+            )
+            assert should_stop() is True
+            state["message_id"] = "assistant-final"
+            if on_token is not None:
+                on_token("done")
+
+    source = RawSource()
+    transport, cached = _transport(source)
+    final_payload = {"current_node": "node-final", "mapping": {"node-final": {}}}
+    curl = _CurlRequests(
+        [
+            [_Response(200, {"websocket_url": "wss://example.invalid/ws"})],
+            [_Response(200, final_payload)],
+        ]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    raw_events: list[dict] = []
+    turn_completed = False
+
+    def on_transport_event(event: dict) -> None:
+        nonlocal turn_completed
+        raw_events.append(event)
+        parsed = event.get("parsed")
+        message = parsed.get("v", {}).get("message") if isinstance(parsed, dict) else None
+        if isinstance(message, dict) and message.get("end_turn") is True:
+            turn_completed = True
+
+    result = transport.resume_turn(
+        conversation_id="conversation-1",
+        resume_value="resume-secret",
+        timeout=10,
+        relay_text_event=lambda _event: (_ for _ in ()).throw(
+            AssertionError("raw observer mode must not duplicate token-only events")
+        ),
+        on_transport_event=on_transport_event,
+        stream_should_stop=lambda: turn_completed,
+        text="prompt",
+        baseline_current_node="node-before",
+    )
+
+    assert source.stop_on_done is False
+    assert [event["type"] for event in raw_events] == ["raw_ws_done", "raw_ws_event"]
+    assert result["canonical_completed"] is True
+    assert result["ws_token_events"] == 1
+    assert cached == [("conversation-1", final_payload)]
+
+
 def test_lightweight_resume_canonical_reconcile_uses_bounded_backoff(monkeypatch) -> None:
     source = _SourceClient()
     transport, cached = _transport(source)

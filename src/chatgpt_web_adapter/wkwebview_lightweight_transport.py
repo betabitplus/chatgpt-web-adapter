@@ -542,6 +542,8 @@ class WKLightweightTransport:
         resume_value: str,
         timeout: float,
         relay_text_event: Callable[[dict[str, Any]], None],
+        on_transport_event: Callable[[dict[str, Any]], None] | None = None,
+        stream_should_stop: Callable[[], bool] | None = None,
     ) -> tuple[Any, dict[str, Any], int, float]:
         try:
             topic_id, state = self.source_client.wk_transport_resume_state(
@@ -562,12 +564,15 @@ class WKLightweightTransport:
         curl_requests, websocket_url = self._resolve_celsius_websocket_url(timeout=timeout)
 
         raw_sequence = 0
+        raw_live_observer = callable(on_transport_event) and callable(stream_should_stop)
 
         def on_token(value: str) -> None:
             nonlocal raw_sequence
             if not isinstance(value, str) or not value:
                 return
             raw_sequence += 1
+            if raw_live_observer:
+                return
             event: dict[str, Any] = {
                 "type": "assistant_text_delta",
                 "sequence": raw_sequence,
@@ -578,18 +583,31 @@ class WKLightweightTransport:
                 event["message_id"] = message_id
             relay_text_event(event)
 
+        def should_stop() -> bool:
+            if self._stop_requested is not None and self._stop_requested(conversation_id):
+                return True
+            if raw_live_observer and stream_should_stop is not None:
+                try:
+                    return bool(stream_should_stop())
+                except Exception:
+                    return False
+            return False
+
+        stream_kwargs: dict[str, Any] = {
+            "on_token": on_token,
+            "should_stop": should_stop,
+        }
+        if raw_live_observer:
+            stream_kwargs["on_event"] = on_transport_event
+            stream_kwargs["stop_on_done"] = False
+
         started = time.monotonic()
         try:
             self.source_client.wk_transport_stream_topic(
                 topic_id,
                 websocket_url=websocket_url,
                 state=state,
-                on_token=on_token,
-                should_stop=(
-                    (lambda: self._stop_requested(conversation_id))
-                    if self._stop_requested is not None
-                    else None
-                ),
+                **stream_kwargs,
             )
         except AttributeError as error:
             raise RequestError(
@@ -717,6 +735,8 @@ class WKLightweightTransport:
         resume_value: str,
         timeout: float,
         relay_text_event: Callable[[dict[str, Any]], None],
+        on_transport_event: Callable[[dict[str, Any]], None] | None = None,
+        stream_should_stop: Callable[[], bool] | None = None,
         text: str,
         baseline_current_node: str | None,
     ) -> dict[str, Any]:
@@ -725,6 +745,8 @@ class WKLightweightTransport:
             resume_value=resume_value,
             timeout=timeout,
             relay_text_event=relay_text_event,
+            on_transport_event=on_transport_event,
+            stream_should_stop=stream_should_stop,
         )
         if self._stop_requested is not None and self._stop_requested(conversation_id):
             return {

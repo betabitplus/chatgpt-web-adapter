@@ -553,6 +553,7 @@ class CanonicalTopicStreamNormalizer:
         self.current_patch_message: dict[str, Any] | None = None
         self.pending_thinking: dict[str, dict[str, Any]] = {}
         self.catchup_remaining = 0
+        self.turn_completed = False
 
     def feed_transport_event(self, event: Any) -> list[dict[str, Any]]:
         if not isinstance(event, dict):
@@ -672,6 +673,12 @@ class CanonicalTopicStreamNormalizer:
         if not isinstance(content, dict):
             content = {}
         content_type = content.get("content_type")
+        if (
+            role == "assistant"
+            and recipient in {"", "all"}
+            and message.get("end_turn") is True
+        ):
+            self.turn_completed = True
 
         if (
             role == "assistant"

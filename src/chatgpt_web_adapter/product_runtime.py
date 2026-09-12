@@ -237,18 +237,34 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                 if on_event is not None:
                     on_event(normalized)
 
-        result = helper(
+        def stream_should_stop() -> bool:
+            if normalizer.turn_completed:
+                return True
+            if should_stop is None:
+                return False
+            try:
+                return bool(should_stop())
+            except Exception:
+                return False
+
+        helper(
             conversation_id=ref.conversation_id,
             topic_id=topic_id,
             timeout=timeout,
             on_event=relay_transport_event,
-            should_stop=should_stop,
+            should_stop=stream_should_stop,
         )
-        completed = isinstance(result, dict) and result.get("completed") is True
+        completed = normalizer.turn_completed
         if not completed:
+            cancelled = False
+            if should_stop is not None:
+                try:
+                    cancelled = bool(should_stop())
+                except Exception:
+                    cancelled = False
             return {
                 "stream_completed": False,
-                "stream_cancelled": should_stop is not None and bool(should_stop()),
+                "stream_cancelled": cancelled,
                 "stream_topic_id": topic_id,
                 "emitted_message_ids": sorted(normalizer.emitted_message_ids),
             }

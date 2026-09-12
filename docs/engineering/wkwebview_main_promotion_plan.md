@@ -351,6 +351,13 @@ Append concise entries here whenever a tracker state changes. Reference task IDs
 - Installed-artifact verification repeated the exact real `/resume 6aa4861b-475c-83eb-b7da-4406ce8c8b3b` path with no `PYTHONPATH` or source override. It reached `Following active response via live stream…` at 10.27 seconds including the large-history render and received a new live `Thinking` event at 10.95 seconds (`GPTTY_INSTALLED_WS_FOLLOW_EVENT_OK`). Final source regression gates were CWA 2273/2273 and gptty 294/294, with targeted Ruff and `git diff --check` passing.
 - After those acceptance gates, `integration/upstream-wkwebview-0.3.1` was advanced from `82a4c67` to the accepted experiment tip with a strict fast-forward only. This makes the push-based follow the maintained WK alternative rather than leaving the installed checkout on an experiment branch. Stable `main` remains `524f400` and was not modified.
 
+### 2026-09-12 — multi-segment resumed-turn stream continuation repair
+
+- Live diagnosis on active conversation `6aa4861b-475c-83eb-b7da-4406ce8c8b3b` showed that one tool-heavy turn keeps the same `turn_exchange_id` across many reasoning/tool segments. Celsius may emit an inner `done` / `[DONE]` marker at a segment boundary while the same ChatGPT turn continues afterward, so treating the first raw `done` as terminal truncated resumed-turn follow in the WK alternative.
+- The fix separates transport-segment completion from ChatGPT-turn completion. `wk_transport_stream_topic(..., stop_on_done=False)` keeps the same Celsius subscription alive across intermediate `done` frames; `WKLightweightTransport` records segment `done` markers only as diagnostics; `CanonicalTopicStreamNormalizer` now owns finality and stops only after a user-visible assistant message on recipient `all` carries `end_turn=true`.
+- Deterministic regression coverage proves that a stream item received after an intermediate raw `done` is still delivered, and product-runtime coverage proves that the stream stop condition switches only after the canonical assistant `end_turn`. Targeted CWA tests are 74/74, full CWA is 2274/2274, full downstream gptty is 294/294, and targeted Ruff is clean.
+- Read-only live probes used the installed gptty environment against the same active conversation. The current segment did not cross a raw `done` boundary during the bounded probe window, so no additional live `done -> next frame` claim is recorded here; the installed runtime nevertheless imports this exact editable CWA checkout, so the next natural segment boundary exercises the repair without another install step.
+
 ## Rules for maintaining this tracker
 
 - Never mark an item `DONE` from code inspection alone when its acceptance criterion requires a live or installed-artifact test.

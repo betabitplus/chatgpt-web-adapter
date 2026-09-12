@@ -281,6 +281,7 @@ class ChatGPTWebClient(_core.ChatGPTWebClient):
         on_event: Callable[[dict[str, Any]], None] | None = None,
         on_token: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        stop_on_done: bool = True,
     ) -> None:
         """Stream one resume topic using a caller-provided Celsius WS URL."""
 
@@ -296,6 +297,7 @@ class ChatGPTWebClient(_core.ChatGPTWebClient):
             on_event=on_event,
             on_token=on_token,
             cancel_check=should_stop,
+            stop_on_done=stop_on_done,
         )
 
     def wk_transport_upload_media_files(

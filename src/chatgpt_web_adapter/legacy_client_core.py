@@ -25,7 +25,14 @@ from .model_detection import (
     detect_reasoning_effort_from_conversation_payload,
 )
 from .status import _status_from_payload
-from .types import AuthData, ChatConversation, ChatMetrics, ChatRequestDiagnostics, ChatResponse, MediaItem
+from .types import (
+    AuthData,
+    ChatConversation,
+    ChatMetrics,
+    ChatRequestDiagnostics,
+    ChatResponse,
+    MediaItem,
+)
 
 CHAT_REQUIREMENTS_URL = "https://chatgpt.com/backend-api/sentinel/chat-requirements"
 CHAT_BACKEND_URL = "https://chatgpt.com/backend-api/f/conversation"
@@ -784,6 +791,7 @@ class ChatGPTWebClient:
         on_event: Callable[[dict[str, Any]], None] | None,
         on_token: Callable[[str], None] | None,
         cancel_check: Callable[[], bool] | None = None,
+        stop_on_done: bool = True,
     ) -> None:
         import websockets
 
@@ -808,8 +816,9 @@ class ChatGPTWebClient:
                 return
             inner_type = inner.get("type")
             if inner_type == "done":
-                completed = True
                 self._emit_event(on_event, "raw_ws_done", topic_id=topic_id)
+                if stop_on_done:
+                    completed = True
                 return
             if inner_type != "stream-item":
                 return
@@ -819,8 +828,9 @@ class ChatGPTWebClient:
                 return
             raw_data = parsed_item["data"]
             if raw_data == "[DONE]":
-                completed = True
                 self._emit_event(on_event, "raw_ws_done", topic_id=topic_id)
+                if stop_on_done:
+                    completed = True
                 return
             try:
                 parsed_payload = json.loads(raw_data)
@@ -937,6 +947,7 @@ class ChatGPTWebClient:
         on_event: Callable[[dict[str, Any]], None] | None,
         on_token: Callable[[str], None] | None,
         cancel_check: Callable[[], bool] | None = None,
+        stop_on_done: bool = True,
     ) -> None:
         try:
             asyncio.run(
@@ -946,6 +957,7 @@ class ChatGPTWebClient:
                     on_event=on_event,
                     on_token=on_token,
                     cancel_check=cancel_check,
+                    stop_on_done=stop_on_done,
                 )
             )
         except RequestError:

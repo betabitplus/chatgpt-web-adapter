@@ -91,8 +91,10 @@ class _SourceClient:
         on_event=None,
         on_token=None,
         should_stop=None,
+        stop_on_done=True,
     ) -> None:
         self.stream_calls.append((topic_id, websocket_url))
+        self.stop_on_done = stop_on_done
         state["message_id"] = "assistant-1"
         if on_event is not None:
             on_event(
@@ -214,8 +216,10 @@ def test_lightweight_follow_topic_uses_one_celsius_bootstrap_and_forwards_events
         on_event=events.append,
     )
 
-    assert result["completed"] is True
+    assert result["completed"] is False
+    assert result["segment_done_count"] == 1
     assert result["topic_id"] == "conversation-turn-turn-1"
+    assert source.stop_on_done is False
     assert source.stream_calls == [
         ("conversation-turn-turn-1", "wss://example.invalid/celsius")
     ]

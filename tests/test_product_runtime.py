@@ -264,7 +264,7 @@ def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -
         on_event,
         should_stop,
     ):
-        provider_calls.append((conversation_id, topic_id, timeout, should_stop))
+        provider_calls.append((conversation_id, topic_id, timeout))
         on_event(
             {
                 "type": "raw_ws_event",
@@ -286,7 +286,27 @@ def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -
             }
         )
         on_event({"type": "raw_ws_done", "topic_id": topic_id})
-        return {"completed": True}
+        assert should_stop() is False
+        on_event(
+            {
+                "type": "raw_ws_event",
+                "parsed": {
+                    "v": {
+                        "message": {
+                            "id": "assistant-final",
+                            "author": {"role": "assistant"},
+                            "recipient": "all",
+                            "status": "finished_successfully",
+                            "end_turn": True,
+                            "content": {"content_type": "text", "parts": ["done"]},
+                            "metadata": {"turn_exchange_id": "turn-1"},
+                        }
+                    }
+                },
+            }
+        )
+        assert should_stop() is True
+        return {"completed": False, "segment_done_count": 1}
 
     provider.follow_stream_topic = follow_stream_topic
     monkeypatch.setattr(
@@ -314,11 +334,14 @@ def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -
     )
 
     assert provider_calls == [
-        ("conversation-1", "conversation-turn-turn-1", 90, None)
+        ("conversation-1", "conversation-turn-turn-1", 90)
     ]
-    assert len(events) == 1
+    assert len(events) == 2
     assert events[0]["message_kind"] == "tool_call"
     assert events[0]["message_id"] == "tool-1"
+    assert events[1]["type"] == "assistant_text_delta"
+    assert events[1]["message_id"] == "assistant-final"
+    assert events[1]["delta"] == "done"
     assert len(final_calls) == 1
     final_ref, final_ids, final_limit = final_calls[0]
     assert getattr(final_ref, "conversation_id", None) == "conversation-1"

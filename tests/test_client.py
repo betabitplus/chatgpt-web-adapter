@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import io
+import asyncio
 import base64
+import io
 import json
 import shutil
 import threading
@@ -11,9 +12,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Iterator
 
+import pytest
+
 import chatgpt_web_adapter as adapter
 import chatgpt_web_adapter.client as client_mod
-import pytest
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"0" * 40
 
@@ -1165,6 +1167,74 @@ def test_parse_encoded_stream_item_extracts_last_sse_event() -> None:
     )
 
     assert parsed == {"event": "done", "data": "[DONE]"}
+
+
+def test_ws_topic_follow_continues_after_intermediate_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _build_client()
+    events: list[dict[str, Any]] = []
+    sent: list[str] = []
+    topic_id = "conversation-turn-long-tool-loop"
+    after_done_payload = {"marker": "after-done"}
+    encoded_item = (
+        "event: message\n"
+        f"data: {json.dumps(after_done_payload, separators=(',', ':'))}\n\n"
+    )
+    frames = [
+        json.dumps([{"id": 2, "reply": {"catchups": [], "last_offset": "1-0", "recovered": True}}]),
+        json.dumps([{"type": "message", "topic_id": topic_id, "payload": {"type": "conversation-turn-stream", "payload": {"type": "done"}}}]),
+        json.dumps([{"type": "message", "topic_id": topic_id, "payload": {"type": "conversation-turn-stream", "payload": {"type": "stream-item", "encoded_item": encoded_item}}}]),
+    ]
+
+    class FakeWebSocket:
+        async def send(self, raw: str) -> None:
+            sent.append(raw)
+
+        async def recv(self) -> str:
+            if not frames:
+                raise AssertionError("unexpected recv after post-done stream item")
+            return frames.pop(0)
+
+    class FakeConnect:
+        async def __aenter__(self):
+            return FakeWebSocket()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    import websockets
+
+    monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: FakeConnect())
+    monkeypatch.setattr(client, "_probe_celsius_ws_user", lambda: {"websocket_url": "wss://example.invalid/celsius"})
+    monkeypatch.setattr(client, "_build_headers", lambda extra=None: {})
+    monkeypatch.setattr(client, "_capture_ws_url_diagnostics", lambda websocket_url, state: None)
+    monkeypatch.setattr(client, "_parse_event", lambda payload, state: ([], None))
+
+    def cancel_check() -> bool:
+        return any(
+            event.get("type") == "raw_ws_event" and event.get("parsed") == after_done_payload
+            for event in events
+        )
+
+    asyncio.run(
+        client._stream_handoff_via_ws_topic_async(
+            topic_id,
+            state={},
+            on_event=events.append,
+            on_token=None,
+            cancel_check=cancel_check,
+            stop_on_done=False,
+        )
+    )
+
+    event_types = [event["type"] for event in events]
+    assert "raw_ws_done" in event_types
+    assert "raw_ws_event" in event_types
+    assert event_types.index("raw_ws_done") < event_types.index("raw_ws_event")
+    after_done_event = next(event for event in events if event["type"] == "raw_ws_event")
+    assert after_done_event["parsed"] == after_done_payload
+    assert len(sent) == 1
 
 
 def test_send_uses_ws_topic_stream_after_stream_handoff(

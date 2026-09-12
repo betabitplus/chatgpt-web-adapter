@@ -29,6 +29,7 @@ class WKLightweightSourceClient(Protocol):
         on_event: Callable[[dict[str, Any]], None] | None = None,
         on_token: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        stop_on_done: bool = True,
     ) -> None: ...
 
     def wk_transport_upload_media_files(
@@ -625,12 +626,12 @@ class WKLightweightTransport:
             "conversation_id": conversation_id,
             "resume_turn_topic_id": normalized_topic,
         }
-        completed = False
+        segment_done_count = 0
 
         def relay_event(event: dict[str, Any]) -> None:
-            nonlocal completed
+            nonlocal segment_done_count
             if isinstance(event, dict) and event.get("type") == "raw_ws_done":
-                completed = True
+                segment_done_count += 1
             if on_event is not None:
                 on_event(event)
 
@@ -643,6 +644,7 @@ class WKLightweightTransport:
                 on_event=relay_event,
                 on_token=on_token,
                 should_stop=should_stop,
+                stop_on_done=False,
             )
         except AttributeError as error:
             raise RequestError(
@@ -656,7 +658,8 @@ class WKLightweightTransport:
             "message_id": state.get("message_id"),
             "turn_exchange_id": state.get("turn_exchange_id"),
             "finish_reason": state.get("finish_reason"),
-            "completed": completed,
+            "completed": False,
+            "segment_done_count": segment_done_count,
             "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
         }
 

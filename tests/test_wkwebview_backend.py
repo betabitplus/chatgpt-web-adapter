@@ -201,6 +201,31 @@ def test_runtime_backend_selection_rejects_conflicting_low_level_injection() -> 
         )
 
 
+def test_wkwebview_provider_persists_and_reads_canonical_cache(tmp_path) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
+    payload = {
+        "conversation_id": "conversation-cache",
+        "current_node": "node-1",
+        "mapping": {"node-1": {}},
+    }
+
+    provider._persist_canonical_payload(
+        "conversation-cache",
+        payload,
+        min_interval_seconds=0,
+    )
+
+    cached = provider.read_cached_conversation_payload("conversation-cache")
+
+    assert cached is not None
+    cached_payload, age = cached
+    assert cached_payload == payload
+    assert age >= 0
+    path = provider._canonical_cache_path("conversation-cache")
+    assert path.is_file()
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
 def test_wkwebview_provider_text_attachment_download_is_cached() -> None:
     provider = WKWebViewTurnProvider()
 
@@ -388,9 +413,11 @@ def test_wkwebview_canonical_read_prefers_curl_second_leg(monkeypatch) -> None:
 
     def fake_curl_read(conversation_id: str, *, timeout: float):
         calls.append((conversation_id, timeout))
-        return {"current_node": "node-curl", "mapping": {"node-curl": {}}}
+        return {"current_node": "node-curl", "mapping": {"node-curl": {}}}, None
 
-    monkeypatch.setattr(provider, "_read_conversation_payload_via_curl", fake_curl_read)
+    monkeypatch.setattr(
+        provider, "_read_conversation_payload_via_coordinated_curl", fake_curl_read
+    )
 
     def fail_if_wk_helper_runs():
         raise AssertionError(
@@ -414,8 +441,8 @@ def test_wkwebview_canonical_read_falls_back_to_helper_when_curl_unavailable(
     monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
     monkeypatch.setattr(
         provider,
-        "_read_conversation_payload_via_curl",
-        lambda conversation_id, *, timeout: None,
+        "_read_conversation_payload_via_coordinated_curl",
+        lambda conversation_id, *, timeout: (None, None),
     )
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     commands: list[list[str]] = []
@@ -436,8 +463,8 @@ def test_wkwebview_canonical_read_falls_back_to_helper_when_curl_unavailable(
     assert provider._canonical_read_observation() == ("wkwebview", None)
 
 
-def test_wkwebview_canonical_fallback_records_reason(monkeypatch) -> None:
-    provider = WKWebViewTurnProvider()
+def test_wkwebview_canonical_fallback_records_reason(monkeypatch, tmp_path) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
     monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
 
     class FailingLightweightTransport:
@@ -463,6 +490,112 @@ def test_wkwebview_canonical_fallback_records_reason(monkeypatch) -> None:
         "wkwebview",
         "WKWEBVIEW_CURL_CANONICAL_HTTP:503",
     )
+
+
+def test_wkwebview_canonical_429_waits_and_retries_without_helper(
+    monkeypatch, tmp_path
+) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
+    provider._canonical_read_min_spacing_seconds = 0.0
+    provider._canonical_rate_limit_initial_backoff_seconds = 0.001
+    provider._canonical_rate_limit_max_backoff_seconds = 0.001
+
+    class _RateLimitedThenSuccess:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.reason: str | None = None
+
+        def read_canonical(self, conversation_id: str, *, timeout: float):
+            self.calls += 1
+            if self.calls == 1:
+                self.reason = "WKWEBVIEW_CURL_CANONICAL_HTTP:HTTP_429"
+                return None
+            self.reason = None
+            return {"current_node": "node-ok", "mapping": {"node-ok": {}}}
+
+        def take_canonical_fallback_reason(self):
+            reason = self.reason
+            self.reason = None
+            return reason
+
+    transport = _RateLimitedThenSuccess()
+    provider._lightweight_transport = transport
+    monkeypatch.setattr(
+        provider,
+        "_ensure_helper",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("429 retry must not fall back to WK helper")
+        ),
+    )
+
+    payload = provider.read_conversation_payload("conversation-429", timeout=1)
+
+    assert payload["current_node"] == "node-ok"
+    assert transport.calls == 2
+    assert provider._canonical_read_observation() == ("curl_cffi", None)
+
+
+def test_wkwebview_canonical_persistent_429_never_falls_back_to_helper(
+    monkeypatch, tmp_path
+) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
+    provider._canonical_read_min_spacing_seconds = 0.0
+    provider._canonical_rate_limit_initial_backoff_seconds = 0.05
+    provider._canonical_rate_limit_max_backoff_seconds = 0.05
+
+    class _AlwaysRateLimited:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def read_canonical(self, conversation_id: str, *, timeout: float):
+            self.calls += 1
+            return None
+
+        def take_canonical_fallback_reason(self):
+            return "WKWEBVIEW_CURL_CANONICAL_HTTP:HTTP_429"
+
+    transport = _AlwaysRateLimited()
+    provider._lightweight_transport = transport
+    helper_calls: list[str] = []
+
+    def fail_helper():
+        helper_calls.append("helper")
+        raise AssertionError("persistent 429 must not launch WK helper")
+
+    monkeypatch.setattr(provider, "_ensure_helper", fail_helper)
+
+    with pytest.raises(RequestError, match="WKWEBVIEW_CANONICAL_RATE_LIMITED") as info:
+        provider.read_conversation_payload("conversation-429", timeout=0.02)
+
+    assert info.value.status_code == 429
+    assert transport.calls == 1
+    assert helper_calls == []
+
+
+def test_wkwebview_canonical_gate_state_is_shared_between_provider_instances(
+    tmp_path,
+) -> None:
+    first = WKWebViewTurnProvider(state_dir=tmp_path)
+    second = WKWebViewTurnProvider(state_dir=tmp_path)
+    first._canonical_read_min_spacing_seconds = 0.03
+    second._canonical_read_min_spacing_seconds = 0.03
+
+    class _SuccessTransport:
+        def read_canonical(self, conversation_id: str, *, timeout: float):
+            return {"current_node": conversation_id, "mapping": {}}
+
+        def take_canonical_fallback_reason(self):
+            return None
+
+    first._lightweight_transport = _SuccessTransport()
+    second._lightweight_transport = _SuccessTransport()
+
+    first.read_conversation_payload("conversation-a", timeout=1)
+    started = time.monotonic()
+    second.read_conversation_payload("conversation-b", timeout=1)
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.02
 
 
 def test_wkwebview_lightweight_path_is_default_with_explicit_legacy_escape_hatch(
@@ -1122,8 +1255,8 @@ def test_wkwebview_new_chat_recovers_identity_by_client_message_id(
     )
     monkeypatch.setattr(
         provider,
-        "_read_conversation_payload_via_curl",
-        lambda *args, **kwargs: canonical,
+        "_read_conversation_payload_via_coordinated_curl",
+        lambda *args, **kwargs: (canonical, None),
     )
 
     def fail_generic_recovery(*args, **kwargs):
@@ -1196,8 +1329,8 @@ def test_wkwebview_identity_recovery_curl_failure_fails_closed_without_wk_fallba
     )
     monkeypatch.setattr(
         provider,
-        "_read_conversation_payload_via_curl",
-        lambda *args, **kwargs: None,
+        "_read_conversation_payload_via_coordinated_curl",
+        lambda *args, **kwargs: (None, None),
     )
 
     def fail_generic_recovery(*args, **kwargs):
@@ -1772,8 +1905,8 @@ def test_wkwebview_identity_recovery_retry_uses_bounded_backoff(
     )
     monkeypatch.setattr(
         provider,
-        "_read_conversation_payload_via_curl",
-        lambda *args, **kwargs: reads.pop(0),
+        "_read_conversation_payload_via_coordinated_curl",
+        lambda *args, **kwargs: (reads.pop(0), None),
     )
     sleeps: list[float] = []
     monkeypatch.setattr(

@@ -6,6 +6,7 @@ import pytest
 
 import chatgpt_web_adapter.product_runtime as product_runtime
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeBridgeStatus
+from chatgpt_web_adapter.exceptions import RequestError
 from chatgpt_web_adapter.product_runtime import (
     BROWSER_OWNED_PRODUCT_TRANSPORT,
     DEFAULT_PRODUCT_TRANSPORT,
@@ -188,6 +189,85 @@ def test_runtime_exposes_canonical_conversation_snapshot(monkeypatch) -> None:
     assert result == snapshot
     assert result is not snapshot
     assert calls == [("conversation-1", {"limit": 25})]
+
+
+def test_runtime_follow_snapshot_uses_cached_history_on_429(monkeypatch) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    payload = {
+        "conversation_id": "conversation-cache",
+        "current_node": "user-1",
+        "mapping": {
+            "user-1": {
+                "id": "user-1",
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": "user-1",
+                    "author": {"role": "user"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "content": {"content_type": "text", "parts": ["cached question"]},
+                    "metadata": {},
+                    "end_turn": False,
+                },
+            }
+        },
+    }
+
+    def rate_limited(_conversation):
+        raise RequestError(
+            "WKWEBVIEW_CANONICAL_RATE_LIMITED",
+            request_stage="wkwebview_canonical_read",
+            status_code=429,
+        )
+
+    monkeypatch.setattr(runtime, "get_conversation_payload", rate_limited)
+    monkeypatch.setattr(
+        runtime.canonical,
+        "read_cached_conversation_payload",
+        lambda _conversation_id: (payload, 12.75),
+        raising=False,
+    )
+
+    snapshot = runtime.conversation_follow_snapshot(
+        "conversation-cache",
+        emitted_message_ids=(),
+        limit=None,
+    )
+
+    assert snapshot["canonical_cache_stale"] is True
+    assert snapshot["canonical_cache_age_seconds"] == 12.75
+    assert len(snapshot["messages"]) == 1
+    assert snapshot["messages"][0].text == "cached question"
+
+
+def test_runtime_follow_snapshot_does_not_use_cache_for_non_429(monkeypatch) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    cache_calls = []
+
+    def unavailable(_conversation):
+        raise RequestError(
+            "WKWEBVIEW_CANONICAL_HTTP_FAILED",
+            request_stage="wkwebview_canonical_read",
+            status_code=503,
+        )
+
+    monkeypatch.setattr(runtime, "get_conversation_payload", unavailable)
+    monkeypatch.setattr(
+        runtime.canonical,
+        "read_cached_conversation_payload",
+        lambda conversation_id: cache_calls.append(conversation_id),
+        raising=False,
+    )
+
+    with pytest.raises(RequestError, match="WKWEBVIEW_CANONICAL_HTTP_FAILED"):
+        runtime.conversation_follow_snapshot(
+            "conversation-cache",
+            emitted_message_ids=(),
+            limit=None,
+        )
+
+    assert cache_calls == []
 
 
 def test_runtime_full_resume_includes_attachment_only_user_text(monkeypatch) -> None:

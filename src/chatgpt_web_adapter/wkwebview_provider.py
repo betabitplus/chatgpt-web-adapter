@@ -54,6 +54,10 @@ class WKWebViewTurnProvider:
     temporary_lifecycle_proof_detail = WKTemporaryTurnRuntime.LIFECYCLE_PROOF_DETAIL
     temporary_finality_detail = WKTemporaryTurnRuntime.FINALITY_DETAIL
     _shared_heavy_submit_gate = threading.Lock()
+    _shared_canonical_read_gate = threading.Lock()
+    _canonical_read_min_spacing_seconds = 5.0
+    _canonical_rate_limit_initial_backoff_seconds = 15.0
+    _canonical_rate_limit_max_backoff_seconds = 60.0
     _shared_heavy_submit_lock_path = (
         Path.home()
         / "Library"
@@ -80,6 +84,8 @@ class WKWebViewTurnProvider:
         )
         self.turn_timeout = float(turn_timeout)
         self.build_timeout = float(build_timeout)
+        self._canonical_read_lock_path = self.state_dir / "wk-canonical-read.lock"
+        self._canonical_cache_dir = self.state_dir / "canonical-cache"
         self._helper_runtime = WKWebViewHelperRuntime(
             self.state_dir, build_timeout=self.build_timeout
         )
@@ -146,6 +152,227 @@ class WKWebViewTurnProvider:
                 finally:
                     os.close(fd)
             self._shared_heavy_submit_gate.release()
+
+    @staticmethod
+    def _read_shared_canonical_state(fd: int) -> dict[str, Any]:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 4096)
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _write_shared_canonical_state(fd: int, state: dict[str, Any]) -> None:
+        encoded = json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, encoded)
+        os.fsync(fd)
+
+    @contextmanager
+    def _canonical_read_gate(self, timeout: float) -> Iterator[int]:
+        wait_timeout = max(0.001, float(timeout))
+        started = time.monotonic()
+        acquired = self._shared_canonical_read_gate.acquire(timeout=wait_timeout)
+        if not acquired:
+            raise RequestError(
+                "WKWEBVIEW_CANONICAL_GATE_TIMEOUT",
+                request_stage="wkwebview_canonical_read",
+            )
+        fd: int | None = None
+        try:
+            remaining = max(0.001, wait_timeout - (time.monotonic() - started))
+            path = self._canonical_read_lock_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            deadline = time.monotonic() + remaining
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RequestError(
+                            "WKWEBVIEW_CANONICAL_GATE_TIMEOUT",
+                            request_stage="wkwebview_canonical_read",
+                        )
+                    time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+            yield fd
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+            self._shared_canonical_read_gate.release()
+
+    def _read_conversation_payload_via_coordinated_curl(
+        self,
+        conversation_id: str,
+        *,
+        timeout: float,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        transport = self._lightweight_transport
+        if transport is None:
+            return None, None
+
+        started = time.monotonic()
+        deadline = started + max(0.001, float(timeout))
+        with self._canonical_read_gate(timeout) as fd:
+            while True:
+                state = self._read_shared_canonical_state(fd)
+                now_wall = time.time()
+                next_allowed_at = state.get("next_allowed_at")
+                if isinstance(next_allowed_at, (int, float)) and not isinstance(
+                    next_allowed_at, bool
+                ):
+                    wait_for = max(0.0, float(next_allowed_at) - now_wall)
+                    if wait_for > 0:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= wait_for:
+                            raise RequestError(
+                                "WKWEBVIEW_CANONICAL_RATE_LIMITED",
+                                request_stage="wkwebview_canonical_read",
+                                status_code=429,
+                            )
+                        time.sleep(wait_for)
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RequestError(
+                        "WKWEBVIEW_CANONICAL_GATE_TIMEOUT",
+                        request_stage="wkwebview_canonical_read",
+                    )
+                payload = transport.read_canonical(
+                    conversation_id,
+                    timeout=max(1.0, remaining),
+                )
+                fallback_reason = transport.take_canonical_fallback_reason()
+                now_wall = time.time()
+                if isinstance(payload, dict):
+                    self._write_shared_canonical_state(
+                        fd,
+                        {
+                            "next_allowed_at": (
+                                now_wall + self._canonical_read_min_spacing_seconds
+                            ),
+                            "rate_limit_strikes": 0,
+                        },
+                    )
+                    return payload, fallback_reason
+
+                if fallback_reason and "HTTP_429" in fallback_reason:
+                    strikes_value = state.get("rate_limit_strikes")
+                    strikes = (
+                        int(strikes_value)
+                        if isinstance(strikes_value, int)
+                        and not isinstance(strikes_value, bool)
+                        and strikes_value >= 0
+                        else 0
+                    )
+                    strikes = min(strikes + 1, 8)
+                    backoff = min(
+                        self._canonical_rate_limit_max_backoff_seconds,
+                        self._canonical_rate_limit_initial_backoff_seconds
+                        * (2 ** max(0, strikes - 1)),
+                    )
+                    self._write_shared_canonical_state(
+                        fd,
+                        {
+                            "next_allowed_at": now_wall + backoff,
+                            "rate_limit_strikes": strikes,
+                        },
+                    )
+                    if deadline - time.monotonic() <= backoff:
+                        raise RequestError(
+                            "WKWEBVIEW_CANONICAL_RATE_LIMITED",
+                            request_stage="wkwebview_canonical_read",
+                            status_code=429,
+                        )
+                    continue
+
+                self._write_shared_canonical_state(
+                    fd,
+                    {
+                        "next_allowed_at": (
+                            now_wall + self._canonical_read_min_spacing_seconds
+                        ),
+                        "rate_limit_strikes": 0,
+                    },
+                )
+                return None, fallback_reason
+
+    def _canonical_cache_path(self, conversation_id: str) -> Path:
+        ref = ConversationRef(conversation_id)
+        return self._canonical_cache_dir / f"{ref.conversation_id}.json"
+
+    def _persist_canonical_payload(
+        self,
+        conversation_id: str,
+        payload: dict[str, Any],
+        *,
+        min_interval_seconds: float = 30.0,
+    ) -> None:
+        path = self._canonical_cache_path(conversation_id)
+        try:
+            if path.is_file():
+                age = max(0.0, time.time() - path.stat().st_mtime)
+                if age < max(0.0, float(min_interval_seconds)):
+                    return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            wrapper = {
+                "saved_at": time.time(),
+                "conversation_id": ConversationRef(conversation_id).conversation_id,
+                "payload": payload,
+            }
+            encoded = json.dumps(
+                wrapper,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            fd = os.open(
+                temporary,
+                os.O_CREAT | os.O_TRUNC | os.O_WRONLY,
+                0o600,
+            )
+            try:
+                os.write(fd, encoded)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError):
+            # Cache persistence is best-effort and never changes canonical authority.
+            return
+
+    def read_cached_conversation_payload(
+        self,
+        conversation_id: str,
+    ) -> tuple[dict[str, Any], float] | None:
+        path = self._canonical_cache_path(conversation_id)
+        try:
+            raw = path.read_bytes()
+            wrapper = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(wrapper, dict):
+            return None
+        payload = wrapper.get("payload")
+        saved_at = wrapper.get("saved_at")
+        if not isinstance(payload, dict):
+            return None
+        if not isinstance(saved_at, (int, float)) or isinstance(saved_at, bool):
+            try:
+                saved_at = path.stat().st_mtime
+            except OSError:
+                saved_at = time.time()
+        age = max(0.0, time.time() - float(saved_at))
+        return payload, age
 
     def status(self) -> BrowserNativeBridgeStatus:
         try:
@@ -396,16 +623,13 @@ class WKWebViewTurnProvider:
     ) -> dict[str, Any]:
         fallback_reason = None
         if self._lightweight_path_enabled():
-            payload = self._read_conversation_payload_via_curl(
+            payload, fallback_reason = self._read_conversation_payload_via_coordinated_curl(
                 conversation_id,
                 timeout=timeout,
             )
             if isinstance(payload, dict):
                 self._record_canonical_read_observation("curl_cffi")
                 return payload
-            transport = self._lightweight_transport
-            if transport is not None:
-                fallback_reason = transport.take_canonical_fallback_reason()
 
         binary = self._ensure_helper()
         payload = self._run_helper(
@@ -447,6 +671,7 @@ class WKWebViewTurnProvider:
         self._canonical_state.set_current_node(
             ref.conversation_id, parsed.get("current_node")
         )
+        self._persist_canonical_payload(ref.conversation_id, parsed)
         return parsed
 
     def read_catalog_payload(

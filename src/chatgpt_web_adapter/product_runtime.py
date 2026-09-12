@@ -18,6 +18,7 @@ from .browser_native_client import (
     _canonical_stream_identity,
 )
 from .client import DEFAULT_TIMEOUT_SECONDS, ChatGPTWebClient
+from .exceptions import RequestError
 from .messages import get_messages
 from .product_runtime_observation_gate import gate_product_runtime_send_text_observed
 from .product_submission import ProductSubmissionAck
@@ -245,7 +246,32 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
         limit: int | None = 128,
     ) -> dict[str, Any]:
         ref = ConversationRef.from_any(conversation)
-        payload = self.get_conversation_payload(ref)
+        canonical_cache_age_seconds: float | None = None
+        try:
+            payload = self.get_conversation_payload(ref)
+        except RequestError as error:
+            if error.status_code != 429:
+                raise
+            cache_reader = getattr(
+                self.canonical,
+                "read_cached_conversation_payload",
+                None,
+            )
+            cached = cache_reader(ref.conversation_id) if callable(cache_reader) else None
+            if not (
+                isinstance(cached, tuple)
+                and len(cached) == 2
+                and isinstance(cached[0], dict)
+            ):
+                raise
+            payload = cached[0]
+            age_value = cached[1]
+            canonical_cache_age_seconds = (
+                max(0.0, float(age_value))
+                if isinstance(age_value, (int, float))
+                and not isinstance(age_value, bool)
+                else None
+            )
 
         class _PayloadReader:
             def _get_conversation_payload(self, _conversation_id: str) -> dict[str, Any]:
@@ -291,6 +317,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             "turn_exchange_id": turn_exchange_id,
             "stream_answer_message_id": answer_message_id,
             "stream_answer_text": answer_text,
+            "canonical_cache_stale": canonical_cache_age_seconds is not None,
+            "canonical_cache_age_seconds": canonical_cache_age_seconds,
         }
 
     def conversation_follow_stream(

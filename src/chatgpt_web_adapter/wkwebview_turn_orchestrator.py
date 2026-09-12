@@ -158,9 +158,11 @@ class WKTurnOrchestrator:
                 )
 
             if candidate_id is not None:
-                canonical = provider._read_conversation_payload_via_curl(
-                    candidate_id,
-                    timeout=min(8.0, max(1.0, remaining)),
+                canonical, _fallback_reason = (
+                    provider._read_conversation_payload_via_coordinated_curl(
+                        candidate_id,
+                        timeout=min(8.0, max(1.0, remaining)),
+                    )
                 )
                 if not isinstance(canonical, dict):
                     wait_before_retry()
@@ -223,9 +225,11 @@ class WKTurnOrchestrator:
                         "WKWEBVIEW_IDENTITY_RECOVERY_TIMEOUT",
                         request_stage="wkwebview_identity_recovery",
                     )
-                canonical = provider._read_conversation_payload_via_curl(
-                    conversation_id,
-                    timeout=min(6.0, max(1.0, scan_remaining)),
+                canonical, _fallback_reason = (
+                    provider._read_conversation_payload_via_coordinated_curl(
+                        conversation_id,
+                        timeout=min(6.0, max(1.0, scan_remaining)),
+                    )
                 )
                 if not isinstance(canonical, dict):
                     continue

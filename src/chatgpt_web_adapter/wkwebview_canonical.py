@@ -276,6 +276,15 @@ class WKWebViewCanonicalClient(BrowserContextCanonicalClient):
         self.canonical_read_plane = WKWEBVIEW_CANONICAL_READ_PLANE
         self._browser_native_turn_provider = provider
 
+    def read_cached_conversation_payload(
+        self,
+        conversation_id: str,
+    ) -> tuple[dict[str, Any], float] | None:
+        reader = getattr(self.provider, "read_cached_conversation_payload", None)
+        if not callable(reader):
+            return None
+        return reader(conversation_id)
+
     def read_text_attachment(
         self,
         attachment: dict[str, Any],

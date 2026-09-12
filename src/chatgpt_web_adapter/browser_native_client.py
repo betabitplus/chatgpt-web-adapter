@@ -407,6 +407,7 @@ def _canonical_intermediate_events(
             "type": "canonical_intermediate_message",
             "message_id": message_id,
             "message_kind": kind,
+            "turn_exchange_id": _node_turn_exchange_id(node),
             "text": text,
             "label": label.strip()
             if isinstance(label, str) and label.strip()

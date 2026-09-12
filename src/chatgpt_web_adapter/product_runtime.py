@@ -191,6 +191,14 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             submission_id=None,
         )
         stream_topic_id, turn_exchange_id = _canonical_stream_identity(payload)
+        current_turn_event_ids = sorted(
+            str(event.get("message_id")).strip()
+            for event in events
+            if isinstance(event.get("message_id"), str)
+            and str(event.get("message_id")).strip()
+            and turn_exchange_id is not None
+            and event.get("turn_exchange_id") == turn_exchange_id
+        )
         answer_message_id, answer_text = _canonical_stream_answer_seed(
             payload,
             turn_exchange_id=turn_exchange_id,
@@ -200,6 +208,7 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             "messages": get_messages(reader, ref, limit=limit),
             "events": events,
             "emitted_message_ids": sorted(emitted),
+            "current_turn_event_ids": current_turn_event_ids,
             "stream_topic_id": stream_topic_id,
             "turn_exchange_id": turn_exchange_id,
             "stream_answer_message_id": answer_message_id,

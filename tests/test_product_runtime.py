@@ -223,7 +223,13 @@ def test_runtime_follow_snapshot_reuses_one_canonical_payload(monkeypatch) -> No
         assert emitted_message_ids == {"m1"}
         assert submission_id is None
         emitted_message_ids.add("m2")
-        return [{"type": "canonical_intermediate_message", "message_id": "m2"}]
+        return [
+            {
+                "type": "canonical_intermediate_message",
+                "message_id": "m2",
+                "turn_exchange_id": "turn-2",
+            }
+        ]
 
     monkeypatch.setattr(
         runtime.canonical,
@@ -234,6 +240,11 @@ def test_runtime_follow_snapshot_reuses_one_canonical_payload(monkeypatch) -> No
     monkeypatch.setattr(product_runtime, "get_status", fake_status)
     monkeypatch.setattr(product_runtime, "get_messages", fake_messages)
     monkeypatch.setattr(product_runtime, "_canonical_intermediate_events", fake_events)
+    monkeypatch.setattr(
+        product_runtime,
+        "_canonical_stream_identity",
+        lambda _payload: ("conversation-turn-turn-2", "turn-2"),
+    )
 
     result = runtime.conversation_follow_snapshot(
         "conversation-1",
@@ -245,9 +256,14 @@ def test_runtime_follow_snapshot_reuses_one_canonical_payload(monkeypatch) -> No
     assert result["status"] is status
     assert result["messages"] is messages
     assert result["events"] == [
-        {"type": "canonical_intermediate_message", "message_id": "m2"}
+        {
+            "type": "canonical_intermediate_message",
+            "message_id": "m2",
+            "turn_exchange_id": "turn-2",
+        }
     ]
     assert result["emitted_message_ids"] == ["m1", "m2"]
+    assert result["current_turn_event_ids"] == ["m2"]
 
 
 def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -> None:

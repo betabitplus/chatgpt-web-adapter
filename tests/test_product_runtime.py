@@ -126,6 +126,30 @@ def test_runtime_exposes_canonical_conversation_catalog(monkeypatch) -> None:
     assert result[0] is not catalog[0]
 
 
+def test_runtime_exposes_bounded_recent_conversation_catalog(monkeypatch) -> None:
+    runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
+    catalog = [{"id": "conversation-1", "title": "One"}]
+    calls = []
+
+    def fake_recent(*, limit):
+        calls.append(limit)
+        return catalog
+
+    monkeypatch.setattr(
+        runtime.canonical,
+        "list_recent_conversations",
+        fake_recent,
+        raising=False,
+    )
+
+    result = runtime.list_recent_conversations(limit=50)
+
+    assert calls == [50]
+    assert result == catalog
+    assert result is not catalog
+    assert result[0] is not catalog[0]
+
+
 def test_runtime_exposes_canonical_model_catalog(monkeypatch) -> None:
     runtime = ChatGPTProductRuntime(_Client(), provider=_Provider())
     models = [{"slug": "gpt-5-6-thinking", "title": "GPT-5.6"}]
@@ -234,6 +258,7 @@ def test_runtime_exposes_complete_gptty_read_surface() -> None:
         "get_messages",
         "get_status",
         "list_conversations",
+        "list_recent_conversations",
         "list_models",
         "conversation_snapshot",
         "conversation_follow_snapshot",

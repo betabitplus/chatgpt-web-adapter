@@ -139,6 +139,15 @@ class WKTurnOrchestrator:
             else prepared.conversation_id
         )
         matched_payload: dict[str, Any] | None = None
+        retry_delay = 1.0
+
+        def wait_before_retry() -> None:
+            nonlocal retry_delay
+            remaining_wait = max(0.0, deadline - time.monotonic())
+            if remaining_wait <= 0:
+                return
+            time.sleep(min(retry_delay, remaining_wait))
+            retry_delay = min(retry_delay * 2.0, 8.0)
 
         while True:
             remaining = deadline - time.monotonic()
@@ -154,7 +163,7 @@ class WKTurnOrchestrator:
                     timeout=min(8.0, max(1.0, remaining)),
                 )
                 if not isinstance(canonical, dict):
-                    time.sleep(min(0.25, max(0.05, remaining)))
+                    wait_before_retry()
                     continue
                 if self._payload_contains_client_message(
                     canonical,
@@ -183,10 +192,10 @@ class WKTurnOrchestrator:
                             }
                         )
                         return payload
-                    time.sleep(min(0.25, max(0.05, remaining)))
+                    wait_before_retry()
                     continue
                 if prepared.conversation_id is not None:
-                    time.sleep(min(0.25, max(0.05, remaining)))
+                    wait_before_retry()
                     continue
                 candidate_id = None
 
@@ -197,7 +206,7 @@ class WKTurnOrchestrator:
                 timeout=min(8.0, max(1.0, remaining)),
             )
             if not isinstance(catalog, dict):
-                time.sleep(min(0.25, max(0.05, remaining)))
+                wait_before_retry()
                 continue
             raw_items = catalog.get("items")
             items = raw_items if isinstance(raw_items, list) else []
@@ -230,7 +239,7 @@ class WKTurnOrchestrator:
                     break
 
             if candidate_id is None:
-                time.sleep(min(0.25, max(0.05, remaining)))
+                wait_before_retry()
                 continue
 
             if (

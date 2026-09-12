@@ -517,9 +517,10 @@ static NSString *AuthenticatedFetchScript(NSString *endpoint) {
     NSString *literal = JSONStringLiteral(endpoint ?: @"");
     return [NSString stringWithFormat:
             @"(()=>{"
-              "const url=%@;"
-              "fetch('/api/auth/session',{credentials:'include',cache:'no-store'})"
-                ".then(async s=>{const session=await s.json();const token=session&&session.accessToken;if(!token)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');return fetch(url,{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+token}});})"
+              "const url=%@,cacheKey='__cwaAuthorityAccessToken';"
+              "const token=async(force=false)=>{if(force)delete window[cacheKey];const cached=window[cacheKey];if(typeof cached==='string'&&cached)return cached;const s=await fetch('/api/auth/session',{credentials:'include',cache:'no-store'});const session=await s.json();const value=session&&session.accessToken;if(!value)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');window[cacheKey]=value;return value;};"
+              "const request=async()=>{let access=await token();let r=await fetch(url,{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+access}});if(r.status===401||r.status===403){access=await token(true);r=await fetch(url,{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+access}});}return r;};"
+              "request()"
                 ".then(async r=>{const body=await r.text();window.webkit.messageHandlers.cwaCanonical.postMessage({ok:r.ok,status:r.status,contentType:r.headers.get('content-type')||'',body});})"
                 ".catch(e=>window.webkit.messageHandlers.cwaCanonical.postMessage({ok:false,status:0,contentType:'',error:String(e)}));"
               "return true;"
@@ -555,10 +556,11 @@ static NSString *CanonicalCompletionCheckScript(NSString *conversationId) {
     NSString *idLiteral = JSONStringLiteral(conversationId ?: @"");
     return [NSString stringWithFormat:
             @"(()=>{"
-              "const id=%@,url='/backend-api/conversation/'+encodeURIComponent(id);"
+              "const id=%@,url='/backend-api/conversation/'+encodeURIComponent(id),cacheKey='__cwaAuthorityAccessToken';"
               "const completed=v=>['completed','complete','finished','done','success','succeeded','finished_successfully'].includes(String(v||'').toLowerCase());"
-              "fetch('/api/auth/session',{credentials:'include',cache:'no-store'})"
-                ".then(async s=>{const session=await s.json();const token=session&&session.accessToken;if(!token)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');return fetch(url,{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+token}});})"
+              "const token=async(force=false)=>{if(force)delete window[cacheKey];const cached=window[cacheKey];if(typeof cached==='string'&&cached)return cached;const s=await fetch('/api/auth/session',{credentials:'include',cache:'no-store'});const session=await s.json();const value=session&&session.accessToken;if(!value)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');window[cacheKey]=value;return value;};"
+              "const request=async()=>{let access=await token();let r=await fetch(url,{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+access}});if(r.status===401||r.status===403){access=await token(true);r=await fetch(url,{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+access}});}return r;};"
+              "request()"
                 ".then(async r=>{"
                   "if(!r.ok){window.webkit.messageHandlers.cwaCanonical.postMessage({ok:false,status:r.status,completed:false});return;}"
                   "const d=await r.json();const mapping=d&&d.mapping&&typeof d.mapping==='object'?d.mapping:{};const current=typeof d.current_node==='string'?d.current_node:'';const node=mapping[current];const m=node&&node.message;const md=m&&m.metadata&&typeof m.metadata==='object'?m.metadata:{};const fd=md&&md.finish_details&&typeof md.finish_details==='object'?md.finish_details:null;const role=m&&m.author&&typeof m.author.role==='string'?m.author.role:null;const recipient=m&&typeof m.recipient==='string'?m.recipient:null;const asyncStatus=(d&&typeof d.async_status==='string'?d.async_status:null)||(d&&typeof d.status==='string'?d.status:null)||(node&&typeof node.async_status==='string'?node.async_status:null)||(node&&typeof node.status==='string'?node.status:null)||(typeof md.async_status==='string'?md.async_status:null)||(typeof md.status==='string'?md.status:null);const messageStatus=m&&typeof m.status==='string'?m.status:null;const active=v=>['running','in_progress','pending','queued','started','streaming'].includes(String(v||'').toLowerCase());"
@@ -576,10 +578,11 @@ static NSString *CanonicalCommitCheckScript(NSString *conversationId, NSString *
     NSString *baselineLiteral = JSONStringLiteral(baselineCurrentNode ?: @"");
     return [NSString stringWithFormat:
             @"(()=>{"
-              "const id=%@,expectedPrompt=%@,baseline=%@;"
+              "const id=%@,expectedPrompt=%@,baseline=%@,cacheKey='__cwaAuthorityAccessToken';"
               "const url='/backend-api/conversation/'+encodeURIComponent(id);"
-              "fetch('/api/auth/session',{credentials:'include',cache:'no-store'})"
-                ".then(async s=>{const session=await s.json();const token=session&&session.accessToken;if(!token)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');return fetch(url,{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+token}});})"
+              "const token=async(force=false)=>{if(force)delete window[cacheKey];const cached=window[cacheKey];if(typeof cached==='string'&&cached)return cached;const s=await fetch('/api/auth/session',{credentials:'include',cache:'no-store'});const session=await s.json();const value=session&&session.accessToken;if(!value)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');window[cacheKey]=value;return value;};"
+              "const request=async()=>{let access=await token();let r=await fetch(url,{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+access}});if(r.status===401||r.status===403){access=await token(true);r=await fetch(url,{credentials:'include',cache:'no-store',headers:{Authorization:'Bearer '+access}});}return r;};"
+              "request()"
                 ".then(async r=>{"
                   "if(!r.ok){window.webkit.messageHandlers.cwaCanonical.postMessage({ok:false,status:r.status,committed:false});return;}"
                   "const d=await r.json();const current=typeof d.current_node==='string'?d.current_node:'';"
@@ -1055,12 +1058,12 @@ int main(int argc, const char *argv[]) {
                 }
                 BOOL canonicalCompleted = NO;
                 NSString *canonicalBody = @"";
+                NSTimeInterval canonicalPollDelay = 1.0;
                 NSTimeInterval nextCanonicalCheckAt = [NSDate timeIntervalSinceReferenceDate];
                 while (!canonicalCompleted && [deadline timeIntervalSinceNow] > 0) {
                     RunLoopFor(0.05);
                     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
                     if (now < nextCanonicalCheckAt) continue;
-                    nextCanonicalCheckAt = now + 2.0;
                     delegate.canonicalDone = NO;
                     delegate.canonicalResult = nil;
                     EvaluateSync(webView, CanonicalCompletionCheckScript(resumeConversation), 1.5, nil);
@@ -1073,6 +1076,12 @@ int main(int argc, const char *argv[]) {
                     if (canonicalCompleted && [completionResult[@"body"] isKindOfClass:[NSString class]]) {
                         canonicalBody = completionResult[@"body"];
                     }
+                    NSNumber *completionStatus = [completionResult[@"status"] isKindOfClass:[NSNumber class]] ? completionResult[@"status"] : @0;
+                    NSTimeInterval completionDelay = completionStatus.integerValue == 429
+                        ? MAX(canonicalPollDelay, 60.0)
+                        : canonicalPollDelay;
+                    nextCanonicalCheckAt = [NSDate timeIntervalSinceReferenceDate] + completionDelay;
+                    if (completionStatus.integerValue != 429) canonicalPollDelay = MIN(canonicalPollDelay * 2.0, 8.0);
                 }
                 NSData *canonicalBodyData = [canonicalBody dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
                 NSString *canonicalBodyBase64 = [canonicalBodyData base64EncodedStringWithOptions:0] ?: @"";
@@ -1115,7 +1124,11 @@ int main(int argc, const char *argv[]) {
                     }
                     NSTimeInterval remaining = [deadline timeIntervalSinceNow];
                     if (remaining <= 0) break;
-                    RunLoopFor(MIN(observerPollInterval, remaining));
+                    NSNumber *observerStatus = [canonical[@"status"] isKindOfClass:[NSNumber class]] ? canonical[@"status"] : @0;
+                    NSTimeInterval observerDelay = observerStatus.integerValue == 429
+                        ? MAX(observerPollInterval, 60.0)
+                        : observerPollInterval;
+                    RunLoopFor(MIN(observerDelay, remaining));
                 }
                 PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_CANONICAL_OBSERVER_TIMEOUT",@"conversation_id":observeConversation});
                 return 22;
@@ -1424,6 +1437,7 @@ int main(int argc, const char *argv[]) {
         BOOL streamingResumeMode = observeStream && streamObserveUntilResumeToken;
 
         if (streamingResumeMode && !resumeCommitFence) {
+            NSTimeInterval canonicalPollDelay = 1.0;
             NSTimeInterval nextCanonicalCheckAt = [NSDate timeIntervalSinceReferenceDate];
             while (!resumeCommitFence && !heavyFinalCanonicalCompleted && [deadline timeIntervalSinceNow] > 0) {
                 RunLoopFor(0.05);
@@ -1438,7 +1452,6 @@ int main(int argc, const char *argv[]) {
 
                 NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
                 if (now < nextCanonicalCheckAt) continue;
-                nextCanonicalCheckAt = now + 2.0;
                 delegate.canonicalDone = NO;
                 delegate.canonicalResult = nil;
                 EvaluateSync(webView, CanonicalCompletionCheckScript(resolvedConversationId), 1.5, nil);
@@ -1451,9 +1464,16 @@ int main(int argc, const char *argv[]) {
                     heavyFinalCanonicalBody = [finalProof[@"body"] isKindOfClass:[NSString class]] ? finalProof[@"body"] : @"";
                     heavyFinalCurrentNode = [finalProof[@"currentNode"] isKindOfClass:[NSString class]] ? finalProof[@"currentNode"] : @"";
                 }
+                NSNumber *finalProofStatus = [finalProof[@"status"] isKindOfClass:[NSNumber class]] ? finalProof[@"status"] : @0;
+                NSTimeInterval finalProofDelay = finalProofStatus.integerValue == 429
+                    ? MAX(canonicalPollDelay, 60.0)
+                    : canonicalPollDelay;
+                nextCanonicalCheckAt = [NSDate timeIntervalSinceReferenceDate] + finalProofDelay;
+                if (finalProofStatus.integerValue != 429) canonicalPollDelay = MIN(canonicalPollDelay * 2.0, 8.0);
             }
         } else if (!resumeCommitFence) {
             NSDate *commitDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(30.0, MAX(1.0, [deadline timeIntervalSinceNow]))];
+            NSTimeInterval commitPollDelay = 1.0;
             while ([commitDeadline timeIntervalSinceNow] > 0) {
                 delegate.canonicalDone = NO;
                 delegate.canonicalResult = nil;
@@ -1471,7 +1491,13 @@ int main(int argc, const char *argv[]) {
                     committedCurrentNode = [proof[@"currentNode"] isKindOfClass:[NSString class]] ? proof[@"currentNode"] : @"";
                     break;
                 }
-                RunLoopFor(0.2);
+                NSNumber *proofStatus = [proof[@"status"] isKindOfClass:[NSNumber class]] ? proof[@"status"] : @0;
+                NSTimeInterval proofDelay = proofStatus.integerValue == 429
+                    ? MAX(commitPollDelay, 60.0)
+                    : commitPollDelay;
+                NSTimeInterval commitRemaining = [commitDeadline timeIntervalSinceNow];
+                if (commitRemaining > 0) RunLoopFor(MIN(proofDelay, commitRemaining));
+                if (proofStatus.integerValue != 429) commitPollDelay = MIN(commitPollDelay * 2.0, 8.0);
             }
         }
 

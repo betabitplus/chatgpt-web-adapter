@@ -291,7 +291,7 @@ class WKLightweightTransport:
                 status = payload.get("status") if isinstance(payload, dict) else None
                 if status in {"IS_STOP_REQUESTED", "COMPLETE"}:
                     return str(status)
-                time.sleep(min(0.25, max(0.05, remaining)))
+                time.sleep(min(1.0, max(0.05, remaining)))
 
     def _upload_generic_file(self, path: Path) -> dict[str, Any]:
         try:
@@ -691,6 +691,7 @@ class WKLightweightTransport:
                 request_stage="wkwebview_curl_ws_second_leg",
             ) from error
         last_status = 0
+        retry_delay = 1.0
         with curl_requests.Session(impersonate="safari") as canonical_session:
             while True:
                 remaining = deadline - time.monotonic()
@@ -719,7 +720,10 @@ class WKLightweightTransport:
                     )
                     if not self.request_error_allows_fallback(error):
                         raise error
-                    time.sleep(min(0.5, max(0.05, remaining)))
+                    sleep_delay = 60.0 if response.status_code == 429 else retry_delay
+                    time.sleep(min(sleep_delay, max(0.05, remaining)))
+                    if response.status_code != 429:
+                        retry_delay = min(retry_delay * 2.0, 8.0)
                     continue
                 try:
                     canonical_payload = response.json()
@@ -749,4 +753,5 @@ class WKLightweightTransport:
                         "stream_terminal_observed": True,
                         "ws_token_events": raw_sequence,
                     }
-                time.sleep(min(0.5, max(0.05, remaining)))
+                time.sleep(min(retry_delay, max(0.05, remaining)))
+                retry_delay = min(retry_delay * 2.0, 8.0)

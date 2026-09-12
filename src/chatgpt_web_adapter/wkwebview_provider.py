@@ -455,6 +455,7 @@ class WKWebViewTurnProvider:
         timeout: float,
     ) -> dict[str, Any]:
         deadline = time.monotonic() + max(2.0, min(float(timeout), 30.0))
+        retry_delay = 1.0
         while time.monotonic() < deadline:
             try:
                 payload = self.read_conversation_payload(
@@ -464,17 +465,23 @@ class WKWebViewTurnProvider:
             except RequestError as error:
                 if error.status_code in {401, 403}:
                     raise
-                time.sleep(0.25)
-                continue
-            current_node = payload.get("current_node")
-            node_changed = baseline_current_node is None or (
-                isinstance(current_node, str)
-                and current_node
-                and current_node != baseline_current_node
-            )
-            if node_changed and self._current_branch_contains_user_text(payload, text):
-                return payload
-            time.sleep(0.25)
+                sleep_delay = 60.0 if error.status_code == 429 else retry_delay
+            else:
+                current_node = payload.get("current_node")
+                node_changed = baseline_current_node is None or (
+                    isinstance(current_node, str)
+                    and current_node
+                    and current_node != baseline_current_node
+                )
+                if node_changed and self._current_branch_contains_user_text(payload, text):
+                    return payload
+                sleep_delay = retry_delay
+
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining > 0:
+                time.sleep(min(sleep_delay, remaining))
+            if sleep_delay < 60.0:
+                retry_delay = min(retry_delay * 2.0, 8.0)
         raise RequestError(
             "WKWEBVIEW_WRITE_CANONICAL_COMMIT_NOT_PROVEN",
             request_stage="wkwebview_authority_postwrite",

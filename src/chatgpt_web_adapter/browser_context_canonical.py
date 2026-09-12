@@ -527,6 +527,32 @@ class BrowserContextCanonicalClient:
     ) -> AttachedConversation:
         return attach_conversation(self, conversation)
 
+    def list_recent_conversations(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an int between 1 and 100")
+        conversations: dict[str, dict[str, Any]] = {}
+        for starred in (False, True):
+            payload = self.transport.read_catalog(
+                "conversations",
+                offset=0,
+                limit=limit,
+                is_archived=False,
+                is_starred=starred,
+            )
+            raw_items = payload.get("items")
+            items = raw_items if isinstance(raw_items, list) else []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                conversation_id = item.get("id")
+                if isinstance(conversation_id, str) and conversation_id.strip():
+                    conversations[conversation_id.strip()] = dict(item)
+        return sorted(
+            conversations.values(),
+            key=lambda item: str(item.get("update_time") or ""),
+            reverse=True,
+        )[:limit]
+
     def list_conversations(self) -> list[dict[str, Any]]:
         conversations: dict[str, dict[str, Any]] = {}
         page_size = 100

@@ -8,6 +8,8 @@ from .status import _status_from_payload
 from .types import ConversationRef
 from .wkwebview_helper_runtime import WKHelperInvocation
 
+_CANONICAL_OBSERVER_POLL_INTERVAL_SECONDS = 15.0
+
 
 class WKTurnObserver:
     """Own passive observation and Stop lifecycle for the WK turn provider."""
@@ -96,7 +98,7 @@ class WKTurnObserver:
             ],
             request={
                 "observe_conversation": ref.conversation_id,
-                "poll_interval": 1.0,
+                "poll_interval": _CANONICAL_OBSERVER_POLL_INTERVAL_SECONDS,
                 "timeout": total_timeout,
             },
         )

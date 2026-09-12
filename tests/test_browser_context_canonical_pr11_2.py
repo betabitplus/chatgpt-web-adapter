@@ -132,6 +132,56 @@ def test_browser_context_client_owns_terminal_ack_contract(tmp_path) -> None:
     assert not callable(getattr(provider, "complete_canonical_readback", None))
 
 
+def test_recent_conversation_catalog_is_bounded_to_two_active_reads(
+    tmp_path, monkeypatch
+) -> None:
+    provider = BrowserNativeTurnProvider(state_dir=tmp_path)
+    client = BrowserContextCanonicalClient(object(), provider)
+    calls = []
+
+    def fake_catalog(catalog, **kwargs):
+        calls.append((catalog, dict(kwargs)))
+        if kwargs["is_starred"]:
+            return {
+                "items": [
+                    {"id": "starred", "title": "Starred", "update_time": "2026-09-12T02:00:00"}
+                ],
+                "total": 1,
+            }
+        return {
+            "items": [
+                {"id": "normal", "title": "Normal", "update_time": "2026-09-12T01:00:00"}
+            ],
+            "total": 1,
+        }
+
+    monkeypatch.setattr(client.transport, "read_catalog", fake_catalog)
+
+    result = client.list_recent_conversations(limit=50)
+
+    assert [item["id"] for item in result] == ["starred", "normal"]
+    assert calls == [
+        (
+            "conversations",
+            {
+                "offset": 0,
+                "limit": 50,
+                "is_archived": False,
+                "is_starred": False,
+            },
+        ),
+        (
+            "conversations",
+            {
+                "offset": 0,
+                "limit": 50,
+                "is_archived": False,
+                "is_starred": True,
+            },
+        ),
+    ]
+
+
 def test_browser_context_client_keeps_python_status_interpreter(
     tmp_path, monkeypatch
 ) -> None:

@@ -322,6 +322,72 @@ def test_lightweight_transport_resumes_and_finalizes_through_explicit_contract(
     assert result["ws_token_events"] == 1
 
 
+def test_lightweight_resume_canonical_reconcile_uses_bounded_backoff(monkeypatch) -> None:
+    source = _SourceClient()
+    transport, cached = _transport(source)
+    final_payload = {"current_node": "node-final", "mapping": {"node-final": {}}}
+    curl = _CurlRequests(
+        [
+            [_Response(200, {"websocket_url": "wss://example.invalid/ws"})],
+            [
+                _Response(200, {"current_node": "not-final", "mapping": {}}),
+                _Response(200, final_payload),
+            ],
+        ]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport.time.sleep",
+        sleeps.append,
+    )
+
+    result = transport.resume_turn(
+        conversation_id="conversation-1",
+        resume_value="resume-secret",
+        timeout=30,
+        relay_text_event=lambda _event: None,
+        text="prompt",
+        baseline_current_node="node-before",
+    )
+
+    assert result["canonical_completed"] is True
+    assert sleeps == [1.0]
+    assert len(curl.sessions[1].calls) == 2
+    assert cached == [("conversation-1", final_payload)]
+
+
+def test_lightweight_resume_429_uses_long_backoff(monkeypatch) -> None:
+    source = _SourceClient()
+    transport, _ = _transport(source)
+    final_payload = {"current_node": "node-final", "mapping": {"node-final": {}}}
+    curl = _CurlRequests(
+        [
+            [_Response(200, {"websocket_url": "wss://example.invalid/ws"})],
+            [_Response(429, {}), _Response(200, final_payload)],
+        ]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport.time.sleep",
+        sleeps.append,
+    )
+
+    result = transport.resume_turn(
+        conversation_id="conversation-1",
+        resume_value="resume-secret",
+        timeout=120,
+        relay_text_event=lambda _event: None,
+        text="prompt",
+        baseline_current_node="node-before",
+    )
+
+    assert result["canonical_completed"] is True
+    assert sleeps == [60.0]
+    assert len(curl.sessions[1].calls) == 2
+
+
 def test_lightweight_resume_stop_skips_canonical_polling(monkeypatch) -> None:
     source = _SourceClient()
     cached: list[tuple[str, dict]] = []

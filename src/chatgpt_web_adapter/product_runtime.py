@@ -137,6 +137,12 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             )
         return [dict(item) for item in helper()]
 
+    def list_recent_conversations(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        helper = getattr(self.canonical, "list_recent_conversations", None)
+        if callable(helper):
+            return [dict(item) for item in helper(limit=limit)]
+        return self.list_conversations()[:limit]
+
     def list_models(self) -> list[dict[str, Any]]:
         helper = getattr(self.canonical, "list_models", None)
         if not callable(helper):

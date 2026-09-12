@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1686,6 +1687,76 @@ def test_wkwebview_status_does_not_hide_programming_errors(monkeypatch) -> None:
         provider.status()
 
 
+def test_wkwebview_write_commit_retry_uses_bounded_backoff(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    calls = []
+    final_payload = _final_canonical_for_prompt("hello", assistant_text="done")
+    payloads = [
+        {"current_node": "node-before", "mapping": {}},
+        final_payload,
+    ]
+    monkeypatch.setattr(
+        provider,
+        "read_conversation_payload",
+        lambda *args, **kwargs: payloads.pop(0),
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_provider.time.sleep",
+        calls.append,
+    )
+
+    result = provider._wait_for_canonical_write_commit(
+        conversation_id="conversation-1",
+        text="hello",
+        baseline_current_node="node-before",
+        timeout=30,
+    )
+
+    assert result == final_payload
+    assert calls == [1.0]
+
+
+def test_wkwebview_identity_recovery_retry_uses_bounded_backoff(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    final_payload = _final_canonical_for_prompt("recover me", assistant_text="done")
+    final_payload["mapping"]["user-final"]["message"]["id"] = "client-message-1"
+    reads = [None, final_payload]
+    provider._lightweight_transport = SimpleNamespace(
+        read_catalog=lambda *args, **kwargs: {
+            "items": [{"id": "conversation-recovered"}],
+            "total": 1,
+        }
+    )
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_via_curl",
+        lambda *args, **kwargs: reads.pop(0),
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_turn_orchestrator.time.sleep",
+        sleeps.append,
+    )
+
+    result = provider._turn_orchestrator.recover_phase_one_identity(
+        {
+            "identity_recovery_required": True,
+            "client_message_id": "client-message-1",
+            "conversation_id": "",
+        },
+        prepared=SimpleNamespace(conversation_id=None),
+        text="recover me",
+        total_timeout=30,
+        started=time.monotonic(),
+    )
+
+    assert result["conversation_id"] == "conversation-recovered"
+    assert result["_cwa_identity_recovered"] is True
+    assert sleeps == [1.0]
+
+
 def test_wkwebview_write_commit_does_not_hide_programming_errors(monkeypatch) -> None:
     provider = WKWebViewTurnProvider()
 
@@ -1701,6 +1772,72 @@ def test_wkwebview_write_commit_does_not_hide_programming_errors(monkeypatch) ->
             baseline_current_node="node-before",
             timeout=5,
         )
+
+
+def test_wkwebview_observer_uses_conservative_canonical_poll_interval(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    captured = {}
+
+    def fake_observer(invocation, **kwargs):
+        captured["request"] = dict(invocation.request)
+        return kwargs["on_event"](
+            {
+                "type": "canonical_payload",
+                "status": 200,
+                "body_base64": base64.b64encode(
+                    json.dumps(
+                        {
+                            "current_node": "assistant-1",
+                            "mapping": {
+                                "assistant-1": {
+                                    "message": {
+                                        "id": "assistant-1",
+                                        "author": {"role": "assistant"},
+                                        "recipient": "all",
+                                        "status": "finished_successfully",
+                                        "content": {
+                                            "content_type": "text",
+                                            "parts": ["done"],
+                                        },
+                                        "metadata": {
+                                            "finish_details": {"type": "stop"},
+                                        },
+                                    }
+                                }
+                            },
+                        }
+                    ).encode()
+                ).decode(),
+            }
+        )
+
+    monkeypatch.setattr(provider._helper_runtime, "run_event_observer", fake_observer)
+
+    result = provider.observe_turn(
+        conversation_id="conversation-1",
+        turn_exchange_id=None,
+        browser_authority_lease_id="lease-1",
+        timeout=30,
+    )
+
+    assert result["ok"] is True
+    assert captured["request"]["poll_interval"] == 15.0
+
+
+def test_wkwebview_helper_observer_backs_off_after_429() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src/chatgpt_web_adapter/wkwebview_helper/WKChatGPTAuthority.m"
+    ).read_text(encoding="utf-8")
+
+    assert "observerStatus.integerValue == 429" in source
+    assert "MAX(observerPollInterval, 60.0)" in source
+    assert "cacheKey='__cwaAuthorityAccessToken'" in source
+    assert "canonicalPollDelay = 1.0" in source
+    assert "commitPollDelay = 1.0" in source
 
 
 def test_wkwebview_observer_does_not_hide_malformed_canonical_payload(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ class BrowserNativeSubmission:
 
 
 _CANONICAL_LIVE_POLL_INTERVAL_SECONDS = 15.0
+_ACTIVE_SEND_CANONICAL_POLL_INTERVAL_SECONDS = 2.0
 _CANONICAL_RATE_LIMIT_BACKOFF_SECONDS = 15.0
 _PASSIVE_FINAL_RECONCILE_RETRY_SECONDS = 5.0
 _PASSIVE_FINAL_RECONCILE_SETTLE_SECONDS = 4.0
@@ -1409,20 +1411,27 @@ def submit_browser_native(
         emitted_message_ids=tuple(baseline_message_ids),
     )
     transport_sequence = 0
+    observer_lock = threading.Lock()
+    observer_stop = threading.Event()
+    observer_thread: threading.Thread | None = None
+    observer_deadline = started + timeout
 
     def handle_text_event(event: dict[str, Any]) -> None:
         normalized = stream_state.apply(event)
         if normalized is not None:
             normalized = {**normalized, "submission_id": submission_id}
             _emit_revision_safe_event(self, on_event, normalized)
-        topic_normalizer.answer_message_id = stream_state.message_id
-        topic_normalizer.answer_text = stream_state.text
+        with observer_lock:
+            topic_normalizer.answer_message_id = stream_state.message_id
+            topic_normalizer.answer_text = stream_state.text
 
     def handle_transport_event(event: dict[str, Any]) -> None:
         nonlocal transport_sequence
-        topic_normalizer.answer_message_id = stream_state.message_id
-        topic_normalizer.answer_text = stream_state.text
-        for normalized in topic_normalizer.feed_transport_event(event):
+        with observer_lock:
+            topic_normalizer.answer_message_id = stream_state.message_id
+            topic_normalizer.answer_text = stream_state.text
+            normalized_events = topic_normalizer.feed_transport_event(event)
+        for normalized in normalized_events:
             if normalized.get("type") in {
                 ASSISTANT_TEXT_SNAPSHOT,
                 ASSISTANT_TEXT_DELTA,
@@ -1441,7 +1450,51 @@ def submit_browser_native(
             )
 
     def stream_should_stop() -> bool:
-        return topic_normalizer.turn_completed
+        with observer_lock:
+            return topic_normalizer.turn_completed
+
+    def stop_canonical_observer() -> None:
+        observer_stop.set()
+        thread = observer_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.2)
+
+    def start_canonical_observer(conversation_id: str) -> None:
+        nonlocal observer_thread
+        if observer_thread is not None:
+            return
+        read_payload = getattr(self, "_get_conversation_payload", None)
+        if not callable(read_payload):
+            return
+
+        def worker() -> None:
+            while not observer_stop.is_set() and time.monotonic() < observer_deadline:
+                try:
+                    payload = read_payload(conversation_id)
+                except Exception:
+                    if observer_stop.wait(_ACTIVE_SEND_CANONICAL_POLL_INTERVAL_SECONDS):
+                        return
+                    continue
+                if observer_stop.is_set():
+                    return
+                with observer_lock:
+                    events = _canonical_intermediate_events(
+                        payload,
+                        baseline_message_ids=baseline_message_ids,
+                        emitted_message_ids=topic_normalizer.emitted_message_ids,
+                        submission_id=submission_id,
+                    )
+                for normalized in events:
+                    _emit_revision_safe_event(self, on_event, normalized)
+                if observer_stop.wait(_ACTIVE_SEND_CANONICAL_POLL_INTERVAL_SECONDS):
+                    return
+
+        observer_thread = threading.Thread(
+            target=worker,
+            name="cwa-active-send-canonical-observer",
+            daemon=True,
+        )
+        observer_thread.start()
 
     def handle_write_identity(event: dict[str, Any]) -> None:
         if (
@@ -1453,11 +1506,12 @@ def submit_browser_native(
         if not isinstance(conversation_id, str) or not conversation_id.strip():
             return
         status_code = event.get("submit_response_status")
+        normalized_conversation_id = conversation_id.strip()
         self._emit_event(
             on_event,
             "browser_native_write_identity_resolved",
             submission_id=submission_id,
-            conversation_id=conversation_id.strip(),
+            conversation_id=normalized_conversation_id,
             submit_response_observed=bool(event.get("submit_response_observed")),
             status_code=(
                 status_code
@@ -1465,6 +1519,7 @@ def submit_browser_native(
                 else None
             ),
         )
+        start_canonical_observer(normalized_conversation_id)
 
     streaming_requested = (
         on_event is not None and _provider_supports_revision_safe_streaming(provider)
@@ -1498,16 +1553,19 @@ def submit_browser_native(
                 transport_stream_kwargs["on_transport_event"] = handle_transport_event
             if _callable_accepts_stream_should_stop(recovery_stream_send):
                 transport_stream_kwargs["stream_should_stop"] = stream_should_stop
-            turn = recovery_stream_send(
-                prompt,
-                conversation=conversation,
-                timeout=timeout,
-                canonical_completed_at_ms=canonical_completed_at_ms,
-                on_text_event=handle_text_event,
-                **write_identity_kwargs,
-                **transport_stream_kwargs,
-                **provider_kwargs,
-            )
+            try:
+                turn = recovery_stream_send(
+                    prompt,
+                    conversation=conversation,
+                    timeout=timeout,
+                    canonical_completed_at_ms=canonical_completed_at_ms,
+                    on_text_event=handle_text_event,
+                    **write_identity_kwargs,
+                    **transport_stream_kwargs,
+                    **provider_kwargs,
+                )
+            finally:
+                stop_canonical_observer()
         else:
             if normalized_attachment_paths and not _callable_accepts_attachment_paths(
                 recovery_send
@@ -1541,15 +1599,18 @@ def submit_browser_native(
             transport_stream_kwargs["on_transport_event"] = handle_transport_event
         if _callable_accepts_stream_should_stop(stream_send):
             transport_stream_kwargs["stream_should_stop"] = stream_should_stop
-        turn = stream_send(
-            prompt,
-            conversation=conversation,
-            timeout=timeout,
-            on_text_event=handle_text_event,
-            **write_identity_kwargs,
-            **transport_stream_kwargs,
-            **provider_kwargs,
-        )
+        try:
+            turn = stream_send(
+                prompt,
+                conversation=conversation,
+                timeout=timeout,
+                on_text_event=handle_text_event,
+                **write_identity_kwargs,
+                **transport_stream_kwargs,
+                **provider_kwargs,
+            )
+        finally:
+            stop_canonical_observer()
     else:
         turn = provider.send_text(
             prompt,

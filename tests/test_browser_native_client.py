@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from types import SimpleNamespace
 
@@ -282,6 +283,172 @@ def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn()
     ]
     assert answer_events
     assert answer_events[-1].get("delta") == "done" or answer_events[-1].get("text") == "done"
+
+
+def test_active_streaming_send_reconciles_canonical_intermediate_before_provider_returns(
+    monkeypatch,
+) -> None:
+    reasoning_observed = threading.Event()
+    provider_returned = threading.Event()
+
+    class Provider(FakeProvider):
+        revision_safe_streaming_supported = True
+
+        def send_text_streaming(
+            self,
+            text,
+            *,
+            conversation=None,
+            timeout=None,
+            on_text_event,
+            on_write_identity,
+            on_transport_event,
+        ):
+            on_write_identity(
+                {
+                    "type": "write_identity_resolved",
+                    "conversation_id": "conversation-1",
+                    "submit_response_observed": True,
+                    "submit_response_status": 200,
+                }
+            )
+            assert reasoning_observed.wait(2.0)
+            on_transport_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "v": {"message": live_payload["mapping"]["reasoning"]["message"]}
+                    },
+                }
+            )
+            provider_returned.set()
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-1",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=500,
+            )
+
+    baseline_payload = {
+        "conversation_id": "conversation-1",
+        "current_node": "old",
+        "mapping": {
+            "old": {
+                "id": "old",
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": "old-assistant",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "content": {"content_type": "text", "parts": ["old"]},
+                    "metadata": {},
+                    "end_turn": True,
+                },
+            }
+        },
+    }
+    live_payload = {
+        "conversation_id": "conversation-1",
+        "current_node": "reasoning",
+        "mapping": {
+            "old": {
+                "id": "old",
+                "parent": None,
+                "children": ["reasoning"],
+                "message": baseline_payload["mapping"]["old"]["message"],
+            },
+            "reasoning": {
+                "id": "reasoning",
+                "parent": "old",
+                "children": [],
+                "message": {
+                    "id": "reasoning-live",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "content": {
+                        "content_type": "thoughts",
+                        "thoughts": [
+                            {
+                                "summary": "Visible first-leg reasoning",
+                                "content": "internal-only-content",
+                                "finished": True,
+                            }
+                        ],
+                    },
+                    "metadata": {"turn_exchange_id": "turn-1"},
+                    "end_turn": False,
+                },
+            },
+        },
+    }
+
+    provider = Provider()
+    client = _client(provider)
+    payload_reads = 0
+
+    def read_payload(_conversation_id: str):
+        nonlocal payload_reads
+        payload_reads += 1
+        return baseline_payload if payload_reads == 1 else live_payload
+
+    client._get_conversation_payload = read_payload
+    delivered: list[dict] = []
+
+    def emit(callback, event_type, **payload):
+        event = {"type": event_type, **payload}
+        client.events.append((event_type, payload))
+        if callback is not None:
+            callback(event)
+
+    client._emit_event = emit
+
+    def on_event(event: dict) -> None:
+        delivered.append(event)
+        if event.get("message_id") == "reasoning-live":
+            assert provider_returned.is_set() is False
+            reasoning_observed.set()
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._ACTIVE_SEND_CANONICAL_POLL_INTERVAL_SECONDS",
+        0.001,
+    )
+
+    submit_browser_native(
+        client,
+        "hello",
+        conversation="existing-conversation",
+        timeout=2,
+        poll_interval=0.01,
+        on_event=on_event,
+    )
+
+    assert reasoning_observed.is_set()
+    assert provider_returned.is_set()
+    reasoning = [
+        event
+        for event in delivered
+        if event.get("type") == "canonical_intermediate_message"
+        and event.get("message_id") == "reasoning-live"
+    ]
+    assert reasoning == [
+        {
+            "type": "canonical_intermediate_message",
+            "message_id": "reasoning-live",
+            "message_kind": "reasoning",
+            "text": "Visible first-leg reasoning",
+            "label": None,
+            "tool_name": None,
+            "submission_id": reasoning[0]["submission_id"],
+        }
+    ]
+    assert "internal-only" not in repr(reasoning)
 
 
 def test_streaming_write_identity_is_emitted_before_write_completed() -> None:

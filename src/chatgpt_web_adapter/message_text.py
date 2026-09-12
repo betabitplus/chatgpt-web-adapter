@@ -45,15 +45,46 @@ def extract_message_text(message: dict[str, Any]) -> str:
     if not isinstance(message, dict):
         return ""
 
-    chunks: list[str] = []
+    content = message.get("content")
+    if _is_thoughts_content(content):
+        chunks: list[str] = []
+        _collect_thought_summaries(content.get("thoughts"), chunks)
+        return "\n".join(chunks).strip()
+
+    chunks = []
     stack: set[int] = set()
-    _collect_text(message.get("content"), chunks, stack)
+    _collect_text(content, chunks, stack)
 
     if not chunks:
         _collect_text(message.get("text"), chunks, stack)
         _collect_text(message.get("multimodal_text"), chunks, stack)
 
     return "\n".join(chunks).strip()
+
+
+def _is_thoughts_content(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    content_type = value.get("content_type")
+    return isinstance(content_type, str) and content_type.strip().lower() == "thoughts"
+
+
+def _collect_thought_summaries(value: Any, chunks: list[str]) -> None:
+    """Collect only the user-visible summary surface from private thoughts payloads."""
+
+    if isinstance(value, list):
+        for item in value:
+            _collect_thought_summaries(item, chunks)
+        return
+    if not isinstance(value, dict):
+        return
+    summary = value.get("summary")
+    if isinstance(summary, str):
+        _append_text(chunks, summary)
+    elif isinstance(summary, list):
+        for item in summary:
+            if isinstance(item, str):
+                _append_text(chunks, item)
 
 
 def _collect_text(value: Any, chunks: list[str], stack: set[int]) -> None:

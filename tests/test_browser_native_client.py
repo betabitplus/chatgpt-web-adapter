@@ -968,6 +968,108 @@ def test_topic_stream_normalizer_flushes_completed_thinking_before_tool() -> Non
     assert tool[0]["text"] == "Inspecting state"
 
 
+def test_topic_stream_normalizer_emits_public_thought_summary_without_reasoning_title() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+
+    events = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "thought-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "status": "finished_successfully",
+                        "content": {
+                            "content_type": "thoughts",
+                            "parts": ["private raw reasoning"],
+                            "thoughts": [
+                                {
+                                    "summary": "Visible reasoning update",
+                                    "content": "private hidden reasoning",
+                                    "finished": True,
+                                }
+                            ],
+                        },
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                    }
+                }
+            },
+        }
+    )
+
+    assert events == [
+        {
+            "type": "canonical_intermediate_message",
+            "message_id": "thought-1",
+            "message_kind": "reasoning",
+            "text": "Visible reasoning update",
+            "label": None,
+            "tool_name": None,
+        }
+    ]
+    assert "private" not in repr(events)
+
+
+def test_topic_stream_normalizer_reconstructs_public_thought_summary_patches() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+
+    assert normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "thought-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "status": "in_progress",
+                        "content": {
+                            "content_type": "thoughts",
+                            "thoughts": [
+                                {
+                                    "summary": "Inspect",
+                                    "content": "private hidden reasoning",
+                                    "finished": False,
+                                }
+                            ],
+                        },
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                    }
+                }
+            },
+        }
+    ) == []
+    assert normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "p": "/message/content/thoughts/0/summary",
+                "v": "ing state",
+            },
+        }
+    ) == []
+    events = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {"p": "/message/status", "v": "finished_successfully"},
+        }
+    )
+
+    assert events == [
+        {
+            "type": "canonical_intermediate_message",
+            "message_id": "thought-1",
+            "message_kind": "reasoning",
+            "text": "Inspecting state",
+            "label": None,
+            "tool_name": None,
+        }
+    ]
+    assert "private" not in repr(events)
+
+
 def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitive_fields() -> (
     None
 ):
@@ -1105,6 +1207,73 @@ def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitiv
     assert "private raw reasoning" not in repr(events)
     assert events[4]["text"] == "Worked for 12s"
     assert "m-final" not in emitted
+
+
+def test_canonical_intermediate_events_emit_public_thought_summary_without_title() -> None:
+    payload = {
+        "conversation_id": "conversation-1",
+        "current_node": "final",
+        "mapping": {
+            "thoughts": {
+                "id": "thoughts",
+                "parent": None,
+                "children": ["final"],
+                "message": {
+                    "id": "m-thoughts-public",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "content": {
+                        "content_type": "thoughts",
+                        "parts": ["private raw reasoning"],
+                        "thoughts": [
+                            {
+                                "summary": "Visible reasoning update",
+                                "content": "private hidden reasoning",
+                                "finished": True,
+                            }
+                        ],
+                    },
+                    "metadata": {},
+                    "end_turn": False,
+                },
+            },
+            "final": {
+                "id": "final",
+                "parent": "thoughts",
+                "children": [],
+                "message": {
+                    "id": "m-final",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["done"]},
+                    "metadata": {},
+                    "end_turn": True,
+                },
+            },
+        },
+    }
+    emitted: set[str] = set()
+
+    events = _canonical_intermediate_events(
+        payload,
+        baseline_message_ids=frozenset(),
+        emitted_message_ids=emitted,
+        submission_id="submission-1",
+    )
+
+    assert events == [
+        {
+            "type": "canonical_intermediate_message",
+            "message_id": "m-thoughts-public",
+            "message_kind": "reasoning",
+            "text": "Visible reasoning update",
+            "label": None,
+            "tool_name": None,
+            "submission_id": "submission-1",
+        }
+    ]
+    assert "private" not in repr(events)
 
 
 def test_unlabeled_tool_calls_get_concise_context_and_plain_thoughts_are_suppressed() -> (
@@ -1247,6 +1416,51 @@ def test_current_canonical_progress_waits_for_revision_completion() -> None:
         "Первый нюанс уже появился на уровне инструмента: читаю файл диапазонами."
     )
     assert "m-progress" in emitted
+
+
+def test_completed_current_reasoning_summary_is_safe_to_emit() -> None:
+    payload = {
+        "conversation_id": "conversation-1",
+        "current_node": "thoughts",
+        "mapping": {
+            "thoughts": {
+                "id": "thoughts",
+                "parent": None,
+                "children": [],
+                "message": {
+                    "id": "m-thoughts",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "content": {
+                        "content_type": "thoughts",
+                        "thoughts": [
+                            {
+                                "summary": "Visible completed summary",
+                                "content": "internal-only-content",
+                                "finished": True,
+                            }
+                        ],
+                    },
+                    "metadata": {},
+                    "end_turn": False,
+                },
+            }
+        },
+    }
+    emitted: set[str] = set()
+
+    events = _canonical_intermediate_events(
+        payload,
+        baseline_message_ids=frozenset(),
+        emitted_message_ids=emitted,
+        submission_id="submission-1",
+    )
+
+    assert len(events) == 1
+    assert events[0]["message_id"] == "m-thoughts"
+    assert events[0]["message_kind"] == "reasoning"
+    assert events[0]["text"] == "Visible completed summary"
 
 
 def test_passive_observer_waits_without_canonical_polling_then_reconciles_once() -> (

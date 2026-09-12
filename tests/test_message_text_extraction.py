@@ -138,3 +138,40 @@ def test_extract_message_text_allows_reused_structured_objects_in_sibling_positi
     message = {"content": {"parts": [part, part]}}
 
     assert extract_message_text(message) == "Repeated"
+
+
+def test_extract_message_text_reads_only_public_thought_summaries() -> None:
+    message = {
+        "content": {
+            "content_type": "thoughts",
+            "parts": ["private raw reasoning"],
+            "thoughts": [
+                {
+                    "summary": "Visible summary",
+                    "content": "private hidden reasoning",
+                    "chunks": ["private hidden chunk"],
+                    "finished": True,
+                }
+            ],
+        }
+    }
+
+    assert extract_message_text(message) == "Visible summary"
+
+
+def test_extract_message_text_suppresses_private_thoughts_without_public_summary() -> None:
+    message = {
+        "content": {
+            "content_type": " thoughts ",
+            "parts": ["private raw reasoning"],
+            "thoughts": [
+                {
+                    "summary": "",
+                    "content": "private hidden reasoning",
+                    "chunks": ["private hidden chunk"],
+                }
+            ],
+        }
+    }
+
+    assert extract_message_text(message) == ""

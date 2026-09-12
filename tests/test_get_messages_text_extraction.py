@@ -64,3 +64,27 @@ def test_get_messages_does_not_crash_on_tool_message_without_text() -> None:
     assert len(messages) == 1
     assert messages[0].role == "tool"
     assert messages[0].text == ""
+
+
+def test_get_messages_includes_public_thought_summary_only() -> None:
+    message = _message(
+        {
+            "content_type": "thoughts",
+            "parts": ["internal-only-parts"],
+            "thoughts": [
+                {
+                    "summary": "Visible reasoning update",
+                    "content": "internal-only-content",
+                    "chunks": ["internal-only-chunk"],
+                    "finished": True,
+                }
+            ],
+        },
+        role="assistant",
+    )
+
+    messages = _client(message).get_messages("conversation-1")
+
+    assert len(messages) == 1
+    assert messages[0].text == "Visible reasoning update"
+    assert "internal-only" not in messages[0].text

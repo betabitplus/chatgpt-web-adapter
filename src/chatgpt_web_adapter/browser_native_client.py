@@ -367,10 +367,12 @@ def _canonical_intermediate_events(
             label = metadata.get("reasoning_title") or "Reasoning summary"
             text = _sanitize_intermediate_text(extract_message_text(raw_message))
         elif role == "assistant" and content_type == "thoughts":
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
             reasoning_title = metadata.get("reasoning_title")
             if isinstance(reasoning_title, str) and reasoning_title.strip():
-                kind = "reasoning"
                 label = reasoning_title.strip()
+            if text or label:
+                kind = "reasoning"
         elif (
             role == "assistant"
             and recipient in {"", "all"}
@@ -391,7 +393,11 @@ def _canonical_intermediate_events(
         # such as "Первый". Tool calls can be shown immediately, but thinking text
         # is emitted only after ChatGPT advances to the next canonical node.
         revision_sensitive = kind in {"assistant_progress", "reasoning"} and bool(text)
-        if revision_sensitive and node_id == current_node:
+        if (
+            revision_sensitive
+            and node_id == current_node
+            and not _stream_message_completed(raw_message)
+        ):
             continue
 
         emitted_message_ids.add(message_id)
@@ -708,10 +714,15 @@ class CanonicalTopicStreamNormalizer:
             return
 
         if role == "assistant" and recipient in {"", "all"} and content_type == "thoughts":
+            text = _sanitize_intermediate_text(extract_message_text(message))
             reasoning_title = metadata.get("reasoning_title")
+            label = (
+                reasoning_title.strip()
+                if isinstance(reasoning_title, str) and reasoning_title.strip()
+                else None
+            )
             if (
-                isinstance(reasoning_title, str)
-                and reasoning_title.strip()
+                (text or label)
                 and _stream_message_completed(message)
                 and message_id not in self.emitted_message_ids
             ):
@@ -721,8 +732,8 @@ class CanonicalTopicStreamNormalizer:
                         "type": "canonical_intermediate_message",
                         "message_id": message_id,
                         "message_kind": "reasoning",
-                        "text": _sanitize_intermediate_text(extract_message_text(message)),
-                        "label": reasoning_title.strip(),
+                        "text": text,
+                        "label": label,
                         "tool_name": None,
                     }
                 )
@@ -864,6 +875,37 @@ class CanonicalTopicStreamNormalizer:
             content["parts"] = parts
         elif path == "/message/content" and isinstance(value, dict):
             message["content"] = dict(value)
+        elif path == "/message/content/thoughts" and isinstance(value, list):
+            content = message.get("content")
+            if not isinstance(content, dict):
+                content = {"content_type": "thoughts"}
+                message["content"] = content
+            content["thoughts"] = [dict(item) if isinstance(item, dict) else item for item in value]
+        elif (
+            isinstance(path, str)
+            and isinstance(value, str)
+            and (match := re.fullmatch(r"/message/content/thoughts/(\d+)/summary", path))
+        ):
+            content = message.get("content")
+            if not isinstance(content, dict):
+                content = {"content_type": "thoughts"}
+                message["content"] = content
+            thoughts = content.get("thoughts")
+            if not isinstance(thoughts, list):
+                thoughts = []
+            thoughts = list(thoughts)
+            index = int(match.group(1))
+            while len(thoughts) <= index:
+                thoughts.append({})
+            entry = thoughts[index]
+            if not isinstance(entry, dict):
+                entry = {}
+            else:
+                entry = dict(entry)
+            previous = entry.get("summary")
+            entry["summary"] = (previous if isinstance(previous, str) else "") + value
+            thoughts[index] = entry
+            content["thoughts"] = thoughts
         elif path == "/message/status":
             message["status"] = value
         elif path == "/message/end_turn":

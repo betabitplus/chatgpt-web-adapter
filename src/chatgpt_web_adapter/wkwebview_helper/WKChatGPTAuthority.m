@@ -882,7 +882,13 @@ int main(int argc, const char *argv[]) {
                 }
                 BOOL responseOK = (delegate.streamResponseObserved && delegate.streamStatus >= 200 && delegate.streamStatus < 300)
                     || (delegate.submitResponseObserved && delegate.submitStatus >= 200 && delegate.submitStatus < 300);
-                if (responseOK && delegate.streamClientMessageId.length > 0 && identityRecoveryDeadline == nil) {
+                if (
+                    identityRecoveryDeadline == nil
+                    && (
+                        minimalConversationId.length > 0
+                        || (responseOK && delegate.streamClientMessageId.length > 0)
+                    )
+                ) {
                     identityRecoveryDeadline = [NSDate dateWithTimeIntervalSinceNow:8.0];
                 }
                 BOOL terminalCompletionFence = responseOK
@@ -904,8 +910,10 @@ int main(int argc, const char *argv[]) {
                 && delegate.streamConversationId.length > 0;
             BOOL identityRecoveryRequired = !terminalCompletionFence
                 && !resumeFenceObserved
-                && responseOK
-                && delegate.streamClientMessageId.length > 0;
+                && (
+                    minimalConversationId.length > 0
+                    || (responseOK && delegate.streamClientMessageId.length > 0)
+                );
             if (identityRecoveryRequired) {
                 BOOL recoveryHandoffWritten = NO;
                 if (resumeHandoffFD >= 0) {
@@ -917,8 +925,10 @@ int main(int argc, const char *argv[]) {
                 PrintResult(@{
                     @"ok":@YES,
                     @"identity_recovery_required":@YES,
-                    @"client_message_id":delegate.streamClientMessageId,
-                    @"conversation_id":delegate.streamConversationId ?: @"",
+                    @"client_message_id":delegate.streamClientMessageId ?: @"",
+                    @"conversation_id":delegate.streamConversationId.length > 0
+                        ? delegate.streamConversationId
+                        : (minimalConversationId ?: @""),
                     @"response_status":@(delegate.streamResponseObserved ? delegate.streamStatus : delegate.submitStatus),
                     @"submit_response_status":@(delegate.submitStatus),
                     @"stream_response_status":@(delegate.streamStatus),

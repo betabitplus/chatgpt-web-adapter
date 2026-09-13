@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -16,6 +17,7 @@ from chatgpt_web_adapter.browser_authority_backend import (
     WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
     normalize_browser_authority_backend,
 )
+from chatgpt_web_adapter.client import ChatGPTWebClient
 from chatgpt_web_adapter.exceptions import RequestError
 from chatgpt_web_adapter.product_capabilities import (
     IMAGES,
@@ -596,6 +598,100 @@ def test_wkwebview_canonical_gate_state_is_shared_between_provider_instances(
     elapsed = time.monotonic() - started
 
     assert elapsed >= 0.02
+
+
+def test_wkwebview_active_stream_registry_lifecycle_preserves_baseline(
+    tmp_path,
+) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
+    provider._canonical_state.set_current_node("conversation-1", "node-before")
+
+    provider.begin_active_turn("conversation-1")
+    pending = provider.active_stream_info("conversation-1")
+
+    assert pending is not None
+    assert pending["state"] == "pending"
+    assert pending["topic_id"] is None
+    assert pending["baseline_current_node"] == "node-before"
+
+    provider._register_active_stream(
+        "conversation-1",
+        "conversation-turn-1",
+        turn_exchange_id="turn-1",
+    )
+    streaming = provider.active_stream_info("conversation-1")
+
+    assert streaming is not None
+    assert streaming["state"] == "streaming"
+    assert streaming["topic_id"] == "conversation-turn-1"
+    assert streaming["turn_exchange_id"] == "turn-1"
+    assert streaming["baseline_current_node"] == "node-before"
+
+    provider.end_active_turn("conversation-1")
+    assert provider.active_stream_info("conversation-1") is None
+    assert not provider._active_stream_path("conversation-1").exists()
+
+
+def test_wkwebview_active_stream_registry_prunes_dead_pid(
+    monkeypatch, tmp_path
+) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
+    provider._register_active_stream("conversation-1", None)
+    path = provider._active_stream_path("conversation-1")
+    assert path.exists()
+
+    monkeypatch.setattr(provider, "_process_is_alive", lambda _pid: False)
+
+    assert provider.active_stream_info("conversation-1") is None
+    assert not path.exists()
+
+
+def test_wkwebview_ws_transport_uses_short_close_timeout(monkeypatch) -> None:
+    client = object.__new__(ChatGPTWebClient)
+    connect_kwargs: dict[str, Any] = {}
+    sent: list[str] = []
+
+    class FakeWebSocket:
+        async def send(self, raw: str) -> None:
+            sent.append(raw)
+
+    class FakeConnect:
+        async def __aenter__(self):
+            return FakeWebSocket()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_connect(*args, **kwargs):
+        connect_kwargs.update(kwargs)
+        return FakeConnect()
+
+    import websockets
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    monkeypatch.setattr(
+        client,
+        "_probe_celsius_ws_user",
+        lambda: {"websocket_url": "wss://example.invalid/celsius"},
+    )
+    monkeypatch.setattr(client, "_build_headers", lambda extra=None: {})
+    monkeypatch.setattr(
+        client, "_capture_ws_url_diagnostics", lambda websocket_url, state: None
+    )
+
+    asyncio.run(
+        client._stream_handoff_via_ws_topic_async(
+            "conversation-turn-1",
+            state={},
+            on_event=None,
+            on_token=None,
+            cancel_check=lambda: True,
+            stop_on_done=False,
+        )
+    )
+
+    assert len(sent) == 1
+    assert connect_kwargs["close_timeout"] == 0.25
 
 
 def test_wkwebview_lightweight_path_is_default_with_explicit_legacy_escape_hatch(
@@ -1853,6 +1949,43 @@ def test_wkwebview_write_commit_retry_uses_bounded_backoff(monkeypatch) -> None:
 
     assert result == final_payload
     assert calls == [1.0]
+
+
+def test_wkwebview_known_continuation_recovers_without_client_message_id(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    final_payload = _final_canonical_for_prompt("queued", assistant_text="done")
+    provider._lightweight_transport = SimpleNamespace()
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_via_coordinated_curl",
+        lambda *args, **kwargs: (final_payload, None),
+    )
+
+    result = provider._turn_orchestrator.recover_phase_one_identity(
+        {
+            "identity_recovery_required": True,
+            "client_message_id": "",
+            "conversation_id": "conversation-1",
+        },
+        prepared=SimpleNamespace(
+            conversation_id="conversation-1",
+            baseline_current_node="node-before",
+        ),
+        text="queued",
+        total_timeout=30,
+        started=time.monotonic(),
+    )
+
+    assert result["conversation_id"] == "conversation-1"
+    assert result["write_commit_proof"] == "CANONICAL_PROMPT_RECOVERY"
+    assert result["_cwa_identity_recovered"] is True
+    assert result["_cwa_identity_recovery_kind"] == "prompt"
+    assert result["stream_terminal_observed"] is True
+    assert (
+        provider._canonical_state.take_final_payload("conversation-1") == final_payload
+    )
 
 
 def test_wkwebview_identity_recovery_retry_uses_bounded_backoff(

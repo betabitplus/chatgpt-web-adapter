@@ -15,6 +15,7 @@ from chatgpt_web_adapter.browser_native_client import (
     _canonical_intermediate_events,
     _canonical_stream_answer_seed,
     _canonical_stream_identity,
+    _make_passive_terminal_stop_check,
     _wait_for_new_final_assistant,
     await_browser_native_final,
     send_browser_native,
@@ -23,6 +24,36 @@ from chatgpt_web_adapter.browser_native_client import (
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeTurnResult
 from chatgpt_web_adapter.exceptions import ConversationTimeoutError, RequestError
 from chatgpt_web_adapter.types import ChatConversation
+
+
+def test_passive_terminal_stop_check_waits_then_stops_and_cancel_is_immediate() -> None:
+    state = {"completed": False, "cancelled": False, "settled": False}
+    times = iter([10.0, 11.0, 11.5])
+    should_stop = _make_passive_terminal_stop_check(
+        lambda: state["completed"],
+        cancelled=lambda: state["cancelled"],
+        settled=lambda: state["settled"],
+        settle_seconds=1.5,
+        monotonic=lambda: next(times),
+    )
+
+    assert should_stop() is False
+    state["completed"] = True
+    assert should_stop() is False
+    assert should_stop() is False
+    assert should_stop() is True
+
+    state["completed"] = False
+    assert should_stop() is False
+    state["completed"] = True
+    state["settled"] = True
+    assert should_stop() is True
+
+    state["completed"] = False
+    state["settled"] = False
+    assert should_stop() is False
+    state["cancelled"] = True
+    assert should_stop() is True
 
 
 class FakeProvider:
@@ -162,9 +193,14 @@ def test_client_returns_canonical_readback_not_native_body() -> None:
     assert provider.normal_calls == [("hello", "existing-conversation", 2)]
 
 
-def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn() -> (
-    None
-):
+def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._PASSIVE_TERMINAL_SETTLE_SECONDS",
+        0.0,
+    )
+
     class Provider(FakeProvider):
         revision_safe_streaming_supported = True
 

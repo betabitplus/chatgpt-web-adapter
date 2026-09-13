@@ -455,6 +455,10 @@ def test_runtime_follow_snapshot_reuses_one_canonical_payload(monkeypatch) -> No
 
 
 def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._PASSIVE_TERMINAL_SETTLE_SECONDS",
+        0.0,
+    )
     provider = _Provider()
     runtime = ChatGPTProductRuntime(_Client(), provider=provider)
     provider_calls = []
@@ -481,7 +485,9 @@ def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -
                             "status": "finished_successfully",
                             "content": {
                                 "content_type": "code",
-                                "parts": ['{"path":"search","args":{"query":"needle"}}'],
+                                "parts": [
+                                    '{"path":"search","args":{"query":"needle"}}'
+                                ],
                             },
                             "metadata": {"turn_exchange_id": "turn-1"},
                         }
@@ -537,9 +543,7 @@ def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -
         on_event=events.append,
     )
 
-    assert provider_calls == [
-        ("conversation-1", "conversation-turn-turn-1", 90)
-    ]
+    assert provider_calls == [("conversation-1", "conversation-turn-turn-1", 90)]
     assert len(events) == 2
     assert events[0]["message_kind"] == "tool_call"
     assert events[0]["message_id"] == "tool-1"
@@ -555,6 +559,264 @@ def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -
     assert result["stream_topic_id"] == "conversation-turn-turn-1"
 
 
+def test_runtime_pending_topic_relays_local_canonical_cache_without_network(
+    monkeypatch,
+) -> None:
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    baseline = {
+        "id": "assistant-old",
+        "parent": None,
+        "children": ["user-new"],
+        "message": {
+            "id": "assistant-old",
+            "author": {"role": "assistant"},
+            "recipient": "all",
+            "status": "finished_successfully",
+            "end_turn": True,
+            "content": {"content_type": "text", "parts": ["old"]},
+            "metadata": {"finish_details": {"type": "stop"}},
+        },
+    }
+    user = {
+        "id": "user-new",
+        "parent": "assistant-old",
+        "children": ["tool-1"],
+        "message": {
+            "id": "user-new",
+            "author": {"role": "user"},
+            "recipient": "all",
+            "status": "finished_successfully",
+            "content": {"content_type": "text", "parts": ["go"]},
+            "metadata": {},
+        },
+    }
+    tool = {
+        "id": "tool-1",
+        "parent": "user-new",
+        "children": ["assistant-final"],
+        "message": {
+            "id": "tool-1",
+            "author": {"role": "assistant"},
+            "recipient": "api_tool.call_tool",
+            "status": "finished_successfully",
+            "content": {
+                "content_type": "code",
+                "parts": ['{"path":"search","args":{"query":"needle"}}'],
+            },
+            "metadata": {"turn_exchange_id": "turn-local"},
+        },
+    }
+    final = {
+        "id": "assistant-final",
+        "parent": "tool-1",
+        "children": [],
+        "message": {
+            "id": "assistant-final",
+            "author": {"role": "assistant"},
+            "recipient": "all",
+            "status": "finished_successfully",
+            "end_turn": True,
+            "content": {"content_type": "text", "parts": ["done"]},
+            "metadata": {
+                "turn_exchange_id": "turn-local",
+                "finish_details": {"type": "stop"},
+            },
+        },
+    }
+    intermediate_payload = {
+        "current_node": "tool-1",
+        "mapping": {
+            "assistant-old": baseline,
+            "user-new": user,
+            "tool-1": tool,
+        },
+    }
+    final_payload = {
+        "current_node": "assistant-final",
+        "mapping": {
+            "assistant-old": baseline,
+            "user-new": user,
+            "tool-1": tool,
+            "assistant-final": final,
+        },
+    }
+    cached_payloads = [intermediate_payload, final_payload]
+
+    provider.active_stream_info = lambda _conversation_id: {
+        "topic_id": None,
+        "state": "pending",
+        "baseline_current_node": "assistant-old",
+        "pid": 123,
+    }
+    provider.canonical_payload_is_final = lambda payload: (
+        payload.get("current_node") == "assistant-final"
+    )
+    provider.follow_stream_topic = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("pending local cache recovery must not require WS follow")
+    )
+
+    def read_cached(_conversation_id):
+        payload = (
+            cached_payloads.pop(0) if len(cached_payloads) > 1 else cached_payloads[0]
+        )
+        return payload, 0.0
+
+    monkeypatch.setattr(
+        runtime.canonical,
+        "read_cached_conversation_payload",
+        read_cached,
+        raising=False,
+    )
+    events = []
+
+    result = runtime.conversation_follow_stream(
+        "conversation-1",
+        topic_id="cwa-local-pending:conversation-1:123",
+        timeout=2.0,
+        on_event=events.append,
+    )
+
+    assert [event["type"] for event in events] == [
+        "canonical_intermediate_message",
+        "assistant_text_delta",
+    ]
+    assert events[0]["message_id"] == "tool-1"
+    assert events[1]["delta"] == "done"
+    assert result["stream_completed"] is True
+    assert result["stream_recovered_from_local_cache"] is True
+    assert result["status"].status == "completed"
+
+
+def test_runtime_topic_follow_uses_shared_final_without_canonical_read(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._PASSIVE_TERMINAL_SETTLE_SECONDS",
+        0.0,
+    )
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    topic_id = "conversation-turn-turn-shared"
+    final_payload = {
+        "current_node": "assistant-final",
+        "mapping": {
+            "assistant-final": {
+                "id": "assistant-final",
+                "parent": "user-1",
+                "children": [],
+                "message": {
+                    "id": "assistant-final",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "content": {"content_type": "text", "parts": ["done"]},
+                    "metadata": {
+                        "stream_topic_id": topic_id,
+                        "turn_exchange_id": "turn-shared",
+                        "finish_details": {"type": "stop"},
+                    },
+                },
+            }
+        },
+    }
+
+    def follow_stream_topic(*, on_event, should_stop, **_kwargs):
+        on_event(
+            {
+                "type": "raw_ws_event",
+                "parsed": {
+                    "v": {
+                        "message": final_payload["mapping"]["assistant-final"][
+                            "message"
+                        ]
+                    }
+                },
+            }
+        )
+        assert should_stop() is True
+
+    provider.follow_stream_topic = follow_stream_topic
+    provider.wait_for_shared_final_payload = lambda *args, **kwargs: final_payload
+    monkeypatch.setattr(
+        runtime,
+        "conversation_follow_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("canonical snapshot must not run when shared final exists")
+        ),
+    )
+
+    result = runtime.conversation_follow_stream(
+        "conversation-1",
+        topic_id=topic_id,
+        on_event=lambda _event: None,
+    )
+
+    assert result["stream_completed"] is True
+    assert result["shared_final_cache"] is True
+    assert result["status"].status == "completed"
+
+
+def test_runtime_topic_follow_recovers_local_stream_failure_from_shared_final(
+    monkeypatch,
+) -> None:
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    actual_topic = "conversation-turn-turn-recovered"
+    final_payload = {
+        "current_node": "assistant-final",
+        "mapping": {
+            "assistant-final": {
+                "id": "assistant-final",
+                "parent": "user-1",
+                "children": [],
+                "message": {
+                    "id": "assistant-final",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "content": {"content_type": "text", "parts": ["done"]},
+                    "metadata": {
+                        "stream_topic_id": actual_topic,
+                        "turn_exchange_id": "turn-recovered",
+                        "finish_details": {"type": "stop"},
+                    },
+                },
+            }
+        },
+    }
+
+    def fail_follow(**_kwargs):
+        raise RuntimeError("forced stream failure")
+
+    provider.follow_stream_topic = fail_follow
+    provider.active_stream_info = lambda _conversation_id: {
+        "topic_id": actual_topic,
+        "state": "streaming",
+    }
+    provider.wait_for_shared_final_payload = lambda *args, **kwargs: final_payload
+    monkeypatch.setattr(
+        runtime,
+        "conversation_follow_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("canonical snapshot must not run for local recovery")
+        ),
+    )
+
+    result = runtime.conversation_follow_stream(
+        "conversation-1",
+        topic_id="cwa-local-pending:conversation-1:123",
+    )
+
+    assert result["stream_completed"] is True
+    assert result["stream_topic_id"] == actual_topic
+    assert result["shared_final_cache"] is True
+    assert result["stream_recovered_from_local_final"] is True
+    assert result["status"].status == "completed"
+
+
 def test_runtime_topic_follow_cancelled_skips_final_canonical_read(monkeypatch) -> None:
     provider = _Provider()
     runtime = ChatGPTProductRuntime(_Client(), provider=provider)
@@ -566,6 +828,7 @@ def test_runtime_topic_follow_cancelled_skips_final_canonical_read(monkeypatch) 
         "conversation_follow_snapshot",
         lambda *args, **kwargs: canonical_reads.append((args, kwargs)),
     )
+
     def stop():
         return True
 

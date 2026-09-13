@@ -60,9 +60,52 @@ _CANONICAL_LIVE_POLL_INTERVAL_SECONDS = 15.0
 _CANONICAL_RATE_LIMIT_BACKOFF_SECONDS = 15.0
 _PASSIVE_FINAL_RECONCILE_RETRY_SECONDS = 5.0
 _PASSIVE_FINAL_RECONCILE_SETTLE_SECONDS = 4.0
+_PASSIVE_TERMINAL_SETTLE_SECONDS = 1.5
 _PASSIVE_STREAM_ENDED_RECONCILE_SECONDS = 5.0
 _PREWRITE_CANONICAL_COMPLETION_MAX_AGE_MS = 5_000
 _CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS = 6_000
+
+
+def _make_passive_terminal_stop_check(
+    completed: Callable[[], bool],
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    settled: Callable[[], bool] | None = None,
+    settle_seconds: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> Callable[[], bool]:
+    terminal_started: float | None = None
+
+    def should_stop() -> bool:
+        nonlocal terminal_started
+        if cancelled is not None:
+            try:
+                if bool(cancelled()):
+                    return True
+            except Exception:
+                pass
+        if not completed():
+            terminal_started = None
+            return False
+        if settled is not None:
+            try:
+                if bool(settled()):
+                    return True
+            except Exception:
+                pass
+        settle = (
+            _PASSIVE_TERMINAL_SETTLE_SECONDS
+            if settle_seconds is None
+            else max(0.0, float(settle_seconds))
+        )
+        if terminal_started is None:
+            terminal_started = monotonic()
+            return settle <= 0.0
+        return monotonic() - terminal_started >= settle
+
+    return should_stop
+
+
 _SENSITIVE_KEY_RE = re.compile(
     r"(?:authorization|cookie|set[-_]?cookie|access[-_]?token|refresh[-_]?token|"
     r"id[-_]?token|api[-_]?key|password|passwd|secret|session[-_]?token|csrf)",
@@ -1494,8 +1537,10 @@ def submit_browser_native(
                 {**normalized, "submission_id": submission_id},
             )
 
-    def stream_should_stop() -> bool:
-        return topic_normalizer.turn_completed
+    stream_should_stop = _make_passive_terminal_stop_check(
+        lambda: topic_normalizer.turn_completed,
+        settled=lambda: topic_normalizer.segment_kind is None,
+    )
 
     def handle_write_identity(event: dict[str, Any]) -> None:
         if (
@@ -1533,6 +1578,7 @@ def submit_browser_native(
         {"model_slug": normalized_model_slug} if normalized_model_slug else {}
     )
     provider_kwargs = {**attachment_kwargs, **model_kwargs}
+
     if recovery_authorized:
         canonical_completed_at_ms = recovery_completed_at_ms or int(time.time() * 1000)
         if streaming_requested and callable(recovery_stream_send):

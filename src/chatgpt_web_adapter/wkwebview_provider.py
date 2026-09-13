@@ -86,6 +86,7 @@ class WKWebViewTurnProvider:
         self.build_timeout = float(build_timeout)
         self._canonical_read_lock_path = self.state_dir / "wk-canonical-read.lock"
         self._canonical_cache_dir = self.state_dir / "canonical-cache"
+        self._active_stream_dir = self.state_dir / "active-streams"
         self._helper_runtime = WKWebViewHelperRuntime(
             self.state_dir, build_timeout=self.build_timeout
         )
@@ -312,6 +313,196 @@ class WKWebViewTurnProvider:
         ref = ConversationRef(conversation_id)
         return self._canonical_cache_dir / f"{ref.conversation_id}.json"
 
+    def _active_stream_path(self, conversation_id: str) -> Path:
+        ref = ConversationRef(conversation_id)
+        return self._active_stream_dir / f"{ref.conversation_id}.json"
+
+    @staticmethod
+    def _process_is_alive(pid: int) -> bool:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _register_active_stream(
+        self,
+        conversation_id: str,
+        topic_id: str | None,
+        *,
+        turn_exchange_id: str | None = None,
+        baseline_current_node: str | None = None,
+    ) -> None:
+        normalized_topic = topic_id.strip() if isinstance(topic_id, str) else ""
+        path = self._active_stream_path(conversation_id)
+        if baseline_current_node is None:
+            existing = self.active_stream_info(conversation_id, prune_stale=False)
+            if isinstance(existing, dict) and existing.get("pid") == os.getpid():
+                existing_baseline = existing.get("baseline_current_node")
+                if isinstance(existing_baseline, str) and existing_baseline.strip():
+                    baseline_current_node = existing_baseline.strip()
+        payload = {
+            "saved_at": time.time(),
+            "conversation_id": ConversationRef(conversation_id).conversation_id,
+            "topic_id": normalized_topic or None,
+            "state": "streaming" if normalized_topic else "pending",
+            "turn_exchange_id": (
+                turn_exchange_id.strip()
+                if isinstance(turn_exchange_id, str) and turn_exchange_id.strip()
+                else None
+            ),
+            "baseline_current_node": (
+                baseline_current_node.strip()
+                if isinstance(baseline_current_node, str)
+                and baseline_current_node.strip()
+                else None
+            ),
+            "pid": os.getpid(),
+        }
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, encoded)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, path)
+        except (OSError, TypeError, ValueError):
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _clear_active_stream(
+        self, conversation_id: str, *, topic_id: str | None = None
+    ) -> None:
+        path = self._active_stream_path(conversation_id)
+        if topic_id is not None:
+            active = self.active_stream_info(conversation_id, prune_stale=False)
+            if active is not None and active.get("topic_id") != topic_id:
+                return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def active_stream_info(
+        self, conversation_id: str, *, prune_stale: bool = True
+    ) -> dict[str, Any] | None:
+        path = self._active_stream_path(conversation_id)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        topic_id = payload.get("topic_id")
+        pid = payload.get("pid")
+        saved_at = payload.get("saved_at")
+        valid = (
+            isinstance(saved_at, (int, float))
+            and not isinstance(saved_at, bool)
+            and max(0.0, time.time() - float(saved_at)) <= 6 * 60 * 60
+            and self._process_is_alive(pid)
+        )
+        if not valid:
+            if prune_stale:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return None
+        return {
+            "conversation_id": ConversationRef(conversation_id).conversation_id,
+            "topic_id": (
+                topic_id.strip()
+                if isinstance(topic_id, str) and topic_id.strip()
+                else None
+            ),
+            "state": (
+                payload.get("state")
+                if payload.get("state") in {"pending", "streaming"}
+                else (
+                    "streaming"
+                    if isinstance(topic_id, str) and topic_id.strip()
+                    else "pending"
+                )
+            ),
+            "turn_exchange_id": (
+                payload.get("turn_exchange_id").strip()
+                if isinstance(payload.get("turn_exchange_id"), str)
+                and payload.get("turn_exchange_id").strip()
+                else None
+            ),
+            "baseline_current_node": (
+                payload.get("baseline_current_node").strip()
+                if isinstance(payload.get("baseline_current_node"), str)
+                and payload.get("baseline_current_node").strip()
+                else None
+            ),
+            "pid": pid,
+            "saved_at": float(saved_at),
+        }
+
+    def begin_active_turn(self, conversation_id: str) -> None:
+        baseline_current_node = self._cached_current_node(conversation_id)
+        if baseline_current_node is None:
+            cached = self.read_cached_conversation_payload(conversation_id)
+            if isinstance(cached, tuple) and isinstance(cached[0], dict):
+                value = cached[0].get("current_node")
+                if isinstance(value, str) and value.strip():
+                    baseline_current_node = value.strip()
+        self._register_active_stream(
+            conversation_id,
+            None,
+            baseline_current_node=baseline_current_node,
+        )
+
+    def end_active_turn(self, conversation_id: str) -> None:
+        self._clear_active_stream(conversation_id)
+
+    def pending_stream_topic_id(
+        self, conversation_id: str, active_stream: dict[str, Any]
+    ) -> str | None:
+        if active_stream.get("state") != "pending":
+            return None
+        pid = active_stream.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        ref = ConversationRef(conversation_id)
+        return f"cwa-local-pending:{ref.conversation_id}:{pid}"
+
+    def wait_for_active_stream_info(
+        self,
+        conversation_id: str,
+        *,
+        timeout: float,
+        should_stop: Any = None,
+    ) -> dict[str, Any] | None:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            if should_stop is not None:
+                try:
+                    if bool(should_stop()):
+                        return None
+                except Exception:
+                    pass
+            active = self.active_stream_info(conversation_id)
+            if active is None:
+                return None
+            if active.get("topic_id"):
+                return active
+            if time.monotonic() >= deadline:
+                return active
+            time.sleep(0.05)
+
     def _persist_canonical_payload(
         self,
         conversation_id: str,
@@ -497,16 +688,45 @@ class WKWebViewTurnProvider:
                 "WKWEBVIEW_CURL_WS_SOURCE_CLIENT_MISSING",
                 request_stage="wkwebview_curl_ws_second_leg",
             )
-        return transport.resume_turn(
-            conversation_id=conversation_id,
-            resume_value=resume_value,
-            timeout=timeout,
-            relay_text_event=relay_text_event,
-            on_transport_event=on_transport_event,
-            stream_should_stop=stream_should_stop,
-            text=text,
-            baseline_current_node=baseline_current_node,
-        )
+        active_topic_id: str | None = None
+        active_turn_exchange_id: str | None = None
+        try:
+            topic_id, state = transport.source_client.wk_transport_resume_state(
+                resume_value,
+                conversation_id=conversation_id,
+            )
+        except (AttributeError, RequestError):
+            pass
+        else:
+            if isinstance(topic_id, str) and topic_id.strip():
+                active_topic_id = topic_id.strip()
+                turn_value = (
+                    state.get("turn_exchange_id") if isinstance(state, dict) else None
+                )
+                if isinstance(turn_value, str) and turn_value.strip():
+                    active_turn_exchange_id = turn_value.strip()
+                self._register_active_stream(
+                    conversation_id,
+                    active_topic_id,
+                    turn_exchange_id=active_turn_exchange_id,
+                )
+        try:
+            return transport.resume_turn(
+                conversation_id=conversation_id,
+                resume_value=resume_value,
+                timeout=timeout,
+                relay_text_event=relay_text_event,
+                on_transport_event=on_transport_event,
+                stream_should_stop=stream_should_stop,
+                text=text,
+                baseline_current_node=baseline_current_node,
+            )
+        finally:
+            if active_topic_id is not None:
+                self._clear_active_stream(
+                    conversation_id,
+                    topic_id=active_topic_id,
+                )
 
     @staticmethod
     def _decode_helper_json(
@@ -551,6 +771,67 @@ class WKWebViewTurnProvider:
         self, conversation_id: str, payload: dict[str, Any]
     ) -> None:
         self._canonical_state.cache_final_payload(conversation_id, payload)
+        self._persist_canonical_payload(
+            conversation_id,
+            payload,
+            min_interval_seconds=0.0,
+        )
+
+    def wait_for_shared_final_payload(
+        self,
+        conversation_id: str,
+        *,
+        topic_id: str,
+        timeout: float = 15.0,
+        should_stop: Any = None,
+    ) -> dict[str, Any] | None:
+        normalized_topic = topic_id.strip() if isinstance(topic_id, str) else ""
+        if not normalized_topic:
+            return None
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            if should_stop is not None:
+                try:
+                    if bool(should_stop()):
+                        return None
+                except Exception:
+                    pass
+            cached = self.read_cached_conversation_payload(conversation_id)
+            if isinstance(cached, tuple) and isinstance(cached[0], dict):
+                payload = cached[0]
+                if self._canonical_state.payload_is_final(payload):
+                    from .browser_native_client import _canonical_stream_identity
+
+                    cached_topic, _turn_exchange_id = _canonical_stream_identity(
+                        payload
+                    )
+                    if cached_topic == normalized_topic:
+                        return payload
+
+            active = self.active_stream_info(conversation_id)
+            if active is None or active.get("topic_id") != normalized_topic:
+                return None
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
+
+    def publish_canonical_observation(
+        self, conversation_id: str, payload: dict[str, Any]
+    ) -> None:
+        if not isinstance(payload, dict):
+            return
+        ref = ConversationRef(conversation_id)
+        self._canonical_state.set_current_node(
+            ref.conversation_id, payload.get("current_node")
+        )
+        self._persist_canonical_payload(
+            ref.conversation_id,
+            payload,
+            min_interval_seconds=0.0,
+        )
+
+    def canonical_payload_is_final(self, payload: dict[str, Any]) -> bool:
+        return self._canonical_state.payload_is_final(payload)
 
     def _wait_for_stopped_final_payload(
         self,
@@ -978,14 +1259,38 @@ class WKWebViewTurnProvider:
                 "WKWEBVIEW_STREAM_FOLLOW_LIGHTWEIGHT_UNAVAILABLE",
                 request_stage="wkwebview_stream_follow",
             )
-        return self._lightweight_transport.follow_topic(
+        actual_topic_id = topic_id
+        if topic_id.startswith("cwa-local-pending:"):
+            active = self.wait_for_active_stream_info(
+                conversation_id,
+                timeout=timeout,
+                should_stop=should_stop,
+            )
+            if active is None:
+                return {
+                    "completed": False,
+                    "cancelled": True,
+                    "topic_id": topic_id,
+                }
+            candidate = active.get("topic_id")
+            if not isinstance(candidate, str) or not candidate.strip():
+                return {
+                    "completed": False,
+                    "cancelled": False,
+                    "topic_id": topic_id,
+                }
+            actual_topic_id = candidate.strip()
+        result = self._lightweight_transport.follow_topic(
             conversation_id=conversation_id,
-            topic_id=topic_id,
+            topic_id=actual_topic_id,
             timeout=timeout,
             on_event=on_event,
             on_token=None,
             should_stop=should_stop,
         )
+        if isinstance(result, dict):
+            return {**result, "topic_id": actual_topic_id}
+        return {"completed": False, "topic_id": actual_topic_id}
 
     def _resume_via_direct_wk(
         self,
@@ -1189,17 +1494,28 @@ class WKWebViewTurnProvider:
         on_transport_event: Any = None,
         stream_should_stop: Any = None,
     ) -> BrowserNativeTurnResult:
-        return self._send_text_impl(
-            text,
-            conversation=conversation,
-            timeout=timeout,
-            attachment_paths=attachment_paths,
-            model_slug=model_slug,
-            on_text_event=on_text_event,
-            on_write_identity=on_write_identity,
-            on_transport_event=on_transport_event,
-            stream_should_stop=stream_should_stop,
+        active_conversation_id = (
+            ConversationRef.from_any(conversation).conversation_id
+            if conversation is not None
+            else None
         )
+        if active_conversation_id is not None:
+            self.begin_active_turn(active_conversation_id)
+        try:
+            return self._send_text_impl(
+                text,
+                conversation=conversation,
+                timeout=timeout,
+                attachment_paths=attachment_paths,
+                model_slug=model_slug,
+                on_text_event=on_text_event,
+                on_write_identity=on_write_identity,
+                on_transport_event=on_transport_event,
+                stream_should_stop=stream_should_stop,
+            )
+        finally:
+            if active_conversation_id is not None:
+                self.end_active_turn(active_conversation_id)
 
     def send_text_with_stale_ui_recovery(
         self,

@@ -1,3 +1,4 @@
+# fmt: off
 from __future__ import annotations
 
 import asyncio
@@ -871,6 +872,7 @@ class ChatGPTWebClient:
             websocket_url,
             additional_headers=headers,
             open_timeout=10,
+            close_timeout=0.25,
             ping_interval=None,
             ping_timeout=None,
             max_size=None,

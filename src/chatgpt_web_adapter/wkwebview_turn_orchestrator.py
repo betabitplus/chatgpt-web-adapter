@@ -117,13 +117,17 @@ class WKTurnOrchestrator:
         if payload.get("identity_recovery_required") is not True:
             return payload
 
-        client_message_id = payload.get("client_message_id")
-        if not isinstance(client_message_id, str) or not client_message_id.strip():
+        raw_client_message_id = payload.get("client_message_id")
+        client_message_id = (
+            raw_client_message_id.strip()
+            if isinstance(raw_client_message_id, str) and raw_client_message_id.strip()
+            else None
+        )
+        if client_message_id is None and prepared.conversation_id is None:
             raise RequestError(
                 "WKWEBVIEW_IDENTITY_RECOVERY_MESSAGE_ID_MISSING",
                 request_stage="wkwebview_authority_turn",
             )
-        client_message_id = client_message_id.strip()
         provider = self.provider
         transport = provider._lightweight_transport
         if transport is None:
@@ -167,27 +171,58 @@ class WKTurnOrchestrator:
                 if not isinstance(canonical, dict):
                     wait_before_retry()
                     continue
-                if self._payload_contains_client_message(
-                    canonical,
-                    client_message_id=client_message_id,
-                    text=text,
-                ):
+                publish_observation = getattr(
+                    provider, "publish_canonical_observation", None
+                )
+                if callable(publish_observation):
+                    publish_observation(candidate_id, canonical)
+                current_node = canonical.get("current_node")
+                if client_message_id is not None:
+                    write_matches = self._payload_contains_client_message(
+                        canonical,
+                        client_message_id=client_message_id,
+                        text=text,
+                    )
+                    recovery_proof = "CANONICAL_MESSAGE_ID_RECOVERY"
+                else:
+                    node_changed = prepared.baseline_current_node is None or (
+                        isinstance(current_node, str)
+                        and bool(current_node)
+                        and current_node != prepared.baseline_current_node
+                    )
+                    write_matches = (
+                        node_changed
+                        and provider._current_branch_contains_user_text(canonical, text)
+                    )
+                    recovery_proof = "CANONICAL_PROMPT_RECOVERY"
+                if write_matches:
                     matched_payload = canonical
                     if provider._canonical_state.payload_is_final(canonical):
                         provider._cache_final_payload(candidate_id, canonical)
                         payload.update(
                             {
                                 "conversation_id": candidate_id,
+                                "response_status": (
+                                    payload.get("response_status")
+                                    if isinstance(payload.get("response_status"), int)
+                                    and 200 <= payload.get("response_status") < 300
+                                    else 200
+                                ),
                                 "write_commit_proven": True,
-                                "write_commit_proof": "CANONICAL_MESSAGE_ID_RECOVERY",
+                                "write_commit_proof": recovery_proof,
                                 "canonical_committed": True,
                                 "canonical_final_completed": True,
-                                "committed_current_node": canonical.get("current_node")
-                                if isinstance(canonical.get("current_node"), str)
+                                "committed_current_node": current_node
+                                if isinstance(current_node, str)
                                 else "",
                                 "stream_terminal_observed": True,
                                 "_cwa_identity_recovered": True,
                                 "_cwa_identity_recovery_transport": "curl_cffi",
+                                "_cwa_identity_recovery_kind": (
+                                    "message_id"
+                                    if client_message_id is not None
+                                    else "prompt"
+                                ),
                                 "_cwa_identity_recovery_elapsed_ms": int(
                                     (time.monotonic() - started) * 1000
                                 ),
@@ -233,10 +268,13 @@ class WKTurnOrchestrator:
                 )
                 if not isinstance(canonical, dict):
                     continue
-                if self._payload_contains_client_message(
-                    canonical,
-                    client_message_id=client_message_id,
-                    text=text,
+                if (
+                    client_message_id is not None
+                    and self._payload_contains_client_message(
+                        canonical,
+                        client_message_id=client_message_id,
+                        text=text,
+                    )
                 ):
                     candidate_id = conversation_id
                     matched_payload = canonical
@@ -264,6 +302,7 @@ class WKTurnOrchestrator:
                         "stream_terminal_observed": True,
                         "_cwa_identity_recovered": True,
                         "_cwa_identity_recovery_transport": "curl_cffi",
+                        "_cwa_identity_recovery_kind": "message_id",
                         "_cwa_identity_recovery_elapsed_ms": int(
                             (time.monotonic() - started) * 1000
                         ),
@@ -623,7 +662,12 @@ class WKTurnOrchestrator:
 
         resume_value = payload.pop("stream_resume_value", None)
         if payload.get("_cwa_identity_recovered") is True:
-            record_phase_b("canonical_message_id_recovery")
+            recovery_kind = payload.get("_cwa_identity_recovery_kind")
+            record_phase_b(
+                "canonical_prompt_recovery"
+                if recovery_kind == "prompt"
+                else "canonical_message_id_recovery"
+            )
             return passive_observer_armed
         phase_one_completed = phase_one_final_cached or bool(
             payload.get("stream_terminal_observed")

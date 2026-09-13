@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -16,10 +17,11 @@ from .browser_native_client import (
     _canonical_intermediate_events,
     _canonical_stream_answer_seed,
     _canonical_stream_identity,
+    _make_passive_terminal_stop_check,
 )
 from .client import DEFAULT_TIMEOUT_SECONDS, ChatGPTWebClient
 from .exceptions import RequestError
-from .messages import get_messages
+from .messages import _current_branch_nodes, get_messages
 from .product_runtime_observation_gate import gate_product_runtime_send_text_observed
 from .product_submission import ProductSubmissionAck
 from .product_transport import (
@@ -238,43 +240,20 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             if str(getattr(message, "text", "") or "").strip()
         ]
 
-    def conversation_follow_snapshot(
+    def _follow_snapshot_from_payload(
         self,
-        conversation: Any,
+        ref: ConversationRef,
+        payload: dict[str, Any],
         *,
-        emitted_message_ids: Sequence[str] = (),
-        limit: int | None = 128,
+        emitted_message_ids: Sequence[str],
+        limit: int | None,
+        canonical_cache_age_seconds: float | None = None,
+        active_stream: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        ref = ConversationRef.from_any(conversation)
-        canonical_cache_age_seconds: float | None = None
-        try:
-            payload = self.get_conversation_payload(ref)
-        except RequestError as error:
-            if error.status_code != 429:
-                raise
-            cache_reader = getattr(
-                self.canonical,
-                "read_cached_conversation_payload",
-                None,
-            )
-            cached = cache_reader(ref.conversation_id) if callable(cache_reader) else None
-            if not (
-                isinstance(cached, tuple)
-                and len(cached) == 2
-                and isinstance(cached[0], dict)
-            ):
-                raise
-            payload = cached[0]
-            age_value = cached[1]
-            canonical_cache_age_seconds = (
-                max(0.0, float(age_value))
-                if isinstance(age_value, (int, float))
-                and not isinstance(age_value, bool)
-                else None
-            )
-
         class _PayloadReader:
-            def _get_conversation_payload(self, _conversation_id: str) -> dict[str, Any]:
+            def _get_conversation_payload(
+                self, _conversation_id: str
+            ) -> dict[str, Any]:
                 return payload
 
         reader = _PayloadReader()
@@ -290,6 +269,23 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             submission_id=None,
         )
         stream_topic_id, turn_exchange_id = _canonical_stream_identity(payload)
+        registry_overrode_stream = False
+        if active_stream is not None:
+            active_topic = active_stream.get("topic_id")
+            if isinstance(active_topic, str) and active_topic.strip():
+                normalized_active_topic = active_topic.strip()
+                registry_overrode_stream = normalized_active_topic != stream_topic_id
+                stream_topic_id = normalized_active_topic
+            if active_stream.get("pending_topic") is True:
+                turn_exchange_id = None
+            else:
+                active_turn_exchange = active_stream.get("turn_exchange_id")
+                if (
+                    isinstance(active_turn_exchange, str)
+                    and active_turn_exchange.strip()
+                ):
+                    turn_exchange_id = active_turn_exchange.strip()
+
         current_turn_event_ids = sorted(
             str(event.get("message_id")).strip()
             for event in events
@@ -302,13 +298,21 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             payload,
             turn_exchange_id=turn_exchange_id,
         )
+        if registry_overrode_stream:
+            answer_message_id = None
+            answer_text = ""
+        status = get_status(reader, ref)
+        if active_stream is not None:
+            status.status = "running"
+            status.finish_reason = None
+            status.pending_approval = False
         messages = (
             self._full_resume_messages(reader, ref, payload)
             if limit is None
             else get_messages(reader, ref, limit=limit)
         )
         return {
-            "status": get_status(reader, ref),
+            "status": status,
             "messages": messages,
             "events": events,
             "emitted_message_ids": sorted(emitted),
@@ -319,7 +323,159 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             "stream_answer_text": answer_text,
             "canonical_cache_stale": canonical_cache_age_seconds is not None,
             "canonical_cache_age_seconds": canonical_cache_age_seconds,
+            "active_stream_registry": active_stream is not None,
         }
+
+    def conversation_follow_snapshot(
+        self,
+        conversation: Any,
+        *,
+        emitted_message_ids: Sequence[str] = (),
+        limit: int | None = 128,
+    ) -> dict[str, Any]:
+        ref = ConversationRef.from_any(conversation)
+        canonical_cache_age_seconds: float | None = None
+        provider = getattr(self.write_transport, "provider", None)
+        active_stream: dict[str, Any] | None = None
+        active_stream_reader = getattr(provider, "active_stream_info", None)
+        if callable(active_stream_reader):
+            candidate = active_stream_reader(ref.conversation_id)
+            if isinstance(candidate, dict):
+                active_stream = candidate
+        if active_stream is not None and not active_stream.get("topic_id"):
+            pending_topic_factory = getattr(provider, "pending_stream_topic_id", None)
+            if callable(pending_topic_factory):
+                pending_topic = pending_topic_factory(
+                    ref.conversation_id,
+                    active_stream,
+                )
+                if isinstance(pending_topic, str) and pending_topic.strip():
+                    active_stream = {
+                        **active_stream,
+                        "topic_id": pending_topic.strip(),
+                        "pending_topic": True,
+                    }
+
+        cache_reader = getattr(
+            self.canonical,
+            "read_cached_conversation_payload",
+            None,
+        )
+        cached = (
+            cache_reader(ref.conversation_id)
+            if active_stream is not None and callable(cache_reader)
+            else None
+        )
+        use_cached_active_snapshot = (
+            active_stream is not None
+            and isinstance(cached, tuple)
+            and len(cached) == 2
+            and isinstance(cached[0], dict)
+        )
+        if use_cached_active_snapshot:
+            payload = cached[0]
+            age_value = cached[1]
+            canonical_cache_age_seconds = (
+                max(0.0, float(age_value))
+                if isinstance(age_value, (int, float))
+                and not isinstance(age_value, bool)
+                else None
+            )
+        else:
+            try:
+                payload = self.get_conversation_payload(ref)
+            except RequestError as error:
+                if error.status_code != 429:
+                    raise
+                if cached is None and callable(cache_reader):
+                    cached = cache_reader(ref.conversation_id)
+                if not (
+                    isinstance(cached, tuple)
+                    and len(cached) == 2
+                    and isinstance(cached[0], dict)
+                ):
+                    raise
+                payload = cached[0]
+                age_value = cached[1]
+                canonical_cache_age_seconds = (
+                    max(0.0, float(age_value))
+                    if isinstance(age_value, (int, float))
+                    and not isinstance(age_value, bool)
+                    else None
+                )
+
+        return self._follow_snapshot_from_payload(
+            ref,
+            payload,
+            emitted_message_ids=emitted_message_ids,
+            limit=limit,
+            canonical_cache_age_seconds=canonical_cache_age_seconds,
+            active_stream=active_stream,
+        )
+
+    @staticmethod
+    def _relay_pending_canonical_payload(
+        payload: dict[str, Any],
+        *,
+        baseline_current_node: str | None,
+        normalizer: CanonicalTopicStreamNormalizer,
+        on_event: Any = None,
+    ) -> bool:
+        if (
+            not isinstance(baseline_current_node, str)
+            or not baseline_current_node.strip()
+        ):
+            return False
+        branch = _current_branch_nodes(payload)
+        baseline_index: int | None = None
+        for index, (node_id, _node) in enumerate(branch):
+            if node_id == baseline_current_node:
+                baseline_index = index
+                break
+        if baseline_index is None or baseline_index >= len(branch) - 1:
+            return False
+        advanced = False
+        normalized_emitted = False
+        first_new_message: dict[str, Any] | None = None
+        for _node_id, node in branch[baseline_index + 1 :]:
+            message = node.get("message")
+            if not isinstance(message, dict):
+                continue
+            if first_new_message is None:
+                first_new_message = message
+            advanced = True
+            transport_event = {
+                "type": "raw_ws_event",
+                "parsed": {"v": {"message": message}},
+            }
+            for normalized in normalizer.feed_transport_event(transport_event):
+                normalized_emitted = True
+                if on_event is not None:
+                    on_event(normalized)
+        if advanced and not normalized_emitted and isinstance(first_new_message, dict):
+            author = first_new_message.get("author")
+            role = author.get("role") if isinstance(author, dict) else None
+            message_id = first_new_message.get("id")
+            if (
+                role == "user"
+                and isinstance(message_id, str)
+                and message_id.strip()
+                and message_id not in normalizer.emitted_message_ids
+            ):
+                normalized_id = message_id.strip()
+                normalizer.emitted_message_ids.add(normalized_id)
+                if on_event is not None:
+                    on_event(
+                        {
+                            "type": "canonical_intermediate_message",
+                            "message_id": normalized_id,
+                            "message_kind": "activity",
+                            "text": "",
+                            "label": "Request accepted",
+                            "tool_name": None,
+                        }
+                    )
+        return advanced
 
     def conversation_follow_stream(
         self,
@@ -352,23 +508,156 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                 if on_event is not None:
                     on_event(normalized)
 
-        def stream_should_stop() -> bool:
-            if normalizer.turn_completed:
-                return True
-            if should_stop is None:
-                return False
-            try:
-                return bool(should_stop())
-            except Exception:
-                return False
-
-        helper(
-            conversation_id=ref.conversation_id,
-            topic_id=topic_id,
-            timeout=timeout,
-            on_event=relay_transport_event,
-            should_stop=stream_should_stop,
+        stream_should_stop = _make_passive_terminal_stop_check(
+            lambda: normalizer.turn_completed,
+            cancelled=should_stop,
+            settled=lambda: normalizer.segment_kind is None,
         )
+
+        actual_topic_id = topic_id
+        local_final_payload: dict[str, Any] | None = None
+        if topic_id.startswith("cwa-local-pending:"):
+            active_stream_reader = getattr(provider, "active_stream_info", None)
+            cache_reader = getattr(
+                self.canonical, "read_cached_conversation_payload", None
+            )
+            final_predicate = getattr(provider, "canonical_payload_is_final", None)
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            baseline_current_node: str | None = None
+            while True:
+                cancelled = False
+                if should_stop is not None:
+                    try:
+                        cancelled = bool(should_stop())
+                    except Exception:
+                        cancelled = False
+                if cancelled:
+                    return {
+                        "stream_completed": False,
+                        "stream_cancelled": True,
+                        "stream_topic_id": actual_topic_id,
+                        "emitted_message_ids": sorted(normalizer.emitted_message_ids),
+                    }
+
+                active_stream = (
+                    active_stream_reader(ref.conversation_id)
+                    if callable(active_stream_reader)
+                    else None
+                )
+                if isinstance(active_stream, dict):
+                    active_baseline = active_stream.get("baseline_current_node")
+                    if (
+                        baseline_current_node is None
+                        and isinstance(active_baseline, str)
+                        and active_baseline.strip()
+                    ):
+                        baseline_current_node = active_baseline.strip()
+                    active_topic = active_stream.get("topic_id")
+                    if isinstance(active_topic, str) and active_topic.strip():
+                        actual_topic_id = active_topic.strip()
+                        break
+
+                cached = (
+                    cache_reader(ref.conversation_id)
+                    if callable(cache_reader)
+                    else None
+                )
+                if (
+                    isinstance(cached, tuple)
+                    and len(cached) == 2
+                    and isinstance(cached[0], dict)
+                ):
+                    cached_payload = cached[0]
+                    advanced = self._relay_pending_canonical_payload(
+                        cached_payload,
+                        baseline_current_node=baseline_current_node,
+                        normalizer=normalizer,
+                        on_event=on_event,
+                    )
+                    if (
+                        advanced
+                        and callable(final_predicate)
+                        and bool(final_predicate(cached_payload))
+                    ):
+                        local_final_payload = cached_payload
+                        break
+
+                if active_stream is None or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+
+            if local_final_payload is not None:
+                recovered_snapshot = self._follow_snapshot_from_payload(
+                    ref,
+                    local_final_payload,
+                    emitted_message_ids=tuple(normalizer.emitted_message_ids),
+                    limit=limit,
+                )
+                recovered_snapshot["stream_completed"] = True
+                recovered_snapshot["stream_topic_id"] = actual_topic_id
+                recovered_snapshot["shared_final_cache"] = True
+                recovered_snapshot["stream_recovered_from_local_cache"] = True
+                return recovered_snapshot
+
+            if actual_topic_id.startswith("cwa-local-pending:"):
+                return {
+                    "stream_completed": False,
+                    "stream_cancelled": False,
+                    "stream_topic_id": actual_topic_id,
+                    "emitted_message_ids": sorted(normalizer.emitted_message_ids),
+                }
+
+        try:
+            follow_result = helper(
+                conversation_id=ref.conversation_id,
+                topic_id=actual_topic_id,
+                timeout=timeout,
+                on_event=relay_transport_event,
+                should_stop=stream_should_stop,
+            )
+        except Exception:
+            active_stream_reader = getattr(provider, "active_stream_info", None)
+            active_stream = (
+                active_stream_reader(ref.conversation_id)
+                if callable(active_stream_reader)
+                else None
+            )
+            if isinstance(active_stream, dict):
+                active_topic = active_stream.get("topic_id")
+                if isinstance(active_topic, str) and active_topic.strip():
+                    actual_topic_id = active_topic.strip()
+            shared_final_reader = getattr(
+                provider, "wait_for_shared_final_payload", None
+            )
+            if (
+                callable(shared_final_reader)
+                and isinstance(actual_topic_id, str)
+                and actual_topic_id
+                and not actual_topic_id.startswith("cwa-local-pending:")
+            ):
+                candidate = shared_final_reader(
+                    ref.conversation_id,
+                    topic_id=actual_topic_id,
+                    timeout=timeout,
+                    should_stop=should_stop,
+                )
+                if isinstance(candidate, dict):
+                    recovered_snapshot = self._follow_snapshot_from_payload(
+                        ref,
+                        candidate,
+                        emitted_message_ids=tuple(normalizer.emitted_message_ids),
+                        limit=limit,
+                    )
+                    recovered_snapshot["stream_completed"] = True
+                    recovered_snapshot["stream_topic_id"] = actual_topic_id
+                    recovered_snapshot["shared_final_cache"] = True
+                    recovered_snapshot["stream_recovered_from_local_final"] = True
+                    return recovered_snapshot
+            raise
+        if isinstance(follow_result, dict):
+            result_topic_id = follow_result.get("topic_id")
+            if isinstance(result_topic_id, str) and result_topic_id.strip():
+                actual_topic_id = result_topic_id.strip()
         completed = normalizer.turn_completed
         if not completed:
             cancelled = False
@@ -380,17 +669,38 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             return {
                 "stream_completed": False,
                 "stream_cancelled": cancelled,
-                "stream_topic_id": topic_id,
+                "stream_topic_id": actual_topic_id,
                 "emitted_message_ids": sorted(normalizer.emitted_message_ids),
             }
 
-        final_snapshot = self.conversation_follow_snapshot(
-            ref,
-            emitted_message_ids=tuple(normalizer.emitted_message_ids),
-            limit=limit,
-        )
+        shared_final_payload: dict[str, Any] | None = None
+        shared_final_reader = getattr(provider, "wait_for_shared_final_payload", None)
+        if callable(shared_final_reader):
+            candidate = shared_final_reader(
+                ref.conversation_id,
+                topic_id=actual_topic_id,
+                timeout=15.0,
+            )
+            if isinstance(candidate, dict):
+                shared_final_payload = candidate
+
+        if shared_final_payload is not None:
+            final_snapshot = self._follow_snapshot_from_payload(
+                ref,
+                shared_final_payload,
+                emitted_message_ids=tuple(normalizer.emitted_message_ids),
+                limit=limit,
+            )
+            final_snapshot["shared_final_cache"] = True
+        else:
+            final_snapshot = self.conversation_follow_snapshot(
+                ref,
+                emitted_message_ids=tuple(normalizer.emitted_message_ids),
+                limit=limit,
+            )
+            final_snapshot["shared_final_cache"] = False
         final_snapshot["stream_completed"] = True
-        final_snapshot["stream_topic_id"] = topic_id
+        final_snapshot["stream_topic_id"] = actual_topic_id
         return final_snapshot
 
     def get_conversation_payload(self, conversation: Any) -> dict[str, Any]:

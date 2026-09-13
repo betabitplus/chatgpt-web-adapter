@@ -261,12 +261,15 @@ class WKWebViewHelperRuntime:
         timeout: float,
         on_text_event: Any,
         on_lifecycle_event: Any = None,
+        on_transport_event: Any = None,
         extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if not callable(on_text_event):
             raise TypeError("on_text_event must be callable")
         if on_lifecycle_event is not None and not callable(on_lifecycle_event):
             raise TypeError("on_lifecycle_event must be callable")
+        if on_transport_event is not None and not callable(on_transport_event):
+            raise TypeError("on_transport_event must be callable")
         env = os.environ.copy()
         env.setdefault("NSUnbufferedIO", "YES")
         if extra_env:
@@ -339,6 +342,14 @@ class WKWebViewHelperRuntime:
                         except Exception:
                             # Consumer callbacks are observational; they must not abort
                             # or corrupt the browser-owned transport lifecycle.
+                            pass
+                        continue
+                    if event_type == "raw_ws_event" and on_transport_event is not None:
+                        try:
+                            on_transport_event(event)
+                        except Exception:
+                            # Raw transport callbacks are observational and must not
+                            # interfere with the browser-owned write lifecycle.
                             pass
                         continue
                     if (

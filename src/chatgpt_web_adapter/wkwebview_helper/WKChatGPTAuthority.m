@@ -244,7 +244,11 @@ completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler {
                 self.streamStatus = [status integerValue];
             }
         }
-        else if ([phase isEqualToString:@"ended"] || [phase isEqualToString:@"done"]) self.streamEnded = YES;
+        else if ([phase isEqualToString:@"ended"]) self.streamEnded = YES;
+        else if ([phase isEqualToString:@"done"]) {
+            self.streamEnded = YES;
+            PrintEvent(@{@"type":@"raw_ws_done"});
+        }
         else if ([phase isEqualToString:@"terminal"]) self.streamTerminalObserved = YES;
         else if ([phase isEqualToString:@"resume"]) {
             self.streamResumeToken = [body[@"token"] isKindOfClass:[NSString class]] ? body[@"token"] : nil;
@@ -256,6 +260,11 @@ completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler {
             self.streamTurnTraceId = [body[@"turn_trace_id"] isKindOfClass:[NSString class]] ? body[@"turn_trace_id"] : nil;
         } else if ([phase isEqualToString:@"client_message"]) {
             self.streamClientMessageId = [body[@"message_id"] isKindOfClass:[NSString class]] ? body[@"message_id"] : nil;
+        } else if ([phase isEqualToString:@"raw"]) {
+            NSDictionary *parsed = [body[@"parsed"] isKindOfClass:[NSDictionary class]] ? body[@"parsed"] : nil;
+            if (parsed != nil) {
+                PrintEvent(@{@"type":@"raw_ws_event",@"parsed":parsed});
+            }
         } else if ([phase isEqualToString:@"text"]) {
             NSString *eventType = [body[@"type"] isKindOfClass:[NSString class]] ? body[@"type"] : @"";
             if ([eventType isEqualToString:@"assistant_text_snapshot"]
@@ -340,6 +349,8 @@ static NSString *PassiveStreamObservationScript(void) {
             "const originalFetch=window.fetch;if(typeof originalFetch!=='function')return;"
             "const post=(body)=>{try{window.webkit.messageHandlers.cwaStream.postMessage(body)}catch(_){}};"
             "const str=(v)=>typeof v==='string'&&v.trim()?v.trim():null;"
+            "const sensitiveKey=(key)=>/(?:^|_)(?:token|secret|authorization|cookie)(?:$|_)/i.test(String(key||''))||String(key||'').toLowerCase()==='download_url';"
+            "const sanitize=(value,depth=0)=>{if(value==null||depth>24)return value;if(Array.isArray(value))return value.map(item=>sanitize(item,depth+1));if(typeof value!=='object')return value;const out={};for(const [key,item] of Object.entries(value)){if(sensitiveKey(key))continue;out[key]=sanitize(item,depth+1);}return out;};"
             "let sequence=0,currentMessageId=null,currentRecipient='all',currentText='',currentIsFinalText=false;"
             "const contentText=(content)=>{if(!content||typeof content!=='object')return '';if(typeof content.text==='string')return content.text;if(typeof content.content==='string')return content.content;const parts=Array.isArray(content.parts)?content.parts:[];let out='';for(const part of parts.slice(0,64)){if(typeof part==='string')out+=part;else if(part&&typeof part.text==='string')out+=part.text;}return out;};"
             "const emitText=(type,id,value)=>{sequence+=1;const event={phase:'text',type,sequence,message_id:id||null};if(type==='assistant_text_delta')event.delta=value;else event.text=value;post(event);};"
@@ -349,8 +360,8 @@ static NSString *PassiveStreamObservationScript(void) {
             "const emitTerminal=()=>post({phase:'terminal',message_id:currentMessageId||null});"
             "const inspectTerminalPatch=(path,value)=>{if(!currentIsFinalText)return;const p=String(path||'');if((p==='/message/end_turn'&&value===true)||(p==='/message/status'&&completedStatus(value))||(p==='/message/async_status'&&completedStatus(value))||(p==='/message/metadata/status'&&completedStatus(value))||(p==='/message/metadata/async_status'&&completedStatus(value))||(p==='/message/metadata/finish_reason'&&!!str(value))||(p==='/message/finish_reason'&&!!str(value))||(p==='/message/metadata/finish_details'&&value&&typeof value==='object'&&!!str(value.type))){emitTerminal();}};"
             "const selectMessage=(message)=>{if(!message||typeof message!=='object')return;const id=str(message.id);const previousMessageId=currentMessageId;const role=str(message.author&&message.author.role)||'';currentRecipient=str(message.recipient)||'all';const contentType=str(message.content&&message.content.content_type)||'';if(id)currentMessageId=id;currentIsFinalText=role==='assistant'&&currentRecipient==='all'&&contentType==='text'&&!(message.metadata&&message.metadata.is_thinking_preamble_message===true);if(!currentIsFinalText)return;const text=contentText(message.content);if(id&&id!==previousMessageId){currentText='';if(text){currentText=text;emitText('assistant_text_snapshot',currentMessageId,text);}}else if(currentText===''&&text){currentText=text;emitText('assistant_text_snapshot',currentMessageId,text);}else applyText(text);if(messageTerminal(message))emitTerminal();};"
-            "const inspectIdentity=(value,depth=0)=>{if(value==null||depth>7)return;if(Array.isArray(value)){for(const item of value.slice(0,128))inspectIdentity(item,depth+1);return;}if(typeof value!=='object')return;if(value.type==='resume_conversation_token'&&str(value.token)){post({phase:'resume',token:str(value.token),conversation_id:str(value.conversation_id)});}if(value.type==='stream_handoff'){let topic=null;const options=Array.isArray(value.options)?value.options:[];for(const option of options.slice(0,16)){if(option&&option.type==='subscribe_ws_topic'&&str(option.topic_id)){topic=str(option.topic_id);break;}}post({phase:'handoff',topic_id:topic,conversation_id:str(value.conversation_id),turn_exchange_id:str(value.turn_exchange_id)});}for(const key of ['message','messages','data','result','payload','turn','v','value']){if(Object.prototype.hasOwnProperty.call(value,key))inspectIdentity(value[key],depth+1);}};"
-            "const processPayload=(payload)=>{inspectIdentity(payload);if(!payload||typeof payload!=='object')return;const value=payload.v,path=payload.p;if(value&&typeof value==='object'&&!Array.isArray(value)&&value.message)selectMessage(value.message);if(typeof value==='string'&&currentRecipient==='all'&&(path==null||path==='/message/content/parts/0')){currentText+=value;emitText('assistant_text_delta',currentMessageId,value);}inspectTerminalPatch(path,value);if(Array.isArray(value)){for(const item of value.slice(0,128)){if(!item||typeof item!=='object')continue;if(item.v&&typeof item.v==='object'&&!Array.isArray(item.v)&&item.v.message)selectMessage(item.v.message);if(item.p==='/message/content/parts/0'&&typeof item.v==='string'&&currentRecipient==='all'){currentText+=item.v;emitText('assistant_text_delta',currentMessageId,item.v);}else if(item.p==='/message/content'&&item.v&&typeof item.v==='object'&&currentRecipient==='all'){applyText(contentText(item.v));}inspectTerminalPatch(item.p,item.v);}}};"
+            "const inspectIdentity=(value,depth=0)=>{if(value==null||depth>7)return;if(Array.isArray(value)){for(const item of value.slice(0,128))inspectIdentity(item,depth+1);return;}if(typeof value!=='object')return;if(value.author&&value.content)selectMessage(value);if(value.type==='resume_conversation_token'&&str(value.token)){post({phase:'resume',token:str(value.token),conversation_id:str(value.conversation_id)});}if(value.type==='stream_handoff'){let topic=null;const options=Array.isArray(value.options)?value.options:[];for(const option of options.slice(0,16)){if(option&&option.type==='subscribe_ws_topic'&&str(option.topic_id)){topic=str(option.topic_id);break;}}post({phase:'handoff',topic_id:topic,conversation_id:str(value.conversation_id),turn_exchange_id:str(value.turn_exchange_id)});}for(const key of ['message','messages','data','result','payload','turn','v','value']){if(Object.prototype.hasOwnProperty.call(value,key))inspectIdentity(value[key],depth+1);}};"
+            "const processPayload=(payload)=>{if(payload&&typeof payload==='object'){const parsed=sanitize(payload);if(parsed&&typeof parsed==='object')post({phase:'raw',parsed});}inspectIdentity(payload);if(!payload||typeof payload!=='object')return;const value=payload.v,path=payload.p;if(value&&typeof value==='object'&&!Array.isArray(value)&&value.message)selectMessage(value.message);if(typeof value==='string'&&currentRecipient==='all'&&(path==null||path==='/message/content/parts/0')){currentText+=value;emitText('assistant_text_delta',currentMessageId,value);}inspectTerminalPatch(path,value);if(Array.isArray(value)){for(const item of value.slice(0,128)){if(!item||typeof item!=='object')continue;if(item.v&&typeof item.v==='object'&&!Array.isArray(item.v)&&item.v.message)selectMessage(item.v.message);if(item.p==='/message/content/parts/0'&&typeof item.v==='string'&&currentRecipient==='all'){currentText+=item.v;emitText('assistant_text_delta',currentMessageId,item.v);}else if(item.p==='/message/content'&&item.v&&typeof item.v==='object'&&currentRecipient==='all'){applyText(contentText(item.v));}inspectTerminalPatch(item.p,item.v);}}};"
             "const isWrite=(url,method)=>{if(String(method||'GET').toUpperCase()!=='POST')return false;try{const u=new URL(url,location.href);const p=u.pathname.replace(/\\/+$/,'');return u.origin===location.origin&&(p.endsWith('/backend-api/conversation')||p.endsWith('/backend-api/f/conversation')||p.endsWith('/backend-api/f/conversation/resume'));}catch(_){return false;}};"
             "const processBlock=(block)=>{const data=String(block||'').split(/\\r?\\n/).filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trimStart()).join('\\n').trim();if(!data)return;if(data==='[DONE]'){post({phase:'done'});return;}try{processPayload(JSON.parse(data));}catch(_){}};"
             "const observe=async(response)=>{if(!response||!response.body)return;post({phase:'started',status:Number(response.status)||0,ok:response.ok===true});const reader=response.body.getReader();const decoder=new TextDecoder();let buffer='';try{while(true){const chunk=await reader.read();if(chunk.done){buffer+=decoder.decode();break;}buffer+=decoder.decode(chunk.value,{stream:true});if(buffer.length>1000000)buffer=buffer.slice(-1000000);while(true){const m=/\\r?\\n\\r?\\n/.exec(buffer);if(!m)break;const block=buffer.slice(0,m.index);buffer=buffer.slice(m.index+m[0].length);processBlock(block);}}const tail=buffer.trim();if(tail)processBlock(tail);}catch(_){}finally{try{reader.releaseLock()}catch(_){}post({phase:'ended'});}};"
@@ -1403,10 +1414,11 @@ int main(int argc, const char *argv[]) {
             && delegate.streamResumeToken.length == 0
             && !delegate.streamEnded
         ) {
-            NSDate *resumeTokenDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(20.0, MAX(0.0, [deadline timeIntervalSinceNow]))];
+            NSDate *resumeTokenDeadline = deadline;
             while (
                 delegate.streamResumeToken.length == 0
                 && !delegate.streamEnded
+                && !delegate.streamTerminalObserved
                 && [resumeTokenDeadline timeIntervalSinceNow] > 0
             ) {
                 RunLoopFor(0.05);
@@ -1431,47 +1443,13 @@ int main(int argc, const char *argv[]) {
 
         BOOL canonicalCommitted = NO;
         NSString *committedCurrentNode = @"";
-        BOOL heavyFinalCanonicalCompleted = NO;
-        NSString *heavyFinalCanonicalBody = @"";
-        NSString *heavyFinalCurrentNode = @"";
         BOOL streamingResumeMode = observeStream && streamObserveUntilResumeToken;
+        BOOL streamTerminalCommitFence = streamingResumeMode
+            && accepted != nil
+            && submitSucceeded
+            && delegate.streamTerminalObserved;
 
-        if (streamingResumeMode && !resumeCommitFence) {
-            NSTimeInterval canonicalPollDelay = 1.0;
-            NSTimeInterval nextCanonicalCheckAt = [NSDate timeIntervalSinceReferenceDate];
-            while (!resumeCommitFence && !heavyFinalCanonicalCompleted && [deadline timeIntervalSinceNow] > 0) {
-                RunLoopFor(0.05);
-
-                resumeConversationMatches = delegate.streamConversationId.length > 0
-                    && [delegate.streamConversationId isEqualToString:resolvedConversationId];
-                resumeCommitFence = accepted != nil
-                    && submitSucceeded
-                    && delegate.streamResumeToken.length > 0
-                    && resumeConversationMatches;
-                if (resumeCommitFence) break;
-
-                NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-                if (now < nextCanonicalCheckAt) continue;
-                delegate.canonicalDone = NO;
-                delegate.canonicalResult = nil;
-                EvaluateSync(webView, CanonicalCompletionCheckScript(resolvedConversationId), 1.5, nil);
-                NSDate *canonicalDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(2.0, MAX(0.05, [deadline timeIntervalSinceNow]))];
-                while (!delegate.canonicalDone && [canonicalDeadline timeIntervalSinceNow] > 0) RunLoopFor(0.025);
-                NSDictionary *finalProof = delegate.canonicalResult;
-                heavyFinalCanonicalCompleted = [finalProof isKindOfClass:[NSDictionary class]]
-                    && [finalProof[@"completed"] boolValue];
-                if (heavyFinalCanonicalCompleted) {
-                    heavyFinalCanonicalBody = [finalProof[@"body"] isKindOfClass:[NSString class]] ? finalProof[@"body"] : @"";
-                    heavyFinalCurrentNode = [finalProof[@"currentNode"] isKindOfClass:[NSString class]] ? finalProof[@"currentNode"] : @"";
-                }
-                NSNumber *finalProofStatus = [finalProof[@"status"] isKindOfClass:[NSNumber class]] ? finalProof[@"status"] : @0;
-                NSTimeInterval finalProofDelay = finalProofStatus.integerValue == 429
-                    ? MAX(canonicalPollDelay, 60.0)
-                    : canonicalPollDelay;
-                nextCanonicalCheckAt = [NSDate timeIntervalSinceReferenceDate] + finalProofDelay;
-                if (finalProofStatus.integerValue != 429) canonicalPollDelay = MIN(canonicalPollDelay * 2.0, 8.0);
-            }
-        } else if (!resumeCommitFence) {
+        if (!streamingResumeMode && !resumeCommitFence) {
             NSDate *commitDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(30.0, MAX(1.0, [deadline timeIntervalSinceNow]))];
             NSTimeInterval commitPollDelay = 1.0;
             while ([commitDeadline timeIntervalSinceNow] > 0) {
@@ -1501,7 +1479,7 @@ int main(int argc, const char *argv[]) {
             }
         }
 
-        BOOL writeCommitProven = canonicalCommitted || resumeCommitFence || heavyFinalCanonicalCompleted;
+        BOOL writeCommitProven = canonicalCommitted || resumeCommitFence || streamTerminalCommitFence;
         if (!writeCommitProven) {
             PrintResult(@{
                 @"ok":@NO,
@@ -1512,7 +1490,7 @@ int main(int argc, const char *argv[]) {
                 @"submit_response_status":@(delegate.submitStatus),
                 @"resume_token_present":@(delegate.streamResumeToken.length > 0),
                 @"resume_conversation_matches":@(resumeConversationMatches),
-                @"heavy_final_canonical_completed":@(heavyFinalCanonicalCompleted)
+                @"stream_terminal_observed":@(delegate.streamTerminalObserved)
             });
             return 21;
         }
@@ -1536,8 +1514,6 @@ int main(int argc, const char *argv[]) {
             }
         }
 
-        NSData *heavyFinalBodyData = [heavyFinalCanonicalBody dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
-        NSString *heavyFinalBodyBase64 = [heavyFinalBodyData base64EncodedStringWithOptions:0] ?: @"";
         BOOL resumeHandoffWritten = NO;
         if (delegate.streamResumeToken.length > 0 && resumeHandoffFD >= 0) {
             NSString *privateHandoff = PrivateTurnHandoffJSON(delegate);
@@ -1563,11 +1539,11 @@ int main(int argc, const char *argv[]) {
             @"attachment_count":@(attachments.count),
             @"profile":profile ?: @"",
             @"write_commit_proven":@(writeCommitProven),
-            @"write_commit_proof":resumeCommitFence ? @"RESUME_FENCE" : (heavyFinalCanonicalCompleted ? @"FINAL_CANONICAL" : @"CANONICAL"),
+            @"write_commit_proof":resumeCommitFence ? @"RESUME_FENCE" : (streamTerminalCommitFence ? @"STREAM_TERMINAL" : @"CANONICAL"),
             @"canonical_committed":@(canonicalCommitted),
-            @"canonical_final_completed":@(heavyFinalCanonicalCompleted),
-            @"canonical_body_base64":heavyFinalBodyBase64,
-            @"committed_current_node":canonicalCommitted ? (committedCurrentNode ?: @"") : (heavyFinalCurrentNode ?: @""),
+            @"canonical_final_completed":@NO,
+            @"canonical_body_base64":@"",
+            @"committed_current_node":canonicalCommitted ? (committedCurrentNode ?: @"") : @"",
             @"stream_started":@(delegate.streamStarted),
             @"stream_ended":@(delegate.streamEnded),
             @"stream_terminal_observed":@(delegate.streamTerminalObserved),

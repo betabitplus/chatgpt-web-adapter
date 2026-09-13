@@ -813,44 +813,22 @@ def test_wkwebview_curl_ws_finality_rejects_stale_previous_turn() -> None:
     )
 
 
-def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonical(
+def test_wkwebview_streaming_without_resume_uses_stream_terminal_proof(
     monkeypatch,
 ) -> None:
     provider = WKWebViewTurnProvider()
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
 
-    def fail_if_duplicate_commit_check_runs(**kwargs):
+    def fail_if_canonical_commit_check_runs(**kwargs):
         raise AssertionError(
-            "final canonical helper proof must avoid duplicate polling"
+            "healthy streaming terminal proof must not start canonical commit polling"
         )
 
     monkeypatch.setattr(
         provider,
         "_wait_for_canonical_write_commit",
-        fail_if_duplicate_commit_check_runs,
+        fail_if_canonical_commit_check_runs,
     )
-    final_canonical = {
-        "current_node": "node-final",
-        "mapping": {
-            "user-1": {
-                "parent": None,
-                "message": {
-                    "author": {"role": "user"},
-                    "content": {"parts": ["hello"]},
-                },
-            },
-            "node-final": {
-                "parent": "user-1",
-                "message": {
-                    "author": {"role": "assistant"},
-                    "recipient": "all",
-                    "status": "finished_successfully",
-                    "end_turn": True,
-                    "content": {"parts": ["done"]},
-                },
-            },
-        },
-    }
     calls: list[list[str]] = []
 
     def fake_stream(
@@ -880,15 +858,13 @@ def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonic
             "elapsed_ms": 100,
             "load_elapsed_ms": 50,
             "write_commit_proven": True,
-            "write_commit_proof": "FINAL_CANONICAL",
+            "write_commit_proof": "STREAM_TERMINAL",
             "canonical_committed": False,
-            "canonical_final_completed": True,
-            "canonical_body_base64": base64.b64encode(
-                json.dumps(final_canonical).encode("utf-8")
-            ).decode("ascii"),
-            "committed_current_node": "node-final",
+            "canonical_final_completed": False,
+            "canonical_body_base64": "",
+            "committed_current_node": "",
             "stream_ended": False,
-            "stream_terminal_observed": False,
+            "stream_terminal_observed": True,
             "stream_resume_present": False,
             "stream_resume_handoff_written": False,
         }
@@ -901,17 +877,6 @@ def test_wkwebview_streaming_without_resume_keeps_heavy_page_until_final_canonic
     assert len(calls) == 1
     assert result.passive_observer_armed is False
     assert events[0]["text"] == "done"
-
-    def fail_if_helper_runs(*args, **kwargs):
-        raise AssertionError(
-            "cached final canonical payload must avoid another helper read"
-        )
-
-    monkeypatch.setattr(provider, "_run_helper", fail_if_helper_runs)
-    assert (
-        provider.read_conversation_payload("conversation-1", timeout=5)
-        == final_canonical
-    )
 
 
 def test_wkwebview_stop_requires_canonical_client_stopped_proof(monkeypatch) -> None:
@@ -2001,7 +1966,7 @@ def test_wkwebview_observer_uses_conservative_canonical_poll_interval(
     assert captured["request"]["poll_interval"] == 15.0
 
 
-def test_wkwebview_helper_observer_backs_off_after_429() -> None:
+def test_wkwebview_helper_observer_backs_off_after_429_without_stream_polling() -> None:
     source = (
         Path(__file__).resolve().parents[1]
         / "src/chatgpt_web_adapter/wkwebview_helper/WKChatGPTAuthority.m"
@@ -2010,8 +1975,16 @@ def test_wkwebview_helper_observer_backs_off_after_429() -> None:
     assert "observerStatus.integerValue == 429" in source
     assert "MAX(observerPollInterval, 60.0)" in source
     assert "cacheKey='__cwaAuthorityAccessToken'" in source
-    assert "canonicalPollDelay = 1.0" in source
     assert "commitPollDelay = 1.0" in source
+    streaming_send = source[
+        source.index("BOOL streamingResumeMode =") : source.index(
+            "BOOL writeCommitProven =", source.index("BOOL streamingResumeMode =")
+        )
+    ]
+    assert "canonicalPollDelay" not in streaming_send
+    assert "CanonicalCompletionCheckScript" not in streaming_send
+    assert '@"STREAM_TERMINAL"' in source
+    assert "phase:'raw'" in source
 
 
 def test_wkwebview_observer_does_not_hide_malformed_canonical_payload(

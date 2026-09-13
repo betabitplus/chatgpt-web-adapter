@@ -167,7 +167,9 @@ class WKWebViewTurnProvider:
 
     @staticmethod
     def _write_shared_canonical_state(fd: int, state: dict[str, Any]) -> None:
-        encoded = json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(state, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
         os.lseek(fd, 0, os.SEEK_SET)
         os.ftruncate(fd, 0)
         os.write(fd, encoded)
@@ -412,7 +414,8 @@ class WKWebViewTurnProvider:
         mime_type = str(attachment.get("mime_type") or "").strip().lower()
         text_like = (
             mime_type.startswith("text/")
-            or mime_type in {
+            or mime_type
+            in {
                 "application/json",
                 "application/ld+json",
                 "application/xml",
@@ -623,9 +626,11 @@ class WKWebViewTurnProvider:
     ) -> dict[str, Any]:
         fallback_reason = None
         if self._lightweight_path_enabled():
-            payload, fallback_reason = self._read_conversation_payload_via_coordinated_curl(
-                conversation_id,
-                timeout=timeout,
+            payload, fallback_reason = (
+                self._read_conversation_payload_via_coordinated_curl(
+                    conversation_id,
+                    timeout=timeout,
+                )
             )
             if isinstance(payload, dict):
                 self._record_canonical_read_observation("curl_cffi")
@@ -769,7 +774,9 @@ class WKWebViewTurnProvider:
                     and current_node
                     and current_node != baseline_current_node
                 )
-                if node_changed and self._current_branch_contains_user_text(payload, text):
+                if node_changed and self._current_branch_contains_user_text(
+                    payload, text
+                ):
                     return payload
                 sleep_delay = retry_delay
 
@@ -898,6 +905,7 @@ class WKWebViewTurnProvider:
         timeout: float,
         on_text_event: Any,
         on_lifecycle_event: Any = None,
+        on_transport_event: Any = None,
         extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         return self._helper_runtime.run_streaming(
@@ -905,6 +913,7 @@ class WKWebViewTurnProvider:
             timeout=timeout,
             on_text_event=on_text_event,
             on_lifecycle_event=on_lifecycle_event,
+            on_transport_event=on_transport_event,
             extra_env=extra_env,
         )
 
@@ -1079,6 +1088,7 @@ class WKWebViewTurnProvider:
                 if make_stream_relay is not None
                 else None,
                 on_write_identity=handle_write_identity,
+                on_transport_event=on_transport_event,
             )
             payload = self._turn_orchestrator.recover_phase_one_identity(
                 payload,

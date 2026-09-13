@@ -450,6 +450,7 @@ class WKTurnOrchestrator:
         streaming: bool,
         on_text_event: Any,
         on_write_identity: Any,
+        on_transport_event: Any = None,
     ) -> dict[str, Any]:
         provider = self.provider
         phase_started = time.monotonic()
@@ -469,6 +470,11 @@ class WKTurnOrchestrator:
 
         phase_timeout = total_timeout
         gate_wait_ms = 0
+        transport_event_kwargs = (
+            {"on_transport_event": on_transport_event}
+            if callable(on_transport_event)
+            else {}
+        )
         if provider._lightweight_path_enabled():
             gate_wait = max(0.001, total_timeout - (time.monotonic() - started))
             with provider._heavy_submit_gate(gate_wait) as gate_wait_ms:
@@ -478,6 +484,7 @@ class WKTurnOrchestrator:
                     timeout=phase_timeout,
                     on_text_event=on_text_event,
                     on_lifecycle_event=on_write_identity,
+                    **transport_event_kwargs,
                 )
         else:
             payload = provider._run_helper_streaming(
@@ -485,6 +492,7 @@ class WKTurnOrchestrator:
                 timeout=phase_timeout,
                 on_text_event=on_text_event,
                 on_lifecycle_event=on_write_identity,
+                **transport_event_kwargs,
             )
         payload["_cwa_phase_a_transport"] = phase_a_transport
         payload["_cwa_phase_a_gate_wait_ms"] = gate_wait_ms

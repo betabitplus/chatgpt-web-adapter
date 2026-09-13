@@ -3,7 +3,6 @@ from __future__ import annotations
 import inspect
 import json
 import re
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -58,7 +57,6 @@ class BrowserNativeSubmission:
 
 
 _CANONICAL_LIVE_POLL_INTERVAL_SECONDS = 15.0
-_ACTIVE_SEND_CANONICAL_POLL_INTERVAL_SECONDS = 5.0
 _CANONICAL_RATE_LIMIT_BACKOFF_SECONDS = 15.0
 _PASSIVE_FINAL_RECONCILE_RETRY_SECONDS = 5.0
 _PASSIVE_FINAL_RECONCILE_SETTLE_SECONDS = 4.0
@@ -504,7 +502,10 @@ def _stream_message_completed(message: dict[str, Any]) -> bool:
         "succeeded",
         "finished_successfully",
     }
-    if any(isinstance(value, str) and value.strip().lower() in completed for value in values):
+    if any(
+        isinstance(value, str) and value.strip().lower() in completed
+        for value in values
+    ):
         return True
     finish_details = metadata.get("finish_details")
     if isinstance(finish_details, dict):
@@ -538,7 +539,16 @@ def _clone_stream_message(message: dict[str, Any]) -> dict[str, Any]:
 class CanonicalTopicStreamNormalizer:
     """Normalize Celsius topic frames into the same live events gptty already renders."""
 
-    _CHILD_KEYS = ("message", "messages", "data", "result", "payload", "turn", "v", "value")
+    _CHILD_KEYS = (
+        "message",
+        "messages",
+        "data",
+        "result",
+        "payload",
+        "turn",
+        "v",
+        "value",
+    )
 
     def __init__(
         self,
@@ -563,6 +573,7 @@ class CanonicalTopicStreamNormalizer:
         self.pending_thinking: dict[str, dict[str, Any]] = {}
         self.catchup_remaining = 0
         self.turn_completed = False
+        self.segment_kind: str | None = None
 
     def feed_transport_event(self, event: Any) -> list[dict[str, Any]]:
         if not isinstance(event, dict):
@@ -571,9 +582,15 @@ class CanonicalTopicStreamNormalizer:
             catchup_count = event.get("catchup_count")
             self.catchup_remaining = (
                 max(0, catchup_count)
-                if isinstance(catchup_count, int) and not isinstance(catchup_count, bool)
+                if isinstance(catchup_count, int)
+                and not isinstance(catchup_count, bool)
                 else 0
             )
+            return []
+        if event.get("type") == "raw_ws_done":
+            if self.segment_kind == "answer" and bool(self.answer_text):
+                self.turn_completed = True
+            self.segment_kind = None
             return []
         if event.get("type") != "raw_ws_event":
             return []
@@ -588,7 +605,11 @@ class CanonicalTopicStreamNormalizer:
 
     def _message_id(self, message: dict[str, Any]) -> str | None:
         message_id = message.get("id")
-        return message_id.strip() if isinstance(message_id, str) and message_id.strip() else None
+        return (
+            message_id.strip()
+            if isinstance(message_id, str) and message_id.strip()
+            else None
+        )
 
     def _flush_pending_thinking(
         self,
@@ -694,15 +715,25 @@ class CanonicalTopicStreamNormalizer:
             and recipient in {"", "all"}
             and metadata.get("is_thinking_preamble_message") is True
         ):
+            self.segment_kind = "intermediate"
             text = extract_message_text(message)
             if text.strip():
                 self.pending_thinking[message_id] = {"text": text}
             return
 
-        if role == "assistant" and recipient in {"", "all"} and content_type == "reasoning_recap":
+        if (
+            role == "assistant"
+            and recipient in {"", "all"}
+            and content_type == "reasoning_recap"
+        ):
+            self.segment_kind = "intermediate"
             self._flush_pending_thinking(output, except_id=message_id)
             text = _sanitize_intermediate_text(extract_message_text(message))
-            if text and _stream_message_completed(message) and message_id not in self.emitted_message_ids:
+            if (
+                text
+                and _stream_message_completed(message)
+                and message_id not in self.emitted_message_ids
+            ):
                 self.emitted_message_ids.add(message_id)
                 output.append(
                     {
@@ -716,7 +747,12 @@ class CanonicalTopicStreamNormalizer:
                 )
             return
 
-        if role == "assistant" and recipient in {"", "all"} and content_type == "thoughts":
+        if (
+            role == "assistant"
+            and recipient in {"", "all"}
+            and content_type == "thoughts"
+        ):
+            self.segment_kind = "intermediate"
             text = _sanitize_intermediate_text(extract_message_text(message))
             reasoning_title = metadata.get("reasoning_title")
             label = (
@@ -743,6 +779,7 @@ class CanonicalTopicStreamNormalizer:
             return
 
         if role == "assistant" and recipient not in {"", "all"}:
+            self.segment_kind = "intermediate"
             self._flush_pending_thinking(output)
             if message_id in self.emitted_message_ids:
                 return
@@ -763,8 +800,11 @@ class CanonicalTopicStreamNormalizer:
             return
 
         if role == "tool":
+            self.segment_kind = "intermediate"
             self._flush_pending_thinking(output)
-            if message_id in self.emitted_message_ids or not _stream_message_completed(message):
+            if message_id in self.emitted_message_ids or not _stream_message_completed(
+                message
+            ):
                 return
             self.emitted_message_ids.add(message_id)
             raw_name = author.get("name")
@@ -786,7 +826,10 @@ class CanonicalTopicStreamNormalizer:
             return
 
         if content_type == "tether_browsing_display":
-            if message_id in self.emitted_message_ids or not _stream_message_completed(message):
+            self.segment_kind = "intermediate"
+            if message_id in self.emitted_message_ids or not _stream_message_completed(
+                message
+            ):
                 return
             self.emitted_message_ids.add(message_id)
             output.append(
@@ -807,6 +850,7 @@ class CanonicalTopicStreamNormalizer:
             and content_type == "text"
             and metadata.get("is_thinking_preamble_message") is not True
         ):
+            self.segment_kind = "answer"
             self._flush_pending_thinking(output)
             self._emit_answer(message, output)
 
@@ -832,7 +876,9 @@ class CanonicalTopicStreamNormalizer:
         if identity in seen:
             return
         seen.add(identity)
-        if isinstance(value.get("author"), dict) and isinstance(value.get("content"), dict):
+        if isinstance(value.get("author"), dict) and isinstance(
+            value.get("content"), dict
+        ):
             self._inspect_message(value, output)
         for key in self._CHILD_KEYS:
             if key in value:
@@ -883,11 +929,15 @@ class CanonicalTopicStreamNormalizer:
             if not isinstance(content, dict):
                 content = {"content_type": "thoughts"}
                 message["content"] = content
-            content["thoughts"] = [dict(item) if isinstance(item, dict) else item for item in value]
+            content["thoughts"] = [
+                dict(item) if isinstance(item, dict) else item for item in value
+            ]
         elif (
             isinstance(path, str)
             and isinstance(value, str)
-            and (match := re.fullmatch(r"/message/content/thoughts/(\d+)/summary", path))
+            and (
+                match := re.fullmatch(r"/message/content/thoughts/(\d+)/summary", path)
+            )
         ):
             content = message.get("content")
             if not isinstance(content, dict):
@@ -1412,26 +1462,20 @@ def submit_browser_native(
         emitted_message_ids=tuple(baseline_message_ids),
     )
     transport_sequence = 0
-    observer_lock = threading.Lock()
-    observer_stop = threading.Event()
-    observer_thread: threading.Thread | None = None
-    observer_deadline = started + timeout
 
     def handle_text_event(event: dict[str, Any]) -> None:
         normalized = stream_state.apply(event)
         if normalized is not None:
             normalized = {**normalized, "submission_id": submission_id}
             _emit_revision_safe_event(self, on_event, normalized)
-        with observer_lock:
-            topic_normalizer.answer_message_id = stream_state.message_id
-            topic_normalizer.answer_text = stream_state.text
+        topic_normalizer.answer_message_id = stream_state.message_id
+        topic_normalizer.answer_text = stream_state.text
 
     def handle_transport_event(event: dict[str, Any]) -> None:
         nonlocal transport_sequence
-        with observer_lock:
-            topic_normalizer.answer_message_id = stream_state.message_id
-            topic_normalizer.answer_text = stream_state.text
-            normalized_events = topic_normalizer.feed_transport_event(event)
+        topic_normalizer.answer_message_id = stream_state.message_id
+        topic_normalizer.answer_text = stream_state.text
+        normalized_events = topic_normalizer.feed_transport_event(event)
         for normalized in normalized_events:
             if normalized.get("type") in {
                 ASSISTANT_TEXT_SNAPSHOT,
@@ -1451,51 +1495,7 @@ def submit_browser_native(
             )
 
     def stream_should_stop() -> bool:
-        with observer_lock:
-            return topic_normalizer.turn_completed
-
-    def stop_canonical_observer() -> None:
-        observer_stop.set()
-        thread = observer_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=0.2)
-
-    def start_canonical_observer(conversation_id: str) -> None:
-        nonlocal observer_thread
-        if observer_thread is not None:
-            return
-        read_payload = getattr(self, "_get_conversation_payload", None)
-        if not callable(read_payload):
-            return
-
-        def worker() -> None:
-            while not observer_stop.is_set() and time.monotonic() < observer_deadline:
-                try:
-                    payload = read_payload(conversation_id)
-                except Exception:
-                    if observer_stop.wait(_ACTIVE_SEND_CANONICAL_POLL_INTERVAL_SECONDS):
-                        return
-                    continue
-                if observer_stop.is_set():
-                    return
-                with observer_lock:
-                    events = _canonical_intermediate_events(
-                        payload,
-                        baseline_message_ids=baseline_message_ids,
-                        emitted_message_ids=topic_normalizer.emitted_message_ids,
-                        submission_id=submission_id,
-                    )
-                for normalized in events:
-                    _emit_revision_safe_event(self, on_event, normalized)
-                if observer_stop.wait(_ACTIVE_SEND_CANONICAL_POLL_INTERVAL_SECONDS):
-                    return
-
-        observer_thread = threading.Thread(
-            target=worker,
-            name="cwa-active-send-canonical-observer",
-            daemon=True,
-        )
-        observer_thread.start()
+        return topic_normalizer.turn_completed
 
     def handle_write_identity(event: dict[str, Any]) -> None:
         if (
@@ -1520,7 +1520,6 @@ def submit_browser_native(
                 else None
             ),
         )
-        start_canonical_observer(normalized_conversation_id)
 
     streaming_requested = (
         on_event is not None and _provider_supports_revision_safe_streaming(provider)
@@ -1554,19 +1553,16 @@ def submit_browser_native(
                 transport_stream_kwargs["on_transport_event"] = handle_transport_event
             if _callable_accepts_stream_should_stop(recovery_stream_send):
                 transport_stream_kwargs["stream_should_stop"] = stream_should_stop
-            try:
-                turn = recovery_stream_send(
-                    prompt,
-                    conversation=conversation,
-                    timeout=timeout,
-                    canonical_completed_at_ms=canonical_completed_at_ms,
-                    on_text_event=handle_text_event,
-                    **write_identity_kwargs,
-                    **transport_stream_kwargs,
-                    **provider_kwargs,
-                )
-            finally:
-                stop_canonical_observer()
+            turn = recovery_stream_send(
+                prompt,
+                conversation=conversation,
+                timeout=timeout,
+                canonical_completed_at_ms=canonical_completed_at_ms,
+                on_text_event=handle_text_event,
+                **write_identity_kwargs,
+                **transport_stream_kwargs,
+                **provider_kwargs,
+            )
         else:
             if normalized_attachment_paths and not _callable_accepts_attachment_paths(
                 recovery_send
@@ -1600,18 +1596,15 @@ def submit_browser_native(
             transport_stream_kwargs["on_transport_event"] = handle_transport_event
         if _callable_accepts_stream_should_stop(stream_send):
             transport_stream_kwargs["stream_should_stop"] = stream_should_stop
-        try:
-            turn = stream_send(
-                prompt,
-                conversation=conversation,
-                timeout=timeout,
-                on_text_event=handle_text_event,
-                **write_identity_kwargs,
-                **transport_stream_kwargs,
-                **provider_kwargs,
-            )
-        finally:
-            stop_canonical_observer()
+        turn = stream_send(
+            prompt,
+            conversation=conversation,
+            timeout=timeout,
+            on_text_event=handle_text_event,
+            **write_identity_kwargs,
+            **transport_stream_kwargs,
+            **provider_kwargs,
+        )
     else:
         turn = provider.send_text(
             prompt,

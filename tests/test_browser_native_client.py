@@ -162,7 +162,9 @@ def test_client_returns_canonical_readback_not_native_body() -> None:
     assert provider.normal_calls == [("hello", "existing-conversation", 2)]
 
 
-def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn() -> None:
+def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn() -> (
+    None
+):
     class Provider(FakeProvider):
         revision_safe_streaming_supported = True
 
@@ -274,7 +276,8 @@ def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn()
     answer_events = [
         event
         for event in delivered
-        if event.get("type") in {
+        if event.get("type")
+        in {
             "assistant_text_snapshot",
             "assistant_text_delta",
             "assistant_text_revision",
@@ -282,56 +285,20 @@ def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn()
         and event.get("message_id") == "assistant-1"
     ]
     assert answer_events
-    assert answer_events[-1].get("delta") == "done" or answer_events[-1].get("text") == "done"
+    assert (
+        answer_events[-1].get("delta") == "done"
+        or answer_events[-1].get("text") == "done"
+    )
 
 
-def test_active_streaming_send_reconciles_canonical_intermediate_before_provider_returns(
-    monkeypatch,
-) -> None:
+def test_active_streaming_send_forwards_first_leg_raw_intermediate_without_polling() -> (
+    None
+):
     reasoning_observed = threading.Event()
     provider_returned = threading.Event()
-
-    class Provider(FakeProvider):
-        revision_safe_streaming_supported = True
-
-        def send_text_streaming(
-            self,
-            text,
-            *,
-            conversation=None,
-            timeout=None,
-            on_text_event,
-            on_write_identity,
-            on_transport_event,
-        ):
-            on_write_identity(
-                {
-                    "type": "write_identity_resolved",
-                    "conversation_id": "conversation-1",
-                    "submit_response_observed": True,
-                    "submit_response_status": 200,
-                }
-            )
-            assert reasoning_observed.wait(2.0)
-            on_transport_event(
-                {
-                    "type": "raw_ws_event",
-                    "parsed": {
-                        "v": {"message": live_payload["mapping"]["reasoning"]["message"]}
-                    },
-                }
-            )
-            provider_returned.set()
-            return BrowserNativeTurnResult(
-                conversation_id="conversation-1",
-                turn_exchange_id="turn-1",
-                response_status=200,
-                response_mime_type="text/event-stream",
-                final_url="https://chatgpt.com/c/conversation-1",
-                tab_id=None,
-                tab_was_active=False,
-                elapsed_ms=500,
-            )
+    payload_reads = 0
+    provider_entry_reads: list[int] = []
+    provider_return_reads: list[int] = []
 
     baseline_payload = {
         "conversation_id": "conversation-1",
@@ -353,50 +320,74 @@ def test_active_streaming_send_reconciles_canonical_intermediate_before_provider
             }
         },
     }
-    live_payload = {
-        "conversation_id": "conversation-1",
-        "current_node": "reasoning",
-        "mapping": {
-            "old": {
-                "id": "old",
-                "parent": None,
-                "children": ["reasoning"],
-                "message": baseline_payload["mapping"]["old"]["message"],
-            },
-            "reasoning": {
-                "id": "reasoning",
-                "parent": "old",
-                "children": [],
-                "message": {
-                    "id": "reasoning-live",
-                    "author": {"role": "assistant"},
-                    "recipient": "all",
-                    "status": "finished_successfully",
-                    "content": {
-                        "content_type": "thoughts",
-                        "thoughts": [
-                            {
-                                "summary": "Visible first-leg reasoning",
-                                "content": "internal-only-content",
-                                "finished": True,
-                            }
-                        ],
-                    },
-                    "metadata": {"turn_exchange_id": "turn-1"},
-                    "end_turn": False,
-                },
-            },
+    reasoning_message = {
+        "id": "reasoning-live",
+        "author": {"role": "assistant"},
+        "recipient": "all",
+        "status": "finished_successfully",
+        "content": {
+            "content_type": "thoughts",
+            "thoughts": [
+                {
+                    "summary": "Visible first-leg reasoning",
+                    "content": "internal-only-content",
+                    "finished": True,
+                }
+            ],
         },
+        "metadata": {"turn_exchange_id": "turn-1"},
+        "end_turn": False,
     }
+
+    class Provider(FakeProvider):
+        revision_safe_streaming_supported = True
+
+        def send_text_streaming(
+            self,
+            text,
+            *,
+            conversation=None,
+            timeout=None,
+            on_text_event,
+            on_write_identity,
+            on_transport_event,
+        ):
+            provider_entry_reads.append(payload_reads)
+            on_write_identity(
+                {
+                    "type": "write_identity_resolved",
+                    "conversation_id": "conversation-1",
+                    "submit_response_observed": True,
+                    "submit_response_status": 200,
+                }
+            )
+            on_transport_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {"v": {"message": reasoning_message}},
+                }
+            )
+            assert reasoning_observed.wait(2.0)
+            provider_return_reads.append(payload_reads)
+            provider_returned.set()
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-1",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=500,
+            )
 
     provider = Provider()
     client = _client(provider)
-    payload_reads = 0
 
     def read_payload(_conversation_id: str):
         nonlocal payload_reads
         payload_reads += 1
-        return baseline_payload if payload_reads == 1 else live_payload
+        return baseline_payload
 
     client._get_conversation_payload = read_payload
     delivered: list[dict] = []
@@ -415,11 +406,6 @@ def test_active_streaming_send_reconciles_canonical_intermediate_before_provider
             assert provider_returned.is_set() is False
             reasoning_observed.set()
 
-    monkeypatch.setattr(
-        "chatgpt_web_adapter.browser_native_client._ACTIVE_SEND_CANONICAL_POLL_INTERVAL_SECONDS",
-        0.001,
-    )
-
     submit_browser_native(
         client,
         "hello",
@@ -431,6 +417,8 @@ def test_active_streaming_send_reconciles_canonical_intermediate_before_provider
 
     assert reasoning_observed.is_set()
     assert provider_returned.is_set()
+    assert provider_entry_reads
+    assert provider_return_reads == provider_entry_reads
     reasoning = [
         event
         for event in delivered
@@ -442,7 +430,6 @@ def test_active_streaming_send_reconciles_canonical_intermediate_before_provider
             "type": "canonical_intermediate_message",
             "message_id": "reasoning-live",
             "message_kind": "reasoning",
-            "turn_exchange_id": "turn-1",
             "text": "Visible first-leg reasoning",
             "label": None,
             "tool_name": None,
@@ -990,7 +977,9 @@ def test_successful_canonical_polling_has_fifteen_second_floor(monkeypatch) -> N
     assert sleeps == [15.0]
 
 
-def test_canonical_stream_identity_reconstructs_topic_from_latest_turn_exchange_id() -> None:
+def test_canonical_stream_identity_reconstructs_topic_from_latest_turn_exchange_id() -> (
+    None
+):
     payload = {
         "current_node": "assistant-new",
         "mapping": {
@@ -1171,34 +1160,43 @@ def test_topic_stream_normalizer_does_not_rewind_seeded_answer_during_catchup() 
         answer_text="Hello world",
     )
 
-    assert normalizer.feed_transport_event(
-        {
-            "type": "stream_handoff_ws_subscribed",
-            "catchup_count": 2,
-        }
-    ) == []
-    assert normalizer.feed_transport_event(
-        {
-            "type": "raw_ws_event",
-            "parsed": {
-                "v": {
-                    "message": {
-                        "id": "assistant-1",
-                        "author": {"role": "assistant"},
-                        "recipient": "all",
-                        "content": {"content_type": "text", "parts": ["Hello"]},
-                        "metadata": {"turn_exchange_id": "turn-1"},
+    assert (
+        normalizer.feed_transport_event(
+            {
+                "type": "stream_handoff_ws_subscribed",
+                "catchup_count": 2,
+            }
+        )
+        == []
+    )
+    assert (
+        normalizer.feed_transport_event(
+            {
+                "type": "raw_ws_event",
+                "parsed": {
+                    "v": {
+                        "message": {
+                            "id": "assistant-1",
+                            "author": {"role": "assistant"},
+                            "recipient": "all",
+                            "content": {"content_type": "text", "parts": ["Hello"]},
+                            "metadata": {"turn_exchange_id": "turn-1"},
+                        }
                     }
-                }
-            },
-        }
-    ) == []
-    assert normalizer.feed_transport_event(
-        {
-            "type": "raw_ws_event",
-            "parsed": {"p": "/message/content/parts/0", "v": " world"},
-        }
-    ) == []
+                },
+            }
+        )
+        == []
+    )
+    assert (
+        normalizer.feed_transport_event(
+            {
+                "type": "raw_ws_event",
+                "parsed": {"p": "/message/content/parts/0", "v": " world"},
+            }
+        )
+        == []
+    )
     assert normalizer.feed_transport_event(
         {
             "type": "raw_ws_event",
@@ -1226,7 +1224,10 @@ def test_topic_stream_normalizer_flushes_completed_thinking_before_tool() -> Non
                         "id": "thinking-1",
                         "author": {"role": "assistant"},
                         "recipient": "all",
-                        "content": {"content_type": "text", "parts": ["Inspecting state"]},
+                        "content": {
+                            "content_type": "text",
+                            "parts": ["Inspecting state"],
+                        },
                         "metadata": {
                             "is_thinking_preamble_message": True,
                             "turn_exchange_id": "turn-1",
@@ -1255,11 +1256,16 @@ def test_topic_stream_normalizer_flushes_completed_thinking_before_tool() -> Non
     )
 
     assert thinking == []
-    assert [event["message_kind"] for event in tool] == ["assistant_progress", "tool_call"]
+    assert [event["message_kind"] for event in tool] == [
+        "assistant_progress",
+        "tool_call",
+    ]
     assert tool[0]["text"] == "Inspecting state"
 
 
-def test_topic_stream_normalizer_emits_public_thought_summary_without_reasoning_title() -> None:
+def test_topic_stream_normalizer_emits_public_thought_summary_without_reasoning_title() -> (
+    None
+):
     normalizer = CanonicalTopicStreamNormalizer()
 
     events = normalizer.feed_transport_event(
@@ -1306,41 +1312,47 @@ def test_topic_stream_normalizer_emits_public_thought_summary_without_reasoning_
 def test_topic_stream_normalizer_reconstructs_public_thought_summary_patches() -> None:
     normalizer = CanonicalTopicStreamNormalizer()
 
-    assert normalizer.feed_transport_event(
-        {
-            "type": "raw_ws_event",
-            "parsed": {
-                "v": {
-                    "message": {
-                        "id": "thought-1",
-                        "author": {"role": "assistant"},
-                        "recipient": "all",
-                        "status": "in_progress",
-                        "content": {
-                            "content_type": "thoughts",
-                            "thoughts": [
-                                {
-                                    "summary": "Inspect",
-                                    "content": "private hidden reasoning",
-                                    "finished": False,
-                                }
-                            ],
-                        },
-                        "metadata": {"turn_exchange_id": "turn-1"},
+    assert (
+        normalizer.feed_transport_event(
+            {
+                "type": "raw_ws_event",
+                "parsed": {
+                    "v": {
+                        "message": {
+                            "id": "thought-1",
+                            "author": {"role": "assistant"},
+                            "recipient": "all",
+                            "status": "in_progress",
+                            "content": {
+                                "content_type": "thoughts",
+                                "thoughts": [
+                                    {
+                                        "summary": "Inspect",
+                                        "content": "private hidden reasoning",
+                                        "finished": False,
+                                    }
+                                ],
+                            },
+                            "metadata": {"turn_exchange_id": "turn-1"},
+                        }
                     }
-                }
-            },
-        }
-    ) == []
-    assert normalizer.feed_transport_event(
-        {
-            "type": "raw_ws_event",
-            "parsed": {
-                "p": "/message/content/thoughts/0/summary",
-                "v": "ing state",
-            },
-        }
-    ) == []
+                },
+            }
+        )
+        == []
+    )
+    assert (
+        normalizer.feed_transport_event(
+            {
+                "type": "raw_ws_event",
+                "parsed": {
+                    "p": "/message/content/thoughts/0/summary",
+                    "v": "ing state",
+                },
+            }
+        )
+        == []
+    )
     events = normalizer.feed_transport_event(
         {
             "type": "raw_ws_event",
@@ -1359,6 +1371,83 @@ def test_topic_stream_normalizer_reconstructs_public_thought_summary_patches() -
         }
     ]
     assert "private" not in repr(events)
+
+
+def test_topic_stream_normalizer_completes_only_done_after_answer_segment() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+
+    normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "thinking-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["Checking"]},
+                        "metadata": {"is_thinking_preamble_message": True},
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+    assert normalizer.feed_transport_event({"type": "raw_ws_done"}) == []
+    assert normalizer.turn_completed is False
+
+    normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "tool-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "web.run",
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["{}"]},
+                        "metadata": {},
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+    assert normalizer.feed_transport_event({"type": "raw_ws_done"}) == []
+    assert normalizer.turn_completed is False
+
+    events = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "answer-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "status": "in_progress",
+                        "content": {"content_type": "text", "parts": ["FINAL"]},
+                        "metadata": {},
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+    assert events == [
+        {
+            "type": "assistant_text_delta",
+            "message_id": "answer-1",
+            "sequence": 1,
+            "delta": "FINAL",
+        }
+    ]
+    assert normalizer.turn_completed is False
+
+    assert normalizer.feed_transport_event({"type": "raw_ws_done"}) == []
+    assert normalizer.turn_completed is True
 
 
 def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitive_fields() -> (
@@ -1500,7 +1589,9 @@ def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitiv
     assert "m-final" not in emitted
 
 
-def test_canonical_intermediate_events_emit_public_thought_summary_without_title() -> None:
+def test_canonical_intermediate_events_emit_public_thought_summary_without_title() -> (
+    None
+):
     payload = {
         "conversation_id": "conversation-1",
         "current_node": "final",

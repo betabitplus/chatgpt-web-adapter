@@ -47,7 +47,13 @@ from .product_transport import (
 from .product_transport import ProductRuntimeHealth as ProductRuntimeHealth
 from .product_ui_liveness import BrowserUILivenessObservation
 from .status import get_status
-from .types import ChatResponse, ConversationRef, MediaItem
+from .types import (
+    ChatMessage,
+    ChatResponse,
+    ConversationRef,
+    ConversationStatus,
+    MediaItem,
+)
 
 ProductConversationModeUnavailableError = _core.ProductConversationModeUnavailableError
 ProductRichInputUnavailableError = _core.ProductRichInputUnavailableError
@@ -324,6 +330,84 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             "canonical_cache_stale": canonical_cache_age_seconds is not None,
             "canonical_cache_age_seconds": canonical_cache_age_seconds,
             "active_stream_registry": active_stream is not None,
+        }
+
+    @staticmethod
+    def _follow_snapshot_from_stream_terminal(
+        normalizer: CanonicalTopicStreamNormalizer,
+        *,
+        topic_id: str,
+        follow_result: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        result = follow_result if isinstance(follow_result, dict) else {}
+        message_id = normalizer.answer_message_id
+        if not message_id:
+            candidate = result.get("message_id")
+            if isinstance(candidate, str) and candidate.strip():
+                message_id = candidate.strip()
+        finish_reason = result.get("finish_reason")
+        if not isinstance(finish_reason, str) or not finish_reason.strip():
+            finish_reason = "stop"
+        else:
+            finish_reason = finish_reason.strip()
+        model = result.get("observed_model")
+        if not isinstance(model, str) or not model.strip():
+            model = None
+        else:
+            model = model.strip()
+        turn_exchange_id = result.get("turn_exchange_id")
+        if not isinstance(turn_exchange_id, str) or not turn_exchange_id.strip():
+            turn_exchange_id = None
+        else:
+            turn_exchange_id = turn_exchange_id.strip()
+
+        status = ConversationStatus(
+            status="completed",
+            node_id=message_id,
+            message_id=message_id,
+            role="assistant",
+            recipient="all",
+            finish_reason=finish_reason,
+            metadata_preview={
+                "finish_details": {"type": finish_reason},
+                "model_slug": model,
+                "turn_exchange_id": turn_exchange_id,
+            },
+        )
+        messages = []
+        if message_id:
+            messages.append(
+                ChatMessage(
+                    node_id=message_id,
+                    message_id=message_id,
+                    role="assistant",
+                    text=normalizer.answer_text,
+                    recipient="all",
+                    model=model,
+                    finish_reason=finish_reason,
+                    metadata_preview={
+                        "finish_details": {"type": finish_reason},
+                        "model_slug": model,
+                        "turn_exchange_id": turn_exchange_id,
+                    },
+                )
+            )
+        return {
+            "status": status,
+            "messages": messages,
+            "events": [],
+            "emitted_message_ids": sorted(normalizer.emitted_message_ids),
+            "current_turn_event_ids": [],
+            "stream_topic_id": topic_id,
+            "turn_exchange_id": turn_exchange_id,
+            "stream_answer_message_id": message_id,
+            "stream_answer_text": normalizer.answer_text,
+            "canonical_cache_stale": False,
+            "canonical_cache_age_seconds": None,
+            "active_stream_registry": False,
+            "stream_completed": True,
+            "shared_final_cache": False,
+            "stream_terminal_snapshot": True,
         }
 
     def conversation_follow_snapshot(
@@ -679,7 +763,7 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             candidate = shared_final_reader(
                 ref.conversation_id,
                 topic_id=actual_topic_id,
-                timeout=15.0,
+                timeout=0.0,
             )
             if isinstance(candidate, dict):
                 shared_final_payload = candidate
@@ -692,16 +776,15 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                 limit=limit,
             )
             final_snapshot["shared_final_cache"] = True
-        else:
-            final_snapshot = self.conversation_follow_snapshot(
-                ref,
-                emitted_message_ids=tuple(normalizer.emitted_message_ids),
-                limit=limit,
-            )
-            final_snapshot["shared_final_cache"] = False
-        final_snapshot["stream_completed"] = True
-        final_snapshot["stream_topic_id"] = actual_topic_id
-        return final_snapshot
+            final_snapshot["stream_completed"] = True
+            final_snapshot["stream_topic_id"] = actual_topic_id
+            return final_snapshot
+
+        return self._follow_snapshot_from_stream_terminal(
+            normalizer,
+            topic_id=actual_topic_id,
+            follow_result=follow_result if isinstance(follow_result, dict) else None,
+        )
 
     def get_conversation_payload(self, conversation: Any) -> dict[str, Any]:
         helper = getattr(self.canonical, "get_conversation_payload", None)

@@ -56,6 +56,10 @@ class BrowserNativeTurnResult:
     phase_b_transport: str | None = None
     phase_b_fallback_reason: str | None = None
     phase_b_elapsed_ms: int | None = None
+    stream_finality_proven: bool = False
+    stream_message_id: str | None = None
+    stream_finish_reason: str | None = None
+    stream_model_slug: str | None = None
 
 
 @dataclass(frozen=True)

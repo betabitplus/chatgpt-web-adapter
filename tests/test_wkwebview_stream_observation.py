@@ -204,6 +204,20 @@ console.log(JSON.stringify({{
     assert json.loads(completed.stdout) == {"done": True, "ended": True}
 
 
+def test_native_stream_handoff_does_not_wait_for_resume_token() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "chatgpt_web_adapter"
+        / "wkwebview_helper"
+        / "WKChatGPTAuthority.m"
+    ).read_text(encoding="utf-8")
+    assert "BOOL topicHandoffFence = responseOK" in source
+    assert "terminalCompletionFence || topicHandoffFence" in source
+    assert "&& delegate.streamTopicId.length == 0" in source
+    assert '@"TOPIC_HANDOFF_FENCE"' in source
+
+
 def test_native_stream_bridge_forwards_done_as_raw_ws_done() -> None:
     source = (
         Path(__file__).resolve().parents[1]

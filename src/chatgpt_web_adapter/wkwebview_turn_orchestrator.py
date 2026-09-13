@@ -328,7 +328,18 @@ class WKTurnOrchestrator:
         if conversation is not None:
             conversation_id = ConversationRef.from_any(conversation).conversation_id
             provider.clear_stop_requested_for(conversation_id)
-            baseline_current_node = provider._cached_current_node(conversation_id)
+            prewrite_peeker = getattr(provider, "peek_prewrite_payload", None)
+            if callable(prewrite_peeker):
+                candidate = prewrite_peeker(conversation_id)
+                if isinstance(candidate, dict):
+                    prewrite_payload = candidate
+            if isinstance(prewrite_payload, dict):
+                value = prewrite_payload.get("current_node")
+                baseline_current_node = (
+                    value if isinstance(value, str) and value else None
+                )
+            else:
+                baseline_current_node = provider._cached_current_node(conversation_id)
             if baseline_current_node is None:
                 prewrite_payload = provider.read_conversation_payload(
                     conversation_id,
@@ -661,6 +672,9 @@ class WKTurnOrchestrator:
             return passive_observer_armed
 
         resume_value = payload.pop("stream_resume_value", None)
+        direct_topic_id = payload.get("stream_topic_id")
+        direct_turn_exchange_id = payload.get("turn_exchange_id")
+        direct_stream_conversation_id = payload.get("stream_conversation_id")
         if payload.get("_cwa_identity_recovered") is True:
             recovery_kind = payload.get("_cwa_identity_recovery_kind")
             record_phase_b(
@@ -675,31 +689,62 @@ class WKTurnOrchestrator:
         if phase_one_completed:
             record_phase_b("phase_one_terminal")
             return passive_observer_armed
-        if not isinstance(resume_value, str) or not resume_value:
+        direct_topic_available = (
+            provider._lightweight_path_enabled()
+            and isinstance(direct_topic_id, str)
+            and bool(direct_topic_id.strip())
+            and (
+                not isinstance(direct_stream_conversation_id, str)
+                or not direct_stream_conversation_id.strip()
+                or direct_stream_conversation_id.strip() == result_conversation_id
+            )
+        )
+        resume_value_available = isinstance(resume_value, str) and bool(resume_value)
+        if not direct_topic_available and not resume_value_available:
             record_phase_b(
                 "passive_canonical_observer",
-                "WKWEBVIEW_RESUME_VALUE_MISSING",
+                "WKWEBVIEW_STREAM_HANDOFF_MISSING",
             )
             return True
 
         remaining = max(1.0, total_timeout - (time.monotonic() - started))
         phase_b_transport = (
-            "curl_cffi_websocket"
+            (
+                "curl_cffi_websocket_topic_handoff"
+                if direct_topic_available
+                else "curl_cffi_websocket"
+            )
             if provider._lightweight_path_enabled()
             else "wkwebview_direct_resume"
         )
         try:
             if provider._lightweight_path_enabled():
-                resume_payload = provider._resume_via_curl_ws_second_leg(
-                    conversation_id=result_conversation_id,
-                    resume_value=resume_value,
-                    timeout=remaining,
-                    relay_text_event=make_stream_relay(),
-                    on_transport_event=on_transport_event,
-                    stream_should_stop=stream_should_stop,
-                    text=text,
-                    baseline_current_node=prepared.baseline_current_node,
-                )
+                if direct_topic_available:
+                    resume_payload = provider._resume_via_curl_ws_topic_second_leg(
+                        conversation_id=result_conversation_id,
+                        topic_id=direct_topic_id.strip(),
+                        turn_exchange_id=(
+                            direct_turn_exchange_id.strip()
+                            if isinstance(direct_turn_exchange_id, str)
+                            and direct_turn_exchange_id.strip()
+                            else None
+                        ),
+                        timeout=remaining,
+                        relay_text_event=make_stream_relay(),
+                        on_transport_event=on_transport_event,
+                        stream_should_stop=stream_should_stop,
+                    )
+                else:
+                    resume_payload = provider._resume_via_curl_ws_second_leg(
+                        conversation_id=result_conversation_id,
+                        resume_value=resume_value,
+                        timeout=remaining,
+                        relay_text_event=make_stream_relay(),
+                        on_transport_event=on_transport_event,
+                        stream_should_stop=stream_should_stop,
+                        text=text,
+                        baseline_current_node=prepared.baseline_current_node,
+                    )
             else:
                 resume_payload = provider._resume_via_direct_wk(
                     conversation_id=result_conversation_id,
@@ -707,6 +752,53 @@ class WKTurnOrchestrator:
                     timeout=remaining,
                     on_text_event=make_stream_relay(),
                 )
+            stream_message_id = resume_payload.get("message_id")
+            stream_finish_reason = resume_payload.get("finish_reason")
+            stream_model_slug = resume_payload.get("observed_model")
+            stream_finality_proven = (
+                resume_payload.get("stream_finality_proven") is True
+            )
+            if stream_finality_proven:
+                payload["_cwa_stream_finality_proven"] = True
+                if isinstance(stream_message_id, str) and stream_message_id.strip():
+                    payload["_cwa_stream_message_id"] = stream_message_id.strip()
+                if (
+                    isinstance(stream_finish_reason, str)
+                    and stream_finish_reason.strip()
+                ):
+                    payload["_cwa_stream_finish_reason"] = stream_finish_reason.strip()
+                if isinstance(stream_model_slug, str) and stream_model_slug.strip():
+                    payload["_cwa_stream_model_slug"] = stream_model_slug.strip()
+
+            segment_done_count = resume_payload.get("segment_done_count")
+            stream_completed = stream_finality_proven or (
+                isinstance(segment_done_count, int)
+                and not isinstance(segment_done_count, bool)
+                and segment_done_count > 0
+            )
+            if (
+                isinstance(stream_message_id, str)
+                and stream_message_id.strip()
+                and stream_completed
+                and resume_payload.get("stop_requested") is not True
+            ):
+                observed_model = resume_payload.get("observed_model")
+                observed_effort = resume_payload.get("observed_reasoning_effort")
+                provider.cache_continuation_cursor(
+                    result_conversation_id,
+                    message_id=stream_message_id.strip(),
+                    model_slug=(
+                        observed_model.strip()
+                        if isinstance(observed_model, str) and observed_model.strip()
+                        else prepared.minimal_model_slug
+                    ),
+                    thinking_effort=(
+                        observed_effort.strip()
+                        if isinstance(observed_effort, str) and observed_effort.strip()
+                        else prepared.minimal_thinking_effort
+                    ),
+                )
+
             encoded_final = resume_payload.get("canonical_body_base64")
             if isinstance(encoded_final, str) and encoded_final:
                 final_payload = provider._decode_helper_json(
@@ -820,6 +912,22 @@ class WKTurnOrchestrator:
             phase_b_elapsed_ms=(
                 payload.get("_cwa_phase_b_elapsed_ms")
                 if isinstance(payload.get("_cwa_phase_b_elapsed_ms"), int)
+                else None
+            ),
+            stream_finality_proven=payload.get("_cwa_stream_finality_proven") is True,
+            stream_message_id=(
+                payload.get("_cwa_stream_message_id")
+                if isinstance(payload.get("_cwa_stream_message_id"), str)
+                else None
+            ),
+            stream_finish_reason=(
+                payload.get("_cwa_stream_finish_reason")
+                if isinstance(payload.get("_cwa_stream_finish_reason"), str)
+                else None
+            ),
+            stream_model_slug=(
+                payload.get("_cwa_stream_model_slug")
+                if isinstance(payload.get("_cwa_stream_model_slug"), str)
                 else None
             ),
         )

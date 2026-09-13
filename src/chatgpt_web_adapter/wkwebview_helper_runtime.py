@@ -397,10 +397,19 @@ class WKWebViewHelperRuntime:
                 handoff_payload = None
             if isinstance(handoff_payload, dict):
                 resume_value = handoff_payload.get("r")
+                stream_topic_id = handoff_payload.get("p")
+                turn_exchange_id = handoff_payload.get("x")
+                stream_conversation_id = handoff_payload.get("i")
                 stop_conduit_token = handoff_payload.get("c")
                 turn_trace_id = handoff_payload.get("t")
                 if isinstance(resume_value, str) and resume_value:
                     payload["stream_resume_value"] = resume_value
+                if isinstance(stream_topic_id, str) and stream_topic_id:
+                    payload["stream_topic_id"] = stream_topic_id
+                if isinstance(turn_exchange_id, str) and turn_exchange_id:
+                    payload["turn_exchange_id"] = turn_exchange_id
+                if isinstance(stream_conversation_id, str) and stream_conversation_id:
+                    payload["stream_conversation_id"] = stream_conversation_id
                 if isinstance(stop_conduit_token, str) and stop_conduit_token:
                     payload["_cwa_stop_conduit_token"] = stop_conduit_token
                 if isinstance(turn_trace_id, str) and turn_trace_id:

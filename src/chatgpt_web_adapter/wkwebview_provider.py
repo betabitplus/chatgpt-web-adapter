@@ -543,6 +543,29 @@ class WKWebViewTurnProvider:
             # Cache persistence is best-effort and never changes canonical authority.
             return
 
+    def peek_prewrite_payload(
+        self,
+        conversation_id: str,
+    ) -> dict[str, Any] | None:
+        ref = ConversationRef(conversation_id)
+        return self._canonical_state.prewrite_payload_from_cursor(ref.conversation_id)
+
+    def cache_continuation_cursor(
+        self,
+        conversation_id: str,
+        *,
+        message_id: str,
+        model_slug: str | None = None,
+        thinking_effort: str | None = None,
+    ) -> None:
+        ref = ConversationRef(conversation_id)
+        self._canonical_state.cache_continuation_cursor(
+            ref.conversation_id,
+            message_id=message_id,
+            model_slug=model_slug,
+            thinking_effort=thinking_effort,
+        )
+
     def read_cached_conversation_payload(
         self,
         conversation_id: str,
@@ -728,6 +751,59 @@ class WKWebViewTurnProvider:
                     topic_id=active_topic_id,
                 )
 
+    def _resume_via_curl_ws_topic_second_leg(
+        self,
+        *,
+        conversation_id: str,
+        topic_id: str,
+        turn_exchange_id: str | None,
+        timeout: float,
+        relay_text_event: Any,
+        on_transport_event: Any = None,
+        stream_should_stop: Any = None,
+    ) -> dict[str, Any]:
+        transport = self._lightweight_transport
+        if transport is None:
+            raise RequestError(
+                "WKWEBVIEW_CURL_WS_SOURCE_CLIENT_MISSING",
+                request_stage="wkwebview_curl_ws_second_leg",
+            )
+        normalized_topic = topic_id.strip()
+        self._register_active_stream(
+            conversation_id,
+            normalized_topic,
+            turn_exchange_id=turn_exchange_id,
+        )
+        text_sequence = 0
+
+        def relay_token(token: str) -> None:
+            nonlocal text_sequence
+            if not isinstance(token, str) or not token:
+                return
+            text_sequence += 1
+            relay_text_event(
+                {
+                    "type": "assistant_text_delta",
+                    "sequence": text_sequence,
+                    "delta": token,
+                }
+            )
+
+        try:
+            return transport.follow_topic(
+                conversation_id=conversation_id,
+                topic_id=normalized_topic,
+                timeout=timeout,
+                on_event=on_transport_event,
+                on_token=None if callable(on_transport_event) else relay_token,
+                should_stop=stream_should_stop,
+            )
+        finally:
+            self._clear_active_stream(
+                conversation_id,
+                topic_id=normalized_topic,
+            )
+
     @staticmethod
     def _decode_helper_json(
         payload: dict[str, Any],
@@ -789,6 +865,8 @@ class WKWebViewTurnProvider:
         if not normalized_topic:
             return None
         deadline = time.monotonic() + max(0.0, float(timeout))
+        inactive_since: float | None = None
+        inactive_grace_seconds = min(2.0, max(0.0, float(timeout)))
         while True:
             if should_stop is not None:
                 try:
@@ -809,9 +887,15 @@ class WKWebViewTurnProvider:
                         return payload
 
             active = self.active_stream_info(conversation_id)
+            now = time.monotonic()
             if active is None or active.get("topic_id") != normalized_topic:
-                return None
-            if time.monotonic() >= deadline:
+                if inactive_since is None:
+                    inactive_since = now
+                if now - inactive_since >= inactive_grace_seconds:
+                    return None
+            else:
+                inactive_since = None
+            if now >= deadline:
                 return None
             time.sleep(0.05)
 
@@ -954,9 +1038,12 @@ class WKWebViewTurnProvider:
             ref.conversation_id,
             timeout=total_timeout,
         )
-        self._canonical_state.set_current_node(
-            ref.conversation_id, parsed.get("current_node")
-        )
+        if self._canonical_state.payload_is_final(parsed):
+            self._canonical_state.cache_final_payload(ref.conversation_id, parsed)
+        else:
+            self._canonical_state.set_current_node(
+                ref.conversation_id, parsed.get("current_node")
+            )
         self._persist_canonical_payload(ref.conversation_id, parsed)
         return parsed
 

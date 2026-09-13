@@ -193,6 +193,81 @@ def test_client_returns_canonical_readback_not_native_body() -> None:
     assert provider.normal_calls == [("hello", "existing-conversation", 2)]
 
 
+def test_stream_terminal_finality_skips_canonical_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Provider(FakeProvider):
+        revision_safe_streaming_supported = True
+
+        def send_text_streaming(
+            self,
+            text,
+            *,
+            conversation=None,
+            timeout=None,
+            on_text_event,
+            on_transport_event,
+            stream_should_stop,
+        ):
+            on_text_event(
+                {
+                    "type": "assistant_text_snapshot",
+                    "sequence": 1,
+                    "message_id": "assistant-stream",
+                    "text": "stream final",
+                }
+            )
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-stream",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=100,
+                stream_finality_proven=True,
+                stream_message_id="assistant-stream",
+                stream_finish_reason="stop",
+                stream_model_slug="gpt-5-6-thinking",
+            )
+
+    provider = Provider()
+    client = _client(provider)
+
+    def fail_canonical(*_args, **_kwargs):
+        raise AssertionError("terminal WS finality must not poll canonical readback")
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._wait_for_new_final_assistant",
+        fail_canonical,
+    )
+
+    def fail_attach(_conversation):
+        raise AssertionError("terminal WS finality must not attach/read conversation")
+
+    client.attach_conversation = fail_attach
+
+    delivered: list[dict] = []
+    submission = submit_browser_native(
+        client,
+        "hello",
+        conversation="existing-conversation",
+        timeout=2,
+        poll_interval=0.01,
+        on_event=delivered.append,
+    )
+    response = await_browser_native_final(client, submission)
+
+    assert response.text == "stream final"
+    assert response.conversation.conversation_id == "conversation-1"
+    assert response.conversation.message_id == "assistant-stream"
+    assert response.conversation.parent_message_id == "assistant-stream"
+    assert response.conversation.finish_reason == "stop"
+    assert response.request.observed_model == "gpt-5-6-thinking"
+    assert response.request.turn_exchange_id == "turn-stream"
+
+
 def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

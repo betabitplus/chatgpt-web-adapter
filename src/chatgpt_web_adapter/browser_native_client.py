@@ -1765,6 +1765,18 @@ def await_browser_native_final(
     passive_message_id: str | None = None
     passive_stream_ended_without_terminal = False
     incomplete_without_terminal = False
+    stream_message_id = getattr(turn, "stream_message_id", None)
+    if not isinstance(stream_message_id, str) or not stream_message_id.strip():
+        stream_message_id = submission.stream_state.message_id
+    stream_finish_reason = getattr(turn, "stream_finish_reason", None)
+    stream_model_slug = getattr(turn, "stream_model_slug", None)
+    stream_finality_proven = (
+        bool(getattr(turn, "stream_finality_proven", False))
+        and submission.stream_state.observation_count > 0
+        and not submission.stream_state.delivery_incomplete
+        and isinstance(stream_message_id, str)
+        and bool(stream_message_id.strip())
+    )
     passive_emitted_message_ids = set(submission.baseline_message_ids)
     # A provider may deliver the first part of a turn from the write response
     # itself and then hand finality/continuation to the passive canonical
@@ -1776,7 +1788,8 @@ def await_browser_native_final(
     passive_text_snapshot = submission.stream_state.text
 
     if (
-        bool(getattr(turn, "passive_observer_armed", False))
+        not stream_finality_proven
+        and bool(getattr(turn, "passive_observer_armed", False))
         and callable(observe_turn)
         and isinstance(authority_lease_id, str)
         and authority_lease_id
@@ -1923,45 +1936,67 @@ def await_browser_native_final(
 
     passive_stopped = passive_finish_reason == "stopped"
     stopped_by_user = passive_stopped or provider_stop_requested()
-    readback_timeout = min(remaining, 1.0) if stopped_by_user else remaining
-    try:
-        final_message, canonical_payload, canonical_payload_read_count = (
-            _wait_for_new_final_assistant(
-                self,
-                turn.conversation_id,
-                baseline_assistant_ids=submission.baseline_assistant_ids,
-                baseline_message_ids=submission.baseline_message_ids,
-                timeout=readback_timeout,
-                interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS
-                if passive_observer_used
-                else submission.poll_interval,
-                include_readback=True,
-                turn_exchange_id=observed_turn_exchange_id,
-                retry_400_until_timeout=retry_400_until_timeout,
-                on_event=None if passive_observer_used else submission.on_event,
-                submission_id=submission.submission_id,
-                minimum_poll_interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS
-                if passive_observer_used
-                else None,
-                allow_unfinished=stopped_by_user,
-                stop_requested=None if passive_stopped else provider_stop_requested,
-            )
-        )
-    except ConversationTimeoutError:
-        stopped_by_user = stopped_by_user or provider_stop_requested()
-        if not stopped_by_user and not passive_stream_ended_without_terminal:
-            raise
-        incomplete_without_terminal = (
-            passive_stream_ended_without_terminal and not stopped_by_user
-        )
+    if stream_finality_proven:
         final_message = ChatMessage(
-            message_id=passive_message_id,
+            node_id=stream_message_id,
+            message_id=stream_message_id,
             role="assistant",
-            text="",
-            finish_reason="stopped" if stopped_by_user else "incomplete",
+            text=submission.stream_state.text,
+            recipient="all",
+            model=(
+                stream_model_slug
+                if isinstance(stream_model_slug, str) and stream_model_slug.strip()
+                else None
+            ),
+            finish_reason=(
+                stream_finish_reason
+                if isinstance(stream_finish_reason, str)
+                and stream_finish_reason.strip()
+                else "stop"
+            ),
         )
         canonical_payload = None
-        canonical_payload_read_count = None
+        canonical_payload_read_count = 0
+    else:
+        readback_timeout = min(remaining, 1.0) if stopped_by_user else remaining
+        try:
+            final_message, canonical_payload, canonical_payload_read_count = (
+                _wait_for_new_final_assistant(
+                    self,
+                    turn.conversation_id,
+                    baseline_assistant_ids=submission.baseline_assistant_ids,
+                    baseline_message_ids=submission.baseline_message_ids,
+                    timeout=readback_timeout,
+                    interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS
+                    if passive_observer_used
+                    else submission.poll_interval,
+                    include_readback=True,
+                    turn_exchange_id=observed_turn_exchange_id,
+                    retry_400_until_timeout=retry_400_until_timeout,
+                    on_event=None if passive_observer_used else submission.on_event,
+                    submission_id=submission.submission_id,
+                    minimum_poll_interval=_PASSIVE_FINAL_RECONCILE_RETRY_SECONDS
+                    if passive_observer_used
+                    else None,
+                    allow_unfinished=stopped_by_user,
+                    stop_requested=None if passive_stopped else provider_stop_requested,
+                )
+            )
+        except ConversationTimeoutError:
+            stopped_by_user = stopped_by_user or provider_stop_requested()
+            if not stopped_by_user and not passive_stream_ended_without_terminal:
+                raise
+            incomplete_without_terminal = (
+                passive_stream_ended_without_terminal and not stopped_by_user
+            )
+            final_message = ChatMessage(
+                message_id=passive_message_id,
+                role="assistant",
+                text="",
+                finish_reason="stopped" if stopped_by_user else "incomplete",
+            )
+            canonical_payload = None
+            canonical_payload_read_count = None
 
     stopped_by_user = stopped_by_user or provider_stop_requested()
     result_finish_reason = "stopped" if stopped_by_user else final_message.finish_reason
@@ -1978,7 +2013,7 @@ def await_browser_native_final(
             canonical_payload,
             conversation=result_conversation,
         )
-    elif stopped_by_user or incomplete_without_terminal:
+    elif stream_finality_proven or stopped_by_user or incomplete_without_terminal:
         result_conversation = ChatConversation(
             conversation_id=turn.conversation_id,
             message_id=final_message.message_id,

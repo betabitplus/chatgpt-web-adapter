@@ -454,7 +454,9 @@ def test_runtime_follow_snapshot_reuses_one_canonical_payload(monkeypatch) -> No
     assert result["current_turn_event_ids"] == ["m2"]
 
 
-def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -> None:
+def test_runtime_topic_follow_streams_events_then_finalizes_from_terminal(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(
         "chatgpt_web_adapter.browser_native_client._PASSIVE_TERMINAL_SETTLE_SECONDS",
         0.0,
@@ -550,13 +552,13 @@ def test_runtime_topic_follow_streams_events_then_reconciles_once(monkeypatch) -
     assert events[1]["type"] == "assistant_text_delta"
     assert events[1]["message_id"] == "assistant-final"
     assert events[1]["delta"] == "done"
-    assert len(final_calls) == 1
-    final_ref, final_ids, final_limit = final_calls[0]
-    assert getattr(final_ref, "conversation_id", None) == "conversation-1"
-    assert final_ids == ("tool-1",)
-    assert final_limit == 64
+    assert final_calls == []
     assert result["stream_completed"] is True
     assert result["stream_topic_id"] == "conversation-turn-turn-1"
+    assert result["stream_terminal_snapshot"] is True
+    assert result["status"].status == "completed"
+    assert result["messages"][0].message_id == "assistant-final"
+    assert result["messages"][0].text == "done"
 
 
 def test_runtime_pending_topic_relays_local_canonical_cache_without_network(
@@ -756,6 +758,73 @@ def test_runtime_topic_follow_uses_shared_final_without_canonical_read(
     assert result["stream_completed"] is True
     assert result["shared_final_cache"] is True
     assert result["status"].status == "completed"
+
+
+def test_runtime_topic_follow_terminal_stream_skips_canonical_read_without_shared_final(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._PASSIVE_TERMINAL_SETTLE_SECONDS",
+        0.0,
+    )
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    topic_id = "conversation-turn-turn-terminal"
+    final_message = {
+        "id": "assistant-terminal",
+        "author": {"role": "assistant"},
+        "recipient": "all",
+        "status": "finished_successfully",
+        "end_turn": True,
+        "content": {"content_type": "text", "parts": ["done"]},
+        "metadata": {
+            "turn_exchange_id": "turn-terminal",
+            "finish_details": {"type": "stop"},
+            "model_slug": "gpt-5-6-thinking",
+        },
+    }
+
+    def follow_stream_topic(*, on_event, should_stop, **_kwargs):
+        on_event(
+            {
+                "type": "raw_ws_event",
+                "parsed": {"v": {"message": final_message}},
+            }
+        )
+        assert should_stop() is True
+        return {
+            "topic_id": topic_id,
+            "message_id": "assistant-terminal",
+            "turn_exchange_id": "turn-terminal",
+            "finish_reason": "stop",
+            "observed_model": "gpt-5-6-thinking",
+            "stream_finality_proven": True,
+        }
+
+    provider.follow_stream_topic = follow_stream_topic
+    provider.wait_for_shared_final_payload = lambda *args, **kwargs: None
+    monkeypatch.setattr(
+        runtime,
+        "conversation_follow_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("terminal stream must not require canonical snapshot")
+        ),
+    )
+
+    result = runtime.conversation_follow_stream(
+        "conversation-1",
+        topic_id=topic_id,
+        on_event=lambda _event: None,
+    )
+
+    assert result["stream_completed"] is True
+    assert result["stream_terminal_snapshot"] is True
+    assert result["shared_final_cache"] is False
+    assert result["status"].status == "completed"
+    assert result["status"].message_id == "assistant-terminal"
+    assert result["messages"][0].message_id == "assistant-terminal"
+    assert result["messages"][0].text == "done"
+    assert result["stream_answer_text"] == "done"
 
 
 def test_runtime_topic_follow_recovers_local_stream_failure_from_shared_final(

@@ -642,10 +642,14 @@ class WKLightweightTransport:
                 request_stage="wkwebview_curl_ws_second_leg",
             )
 
-        curl_requests, websocket_url = self._resolve_celsius_websocket_url(timeout=timeout)
+        curl_requests, websocket_url = self._resolve_celsius_websocket_url(
+            timeout=timeout
+        )
 
         raw_sequence = 0
-        raw_live_observer = callable(on_transport_event) and callable(stream_should_stop)
+        raw_live_observer = callable(on_transport_event) and callable(
+            stream_should_stop
+        )
 
         def on_token(value: str) -> None:
             nonlocal raw_sequence
@@ -665,7 +669,9 @@ class WKLightweightTransport:
             relay_text_event(event)
 
         def should_stop() -> bool:
-            if self._stop_requested is not None and self._stop_requested(conversation_id):
+            if self._stop_requested is not None and self._stop_requested(
+                conversation_id
+            ):
                 return True
             if raw_live_observer and stream_should_stop is not None:
                 try:
@@ -720,7 +726,9 @@ class WKLightweightTransport:
                 "WKWEBVIEW_CURL_WS_TOPIC_UNRESOLVED",
                 request_stage="wkwebview_curl_ws_follow",
             )
-        _curl_requests, websocket_url = self._resolve_celsius_websocket_url(timeout=timeout)
+        _curl_requests, websocket_url = self._resolve_celsius_websocket_url(
+            timeout=timeout
+        )
         state: dict[str, Any] = {
             "conversation_id": conversation_id,
             "resume_turn_topic_id": normalized_topic,
@@ -750,14 +758,26 @@ class WKLightweightTransport:
                 "WKWEBVIEW_CURL_WS_SOURCE_CONTRACT_MISSING",
                 request_stage="wkwebview_curl_ws_follow",
             ) from error
+        message_id = state.get("message_id")
+        finish_reason = state.get("finish_reason")
+        stream_finality_proven = (
+            segment_done_count > 0
+            and isinstance(message_id, str)
+            and bool(message_id.strip())
+            and isinstance(finish_reason, str)
+            and bool(finish_reason.strip())
+        )
         return {
             "ok": True,
             "conversation_id": conversation_id,
             "topic_id": normalized_topic,
-            "message_id": state.get("message_id"),
+            "message_id": message_id,
             "turn_exchange_id": state.get("turn_exchange_id"),
-            "finish_reason": state.get("finish_reason"),
-            "completed": False,
+            "finish_reason": finish_reason,
+            "observed_model": state.get("observed_model"),
+            "observed_reasoning_effort": state.get("observed_reasoning_effort"),
+            "stream_finality_proven": stream_finality_proven,
+            "completed": stream_finality_proven,
             "segment_done_count": segment_done_count,
             "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
         }
@@ -821,7 +841,7 @@ class WKLightweightTransport:
         text: str,
         baseline_current_node: str | None,
     ) -> dict[str, Any]:
-        curl_requests, _state, raw_sequence, started = self._stream_resume_topic(
+        curl_requests, state, raw_sequence, started = self._stream_resume_topic(
             conversation_id=conversation_id,
             resume_value=resume_value,
             timeout=timeout,
@@ -829,6 +849,10 @@ class WKLightweightTransport:
             on_transport_event=on_transport_event,
             stream_should_stop=stream_should_stop,
         )
+        message_id = state.get("message_id")
+        finish_reason = state.get("finish_reason")
+        observed_model = state.get("observed_model")
+        observed_effort = state.get("observed_reasoning_effort")
         if self._stop_requested is not None and self._stop_requested(conversation_id):
             return {
                 "ok": True,
@@ -839,7 +863,34 @@ class WKLightweightTransport:
                 "stream_ended": True,
                 "stream_terminal_observed": True,
                 "stop_requested": True,
+                "message_id": message_id,
+                "finish_reason": finish_reason,
+                "observed_model": observed_model,
+                "observed_reasoning_effort": observed_effort,
                 "ws_token_events": raw_sequence,
+            }
+        if (
+            raw_sequence > 0
+            and isinstance(message_id, str)
+            and message_id.strip()
+            and isinstance(finish_reason, str)
+            and finish_reason.strip()
+        ):
+            return {
+                "ok": True,
+                "status": 200,
+                "conversation_id": conversation_id,
+                "canonical_completed": False,
+                "stream_started": True,
+                "stream_ended": True,
+                "stream_terminal_observed": True,
+                "stream_finality_proven": True,
+                "message_id": message_id.strip(),
+                "finish_reason": finish_reason.strip(),
+                "observed_model": observed_model,
+                "observed_reasoning_effort": observed_effort,
+                "ws_token_events": raw_sequence,
+                "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
             }
         deadline = started + max(1.0, float(timeout))
         canonical_url = (

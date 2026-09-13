@@ -302,9 +302,21 @@ def _canonical_commit_snapshot(
     client: Any,
     conversation: Any,
 ) -> tuple[str | None, dict[str, Any] | None, int]:
+    conversation_id = ConversationRef.from_any(conversation).conversation_id
+    prewrite_peeker = getattr(client, "peek_prewrite_canonical_payload", None)
+    if callable(prewrite_peeker):
+        cached_payload = prewrite_peeker(conversation_id)
+        if isinstance(cached_payload, dict):
+            status = _status_from_payload(cached_payload)
+            value = getattr(status, "status", None)
+            return (
+                value if isinstance(value, str) else None,
+                cached_payload,
+                int(time.time() * 1000),
+            )
+
     reader = getattr(client, "_get_conversation_payload", None)
     if callable(reader):
-        conversation_id = ConversationRef.from_any(conversation).conversation_id
         payload = reader(conversation_id)
         if isinstance(payload, dict):
             status = _status_from_payload(payload)

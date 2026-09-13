@@ -312,8 +312,11 @@ completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler {
 
 static NSString *PrivateTurnHandoffJSON(WKAuthorityDelegate *delegate) {
     NSDictionary *payload = @{
-        @"v": @1,
+        @"v": @2,
         @"r": delegate.streamResumeToken ?: @"",
+        @"p": delegate.streamTopicId ?: @"",
+        @"x": delegate.streamTurnExchangeId ?: @"",
+        @"i": delegate.streamConversationId ?: @"",
         @"c": delegate.streamStopConduitToken ?: @"",
         @"t": delegate.streamTurnTraceId ?: @""
     };
@@ -895,7 +898,14 @@ int main(int argc, const char *argv[]) {
                     && minimalConversationId.length > 0
                     && delegate.streamTerminalObserved
                     && delegate.streamConversationId.length > 0;
-                if (terminalCompletionFence) break;
+                BOOL topicHandoffFence = responseOK
+                    && delegate.streamTopicId.length > 0
+                    && delegate.streamConversationId.length > 0
+                    && (
+                        minimalConversationId.length == 0
+                        || [delegate.streamConversationId isEqualToString:minimalConversationId]
+                    );
+                if (terminalCompletionFence || topicHandoffFence) break;
                 if (responseOK && delegate.streamResumeToken.length > 0 && delegate.streamConversationId.length > 0) break;
                 if (identityRecoveryDeadline != nil && [identityRecoveryDeadline timeIntervalSinceNow] <= 0) break;
             }
@@ -905,10 +915,18 @@ int main(int argc, const char *argv[]) {
                 && minimalConversationId.length > 0
                 && delegate.streamTerminalObserved
                 && delegate.streamConversationId.length > 0;
+            BOOL topicHandoffFence = responseOK
+                && delegate.streamTopicId.length > 0
+                && delegate.streamConversationId.length > 0
+                && (
+                    minimalConversationId.length == 0
+                    || [delegate.streamConversationId isEqualToString:minimalConversationId]
+                );
             BOOL resumeFenceObserved = responseOK
                 && delegate.streamResumeToken.length > 0
                 && delegate.streamConversationId.length > 0;
             BOOL identityRecoveryRequired = !terminalCompletionFence
+                && !topicHandoffFence
                 && !resumeFenceObserved
                 && (
                     minimalConversationId.length > 0
@@ -946,18 +964,21 @@ int main(int argc, const char *argv[]) {
                 });
                 return 0;
             }
-            if (!terminalCompletionFence && !resumeFenceObserved) {
+            if (!terminalCompletionFence && !topicHandoffFence && !resumeFenceObserved) {
                 PrintResult(@{
                     @"ok":@NO,
-                    @"error":@"WKWEBVIEW_MINIMAL_SECURITY_RESUME_FENCE_MISSING",
+                    @"error":@"WKWEBVIEW_MINIMAL_SECURITY_STREAM_FENCE_MISSING",
                     @"submit_response_status":@(delegate.submitStatus),
                     @"stream_response_status":@(delegate.streamStatus),
                     @"resume_token_present":@(delegate.streamResumeToken.length > 0),
+                    @"stream_topic_present":@(delegate.streamTopicId.length > 0),
                     @"conversation_id_present":@(delegate.streamConversationId.length > 0)
                 });
                 return 34;
             }
-            NSString *writeCommitProof = resumeFenceObserved ? @"RESUME_FENCE" : @"PHASE_A_TERMINAL";
+            NSString *writeCommitProof = resumeFenceObserved
+                ? @"RESUME_FENCE"
+                : (topicHandoffFence ? @"TOPIC_HANDOFF_FENCE" : @"PHASE_A_TERMINAL");
             BOOL resumeHandoffWritten = NO;
             if (resumeHandoffFD >= 0) {
                 NSString *privateHandoff = PrivateTurnHandoffJSON(delegate);
@@ -1422,11 +1443,13 @@ int main(int argc, const char *argv[]) {
             observeStream
             && streamObserveUntilResumeToken
             && delegate.streamResumeToken.length == 0
+            && delegate.streamTopicId.length == 0
             && !delegate.streamEnded
         ) {
             NSDate *resumeTokenDeadline = deadline;
             while (
                 delegate.streamResumeToken.length == 0
+                && delegate.streamTopicId.length == 0
                 && !delegate.streamEnded
                 && !delegate.streamTerminalObserved
                 && [resumeTokenDeadline timeIntervalSinceNow] > 0
@@ -1449,6 +1472,12 @@ int main(int argc, const char *argv[]) {
             && accepted != nil
             && submitSucceeded
             && delegate.streamResumeToken.length > 0
+            && resumeConversationMatches;
+        BOOL topicHandoffCommitFence = observeStream
+            && streamObserveUntilResumeToken
+            && accepted != nil
+            && submitSucceeded
+            && delegate.streamTopicId.length > 0
             && resumeConversationMatches;
 
         BOOL canonicalCommitted = NO;
@@ -1489,7 +1518,7 @@ int main(int argc, const char *argv[]) {
             }
         }
 
-        BOOL writeCommitProven = canonicalCommitted || resumeCommitFence || streamTerminalCommitFence;
+        BOOL writeCommitProven = canonicalCommitted || resumeCommitFence || topicHandoffCommitFence || streamTerminalCommitFence;
         if (!writeCommitProven) {
             PrintResult(@{
                 @"ok":@NO,
@@ -1525,7 +1554,7 @@ int main(int argc, const char *argv[]) {
         }
 
         BOOL resumeHandoffWritten = NO;
-        if (delegate.streamResumeToken.length > 0 && resumeHandoffFD >= 0) {
+        if ((delegate.streamResumeToken.length > 0 || delegate.streamTopicId.length > 0) && resumeHandoffFD >= 0) {
             NSString *privateHandoff = PrivateTurnHandoffJSON(delegate);
             resumeHandoffWritten = WriteUTF8ToFD(privateHandoff, resumeHandoffFD);
             close(resumeHandoffFD);
@@ -1549,7 +1578,11 @@ int main(int argc, const char *argv[]) {
             @"attachment_count":@(attachments.count),
             @"profile":profile ?: @"",
             @"write_commit_proven":@(writeCommitProven),
-            @"write_commit_proof":resumeCommitFence ? @"RESUME_FENCE" : (streamTerminalCommitFence ? @"STREAM_TERMINAL" : @"CANONICAL"),
+            @"write_commit_proof":resumeCommitFence
+                ? @"RESUME_FENCE"
+                : (topicHandoffCommitFence
+                    ? @"TOPIC_HANDOFF_FENCE"
+                    : (streamTerminalCommitFence ? @"STREAM_TERMINAL" : @"CANONICAL")),
             @"canonical_committed":@(canonicalCommitted),
             @"canonical_final_completed":@NO,
             @"canonical_body_base64":@"",

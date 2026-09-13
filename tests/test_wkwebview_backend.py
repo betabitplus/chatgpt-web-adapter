@@ -17,6 +17,7 @@ from chatgpt_web_adapter.browser_authority_backend import (
     WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
     normalize_browser_authority_backend,
 )
+from chatgpt_web_adapter.browser_owned_write_runtime import _canonical_commit_snapshot
 from chatgpt_web_adapter.client import ChatGPTWebClient
 from chatgpt_web_adapter.exceptions import RequestError
 from chatgpt_web_adapter.product_capabilities import (
@@ -88,6 +89,115 @@ def _final_canonical_for_prompt(prompt: str, *, assistant_text: str = "done") ->
             },
         },
     }
+
+
+def test_wk_shared_final_wait_survives_registry_cleanup_race(
+    monkeypatch, tmp_path
+) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
+    payload = _final_canonical_for_prompt("shared-final")
+    payload["mapping"]["node-final"]["message"]["id"] = "assistant-final"
+
+    reads = 0
+
+    def read_cached(_conversation_id):
+        nonlocal reads
+        reads += 1
+        if reads < 3:
+            return None
+        return payload, 0.0
+
+    monkeypatch.setattr(provider, "read_cached_conversation_payload", read_cached)
+    monkeypatch.setattr(provider, "active_stream_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._canonical_stream_identity",
+        lambda _payload: ("conversation-turn-final", "turn-final"),
+    )
+
+    result = provider.wait_for_shared_final_payload(
+        "conversation-1",
+        topic_id="conversation-turn-final",
+        timeout=0.5,
+    )
+
+    assert result is payload
+    assert reads >= 3
+
+
+def test_wk_final_canonical_cache_supports_non_destructive_prewrite_peek(
+    monkeypatch, tmp_path
+) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
+    payload = _final_canonical_for_prompt("cached")
+    payload["default_model_slug"] = "gpt-5-6-thinking"
+    payload["mapping"]["node-final"]["message"]["id"] = "assistant-final"
+    payload["mapping"]["node-final"]["message"]["metadata"] = {
+        "thinking_effort": "extended"
+    }
+    provider._canonical_state.cache_final_payload("conversation-1", payload)
+    client = WKWebViewCanonicalClient(SimpleNamespace(), provider)
+
+    def fail_network(*args, **kwargs):
+        raise AssertionError("trusted final payload must avoid canonical network read")
+
+    monkeypatch.setattr(provider, "_read_conversation_payload_uncached", fail_network)
+
+    status, commit_payload, _checked_at = _canonical_commit_snapshot(
+        client, "conversation-1"
+    )
+    assert status == "completed"
+    assert commit_payload is not payload
+    assert commit_payload["current_node"] == "assistant-final"
+    prewrite = provider.peek_prewrite_payload("conversation-1")
+    assert isinstance(prewrite, dict)
+    assert prewrite["current_node"] == "assistant-final"
+
+    prepared = provider._turn_orchestrator.prepare_turn(
+        conversation="conversation-1",
+        total_timeout=30,
+        attachment_paths=None,
+        model_slug=None,
+        streaming=True,
+    )
+
+    assert prepared.baseline_current_node == "assistant-final"
+    assert prepared.minimal_parent_message_id == "assistant-final"
+    assert prepared.minimal_model_slug == "gpt-5-6-thinking"
+    assert prepared.minimal_thinking_effort == "extended"
+    assert provider.peek_prewrite_payload("conversation-1") is not None
+
+
+def test_wk_fresh_network_final_seeds_trusted_prewrite_cache(
+    monkeypatch, tmp_path
+) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
+    payload = _final_canonical_for_prompt("fresh")
+    payload["default_model_slug"] = "gpt-5-6-thinking"
+    payload["mapping"]["node-final"]["message"]["id"] = "assistant-fresh"
+
+    calls = 0
+
+    def network_read(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return payload
+
+    monkeypatch.setattr(provider, "_read_conversation_payload_uncached", network_read)
+
+    assert provider.read_conversation_payload("conversation-1", timeout=5) is payload
+    assert calls == 1
+    prewrite = provider.peek_prewrite_payload("conversation-1")
+    assert isinstance(prewrite, dict)
+    assert prewrite["current_node"] == "assistant-fresh"
+
+    canonical = WKWebViewCanonicalClient(SimpleNamespace(), provider)
+    status, commit_payload, _checked_at = _canonical_commit_snapshot(
+        canonical, "conversation-1"
+    )
+    assert status == "completed"
+    assert isinstance(commit_payload, dict)
+    assert commit_payload["current_node"] == "assistant-fresh"
+    assert calls == 1
 
 
 def test_browser_authority_backend_selection_is_closed() -> None:
@@ -353,7 +463,15 @@ fd_index = sys.argv.index("--resume-handoff-fd") + 1
 fd = int(sys.argv[fd_index])
 os.write(
     fd,
-    json.dumps({"v": 1, "r": "resume-test", "c": "conduit-test", "t": "trace-test"}).encode(),
+    json.dumps({
+        "v": 2,
+        "r": "resume-test",
+        "p": "conversation-turn-direct",
+        "x": "turn-direct",
+        "i": "conversation-private",
+        "c": "conduit-test",
+        "t": "trace-test",
+    }).encode(),
 )
 os.close(fd)
 print("WK_RESULT " + json.dumps({
@@ -387,6 +505,9 @@ print("WK_RESULT " + json.dumps({
     assert payload["argv_contains_prompt"] is False
     assert payload["argv_contains_url"] is False
     assert payload["stream_resume_value"] == "resume-test"
+    assert payload["stream_topic_id"] == "conversation-turn-direct"
+    assert payload["turn_exchange_id"] == "turn-direct"
+    assert payload["stream_conversation_id"] == "conversation-private"
     assert payload["_cwa_stop_conduit_token"] == "conduit-test"
     assert payload["_cwa_stop_turn_trace_id"] == "trace-test"
 
@@ -1494,6 +1615,102 @@ def test_wkwebview_minimal_security_shell_continuation_preserves_canonical_selec
     assert request["minimal_thinking_effort"] == "extended"
     assert "gpt-5-6-thinking" not in command
     assert "extended" not in command
+
+
+def test_wkwebview_continuation_uses_direct_topic_handoff_without_resume_token(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    prewrite = {
+        "current_node": "node-before",
+        "mapping": {
+            "node-before": {
+                "message": {
+                    "id": "assistant-message-before",
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["previous answer"]},
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(
+        provider, "read_conversation_payload", lambda *args, **kwargs: prewrite
+    )
+
+    direct_calls: list[dict] = []
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        on_transport_event=None,
+        extra_env=None,
+    ):
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "write_commit_proof": "RESUME_FENCE",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": False,
+            "stream_terminal_observed": False,
+            "stream_resume_present": False,
+            "stream_resume_handoff_written": True,
+            "stream_topic_id": "conversation-turn-topic-only",
+            "turn_exchange_id": "turn-topic-only",
+            "stream_conversation_id": "conversation-1",
+        }
+
+    def fake_direct_topic(**kwargs):
+        direct_calls.append(kwargs)
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "message_id": "assistant-message-after",
+            "segment_done_count": 1,
+            "observed_model": "gpt-5-6-thinking",
+            "observed_reasoning_effort": "extended",
+        }
+
+    def fail_resume_token_path(**kwargs):
+        raise AssertionError(
+            "resume-token second leg must not run for direct topic handoff"
+        )
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(
+        provider, "_resume_via_curl_ws_topic_second_leg", fake_direct_topic
+    )
+    monkeypatch.setattr(
+        provider, "_resume_via_curl_ws_second_leg", fail_resume_token_path
+    )
+
+    result = provider.send_text_streaming(
+        "continue",
+        conversation="conversation-1",
+        on_text_event=lambda event: None,
+        on_transport_event=lambda event: None,
+    )
+
+    assert result.conversation_id == "conversation-1"
+    assert result.phase_b_transport == "curl_cffi_websocket_topic_handoff"
+    assert len(direct_calls) == 1
+    assert direct_calls[0]["topic_id"] == "conversation-turn-topic-only"
+    assert direct_calls[0]["turn_exchange_id"] == "turn-topic-only"
+    next_prewrite = provider.peek_prewrite_payload("conversation-1")
+    assert isinstance(next_prewrite, dict)
+    assert next_prewrite["current_node"] == "assistant-message-after"
+    next_message = next_prewrite["mapping"]["assistant-message-after"]["message"]
+    assert next_message["id"] == "assistant-message-after"
+    assert next_prewrite["default_model_slug"] == "gpt-5-6-thinking"
+    assert next_message["metadata"]["thinking_effort"] == "extended"
 
 
 def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(

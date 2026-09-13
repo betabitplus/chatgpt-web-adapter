@@ -17,6 +17,8 @@ class WKCanonicalState:
         self._current_nodes = threading.local()
         self._final_payload_lock = threading.Lock()
         self._final_payload_cache: dict[str, dict[str, Any]] = {}
+        self._continuation_cursor_lock = threading.Lock()
+        self._continuation_cursors: dict[str, dict[str, str | None]] = {}
         self._stop_final_condition = threading.Condition()
         self._stopped_final_payloads: dict[str, dict[str, Any]] = {}
 
@@ -171,12 +173,139 @@ class WKCanonicalState:
         value = self._current_node_cache().get(conversation_id)
         return value if isinstance(value, str) and value else None
 
+    @staticmethod
+    def _cursor_from_final_payload(
+        payload: dict[str, Any],
+    ) -> dict[str, str | None] | None:
+        mapping = payload.get("mapping")
+        current_node = payload.get("current_node")
+        if (
+            not isinstance(mapping, dict)
+            or not isinstance(current_node, str)
+            or not current_node
+        ):
+            return None
+        node = mapping.get(current_node)
+        message = node.get("message") if isinstance(node, dict) else None
+        if not isinstance(message, dict):
+            return None
+        author = message.get("author")
+        if not isinstance(author, dict) or author.get("role") != "assistant":
+            return None
+        message_id = message.get("id")
+        if not isinstance(message_id, str) or not message_id.strip():
+            return None
+        metadata = message.get("metadata")
+        model_slug = None
+        thinking_effort = None
+        if isinstance(metadata, dict):
+            for key in ("model_slug", "model", "default_model_slug", "selected_model"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    model_slug = value.strip()
+                    break
+            for key in ("thinking_effort", "reasoning_effort"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    thinking_effort = value.strip()
+                    break
+        if model_slug is None:
+            value = payload.get("default_model_slug")
+            if isinstance(value, str) and value.strip():
+                model_slug = value.strip()
+        return {
+            "message_id": message_id.strip(),
+            "model_slug": model_slug,
+            "thinking_effort": thinking_effort,
+        }
+
+    def cache_continuation_cursor(
+        self,
+        conversation_id: str,
+        *,
+        message_id: str,
+        model_slug: str | None = None,
+        thinking_effort: str | None = None,
+    ) -> None:
+        normalized_message_id = (
+            message_id.strip() if isinstance(message_id, str) else ""
+        )
+        if not normalized_message_id:
+            return
+        cursor = {
+            "message_id": normalized_message_id,
+            "model_slug": model_slug.strip()
+            if isinstance(model_slug, str) and model_slug.strip()
+            else None,
+            "thinking_effort": (
+                thinking_effort.strip()
+                if isinstance(thinking_effort, str) and thinking_effort.strip()
+                else None
+            ),
+        }
+        with self._continuation_cursor_lock:
+            self._continuation_cursors[conversation_id] = cursor
+        self.set_current_node(conversation_id, normalized_message_id)
+
+    def peek_continuation_cursor(
+        self, conversation_id: str
+    ) -> dict[str, str | None] | None:
+        with self._continuation_cursor_lock:
+            cursor = self._continuation_cursors.get(conversation_id)
+        return dict(cursor) if isinstance(cursor, dict) else None
+
+    def prewrite_payload_from_cursor(
+        self, conversation_id: str
+    ) -> dict[str, Any] | None:
+        cursor = self.peek_continuation_cursor(conversation_id)
+        if not isinstance(cursor, dict):
+            return None
+        message_id = cursor.get("message_id")
+        if not isinstance(message_id, str) or not message_id:
+            return None
+        metadata: dict[str, Any] = {}
+        model_slug = cursor.get("model_slug")
+        thinking_effort = cursor.get("thinking_effort")
+        if isinstance(model_slug, str) and model_slug:
+            metadata["model_slug"] = model_slug
+        if isinstance(thinking_effort, str) and thinking_effort:
+            metadata["thinking_effort"] = thinking_effort
+        payload: dict[str, Any] = {
+            "current_node": message_id,
+            "mapping": {
+                message_id: {
+                    "parent": None,
+                    "message": {
+                        "id": message_id,
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "status": "finished_successfully",
+                        "end_turn": True,
+                        "metadata": metadata,
+                        "content": {"parts": []},
+                    },
+                }
+            },
+        }
+        if isinstance(model_slug, str) and model_slug:
+            payload["default_model_slug"] = model_slug
+        return payload
+
     def cache_final_payload(
         self, conversation_id: str, payload: dict[str, Any]
     ) -> None:
         with self._final_payload_lock:
             self._final_payload_cache[conversation_id] = payload
-        self.set_current_node(conversation_id, payload.get("current_node"))
+        cursor = self._cursor_from_final_payload(payload)
+        if isinstance(cursor, dict):
+            self.cache_continuation_cursor(
+                conversation_id,
+                message_id=str(cursor["message_id"]),
+                model_slug=cursor.get("model_slug"),
+                thinking_effort=cursor.get("thinking_effort"),
+            )
+        else:
+            self.set_current_node(conversation_id, payload.get("current_node"))
         if self.is_client_stopped_payload(payload):
             with self._stop_final_condition:
                 self._stopped_final_payloads[conversation_id] = payload
@@ -275,6 +404,16 @@ class WKWebViewCanonicalClient(BrowserContextCanonicalClient):
         )
         self.canonical_read_plane = WKWEBVIEW_CANONICAL_READ_PLANE
         self._browser_native_turn_provider = provider
+
+    def peek_prewrite_canonical_payload(
+        self,
+        conversation_id: str,
+    ) -> dict[str, Any] | None:
+        peeker = getattr(self.provider, "peek_prewrite_payload", None)
+        if not callable(peeker):
+            return None
+        cached = peeker(conversation_id)
+        return cached if isinstance(cached, dict) else None
 
     def read_cached_conversation_payload(
         self,

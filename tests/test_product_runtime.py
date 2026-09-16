@@ -760,7 +760,7 @@ def test_runtime_topic_follow_uses_shared_final_without_canonical_read(
     assert result["status"].status == "completed"
 
 
-def test_runtime_topic_follow_terminal_stream_skips_canonical_read_without_shared_final(
+def test_runtime_topic_follow_terminal_stream_reconciles_once_with_canonical_final(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -770,25 +770,41 @@ def test_runtime_topic_follow_terminal_stream_skips_canonical_read_without_share
     provider = _Provider()
     runtime = ChatGPTProductRuntime(_Client(), provider=provider)
     topic_id = "conversation-turn-turn-terminal"
-    final_message = {
+    stream_message = {
         "id": "assistant-terminal",
         "author": {"role": "assistant"},
         "recipient": "all",
         "status": "finished_successfully",
         "end_turn": True,
-        "content": {"content_type": "text", "parts": ["done"]},
+        "content": {"content_type": "text", "parts": ["broken pieces"]},
         "metadata": {
             "turn_exchange_id": "turn-terminal",
             "finish_details": {"type": "stop"},
             "model_slug": "gpt-5-6-thinking",
         },
     }
+    canonical_message = {
+        **stream_message,
+        "content": {"content_type": "text", "parts": ["complete canonical answer"]},
+    }
+    canonical_payload = {
+        "current_node": "assistant-terminal",
+        "mapping": {
+            "assistant-terminal": {
+                "id": "assistant-terminal",
+                "parent": None,
+                "children": [],
+                "message": canonical_message,
+            }
+        },
+    }
+    canonical_reads: list[str] = []
 
     def follow_stream_topic(*, on_event, should_stop, **_kwargs):
         on_event(
             {
                 "type": "raw_ws_event",
-                "parsed": {"v": {"message": final_message}},
+                "parsed": {"v": {"message": stream_message}},
             }
         )
         assert should_stop() is True
@@ -805,9 +821,9 @@ def test_runtime_topic_follow_terminal_stream_skips_canonical_read_without_share
     provider.wait_for_shared_final_payload = lambda *args, **kwargs: None
     monkeypatch.setattr(
         runtime,
-        "conversation_follow_snapshot",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("terminal stream must not require canonical snapshot")
+        "get_conversation_payload",
+        lambda conversation: (
+            canonical_reads.append(conversation.conversation_id) or canonical_payload
         ),
     )
 
@@ -817,14 +833,50 @@ def test_runtime_topic_follow_terminal_stream_skips_canonical_read_without_share
         on_event=lambda _event: None,
     )
 
+    assert canonical_reads == ["conversation-1"]
     assert result["stream_completed"] is True
-    assert result["stream_terminal_snapshot"] is True
+    assert result["stream_terminal_reconciled"] is True
     assert result["shared_final_cache"] is False
     assert result["status"].status == "completed"
-    assert result["status"].message_id == "assistant-terminal"
-    assert result["messages"][0].message_id == "assistant-terminal"
+    assert result["messages"][-1].message_id == "assistant-terminal"
+    assert result["messages"][-1].text == "complete canonical answer"
+    assert result["stream_answer_text"] == "complete canonical answer"
+    assert result["stream_terminal_provisional_text"] == "broken pieces"
+
+
+def test_runtime_topic_follow_terminal_stream_falls_back_when_canonical_unavailable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._PASSIVE_TERMINAL_SETTLE_SECONDS",
+        0.0,
+    )
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    topic_id = "conversation-turn-turn-terminal-fallback"
+    final_message = {
+        "id": "assistant-terminal",
+        "author": {"role": "assistant"},
+        "recipient": "all",
+        "status": "finished_successfully",
+        "end_turn": True,
+        "content": {"content_type": "text", "parts": ["done"]},
+        "metadata": {"finish_details": {"type": "stop"}},
+    }
+
+    def follow_stream_topic(*, on_event, should_stop, **_kwargs):
+        on_event({"type": "raw_ws_event", "parsed": {"v": {"message": final_message}}})
+        assert should_stop() is True
+        return {"topic_id": topic_id, "message_id": "assistant-terminal"}
+
+    provider.follow_stream_topic = follow_stream_topic
+    provider.wait_for_shared_final_payload = lambda *args, **kwargs: None
+
+    result = runtime.conversation_follow_stream("conversation-1", topic_id=topic_id)
+
+    assert result["stream_completed"] is True
+    assert result["stream_terminal_snapshot"] is True
     assert result["messages"][0].text == "done"
-    assert result["stream_answer_text"] == "done"
 
 
 def test_runtime_topic_follow_recovers_local_stream_failure_from_shared_final(

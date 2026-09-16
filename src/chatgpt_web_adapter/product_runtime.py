@@ -780,6 +780,32 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             final_snapshot["stream_topic_id"] = actual_topic_id
             return final_snapshot
 
+        # A passive topic terminal proves lifecycle completion, but not that every
+        # text patch was observed or reconstructed losslessly. This matters most
+        # when attaching to a turn that was already in flight before gptty joined.
+        # Reconcile exactly once against canonical state at terminal; never poll.
+        try:
+            terminal_payload = self.get_conversation_payload(ref)
+        except (RequestError, RuntimeError, OSError, ValueError):
+            terminal_payload = None
+        if isinstance(terminal_payload, dict):
+            terminal_snapshot = self._follow_snapshot_from_payload(
+                ref,
+                terminal_payload,
+                emitted_message_ids=tuple(normalizer.emitted_message_ids),
+                limit=limit,
+            )
+            terminal_status = terminal_snapshot.get("status")
+            if getattr(terminal_status, "status", None) == "completed":
+                terminal_snapshot["shared_final_cache"] = False
+                terminal_snapshot["stream_completed"] = True
+                terminal_snapshot["stream_topic_id"] = actual_topic_id
+                terminal_snapshot["stream_terminal_reconciled"] = True
+                terminal_snapshot["stream_terminal_provisional_text"] = (
+                    normalizer.answer_text
+                )
+                return terminal_snapshot
+
         return self._follow_snapshot_from_stream_terminal(
             normalizer,
             topic_id=actual_topic_id,

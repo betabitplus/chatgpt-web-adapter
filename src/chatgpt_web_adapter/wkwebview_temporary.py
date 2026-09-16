@@ -136,11 +136,12 @@ class WKTemporaryTurnRuntime:
         invocation.request["url"] = "https://chatgpt.com/?temporary-chat=true"
         invocation.request["minimal_temporary"] = True
         invocation.request["minimal_temporary_lifecycle_id"] = lifecycle_id
-        proxy_enabled = os.environ.get("CWA_WK_PROXY_PROTECTED_WRITE", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
+        proxy_setting = os.environ.get("CWA_WK_PROXY_PROTECTED_WRITE")
+        proxy_enabled = proxy_setting is None or proxy_setting.strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
         }
         if proxy_enabled:
             source_client = getattr(transport, "source_client", None)

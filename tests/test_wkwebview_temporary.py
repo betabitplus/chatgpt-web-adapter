@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 import pytest
@@ -15,6 +16,9 @@ class _TemporaryStreamTransport:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.index = 0
+        self.source_client = SimpleNamespace(
+            auth=SimpleNamespace(cookies={"session": "test-cookie"})
+        )
 
     def stream_temporary_turn(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(dict(kwargs))
@@ -187,7 +191,8 @@ class _Provider:
         }
 
 
-def test_wk_temporary_new_continuation_and_end_are_process_bound() -> None:
+def test_wk_temporary_new_continuation_and_end_are_process_bound(monkeypatch) -> None:
+    monkeypatch.delenv("CWA_WK_PROXY_PROTECTED_WRITE", raising=False)
     provider = _Provider()
     runtime = WKTemporaryTurnRuntime(provider)
     events: list[dict[str, Any]] = []
@@ -217,6 +222,8 @@ def test_wk_temporary_new_continuation_and_end_are_process_bound() -> None:
     assert provider.invocations[0].request["minimal_temporary"] is True
     assert provider.invocations[0].request["minimal_temporary_lifecycle_id"] == "lifecycle-1"
     assert provider.invocations[0].request["url"] == "https://chatgpt.com/?temporary-chat=true"
+    assert provider.invocations[0].request["proxy_protected_write"] is True
+    assert provider.invocations[0].request["proxy_cookie_header"] == "session=test-cookie"
     assert "minimal_conversation_id" not in provider.invocations[0].request
     assert provider.invocations[1].request["minimal_conversation_id"] == "temporary-1"
     assert provider.invocations[1].request["minimal_parent_message_id"] == "assistant-1"
@@ -240,6 +247,24 @@ def test_wk_temporary_new_continuation_and_end_are_process_bound() -> None:
             on_event=events.append,
             browser_authority_lease_id="lease-1",
         )
+
+def test_wk_temporary_proxy_can_be_explicitly_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("CWA_WK_PROXY_PROTECTED_WRITE", "0")
+    provider = _Provider()
+    runtime = WKTemporaryTurnRuntime(provider)
+
+    runtime.send(
+        "first",
+        conversation_id=None,
+        lifecycle_id="lifecycle-proxy-disabled",
+        timeout=30,
+        on_event=lambda _event: None,
+        browser_authority_lease_id="lease-1",
+    )
+
+    assert "proxy_protected_write" not in provider.invocations[0].request
+    assert "proxy_cookie_header" not in provider.invocations[0].request
+
 
 def test_wk_temporary_does_not_arm_global_completion_or_early_handoff() -> None:
     provider = _Provider()

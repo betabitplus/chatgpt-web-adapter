@@ -24,8 +24,8 @@ from .browser_owned_write_runtime import (
     WRITE_OUTCOME_UNKNOWN,
     BrowserOwnedWriteObservation,
     BrowserOwnedWriteRuntimeError,
+    _canonical_commit_snapshot,
     _canonical_status_blocks_browser_owned_write,
-    _canonical_status_value,
     _conversation_id,
     _optional_int,
     _optional_text,
@@ -146,7 +146,7 @@ class BrowserOwnedSubmissionLifecycle:
         conversation: ConversationRef | ChatConversation | dict[str, Any] | str | None,
         browser_authority_policy: BrowserAuthorityPolicy | str | None,
         browser_authority_ttl_ms: int | None,
-    ) -> tuple[BrowserAuthorityLease, TurnLifecycle]:
+    ) -> tuple[BrowserAuthorityLease, TurnLifecycle, dict[str, Any] | None, int | None]:
         resolution = self.runtime._resolve_authority_policy(
             browser_authority_policy=browser_authority_policy,
             browser_authority_ttl_ms=browser_authority_ttl_ms,
@@ -185,10 +185,16 @@ class BrowserOwnedSubmissionLifecycle:
                 request_stage="browser_owned_write_preflight",
             )
 
+        # Resolve Browser Authority before the canonical commit snapshot. The
+        # snapshot must be the final read-side operation before lease issuance so
+        # submit_browser_native can reuse it without a second canonical GET.
+        fresh_authority = self.runtime._fresh_browser_authority_status()
+        commit_payload: dict[str, Any] | None = None
+        commit_checked_at_ms: int | None = None
         if conversation is not None:
             try:
-                commit_status = _canonical_status_value(
-                    self.runtime.client, conversation
+                commit_status, commit_payload, commit_checked_at_ms = (
+                    _canonical_commit_snapshot(self.runtime.client, conversation)
                 )
             except Exception as error:
                 raise BrowserOwnedWriteRuntimeError(
@@ -212,11 +218,11 @@ class BrowserOwnedSubmissionLifecycle:
                     request_stage="browser_owned_write_preflight",
                 )
 
-        fresh_authority = self.runtime._fresh_browser_authority_status()
-        return self.runtime._issue_authority(
+        lease, turn = self.runtime._issue_authority(
             resolution=resolution,
             status=fresh_authority,
         )
+        return lease, turn, commit_payload, commit_checked_at_ms
 
     def _acknowledge_readback(self, state: _PendingSubmission) -> bool:
         complete_readback = getattr(
@@ -351,7 +357,7 @@ class BrowserOwnedSubmissionLifecycle:
         self._validate_inputs(text, timeout=timeout, poll_interval=poll_interval)
         self._reserve_dispatch()
         try:
-            lease, turn = self._prepare_authority(
+            lease, turn, commit_payload, commit_checked_at_ms = self._prepare_authority(
                 conversation=conversation,
                 browser_authority_policy=browser_authority_policy,
                 browser_authority_ttl_ms=browser_authority_ttl_ms,
@@ -383,6 +389,8 @@ class BrowserOwnedSubmissionLifecycle:
                     poll_interval=poll_interval,
                     on_token=on_token,
                     on_event=runtime_event,
+                    _prewrite_canonical_payload=commit_payload,
+                    _prewrite_canonical_completed_at_ms=commit_checked_at_ms,
                 )
             except WebChatAdapterError as error:
                 raise self._mark_submit_failure(state, error) from error

@@ -113,6 +113,9 @@ class WKTurnOrchestrator:
         text: str,
         total_timeout: float,
         started: float,
+        completion_watch_sequence: int | None = None,
+        verified_canonical: dict[str, Any] | None = None,
+        stream_should_stop: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         if payload.get("identity_recovery_required") is not True:
             return payload
@@ -142,6 +145,186 @@ class WKTurnOrchestrator:
             if isinstance(candidate, str) and candidate.strip()
             else prepared.conversation_id
         )
+        def apply_known_conversation_candidate(
+            canonical: dict[str, Any],
+            *,
+            conversation_id: str,
+            completion_observed: bool,
+        ) -> dict[str, Any]:
+            publish_observation = getattr(
+                provider, "publish_canonical_observation", None
+            )
+            if callable(publish_observation):
+                publish_observation(conversation_id, canonical)
+            current_node = canonical.get("current_node")
+            if client_message_id is not None:
+                write_matches = self._payload_contains_client_message(
+                    canonical,
+                    client_message_id=client_message_id,
+                    text=text,
+                )
+                recovery_proof = (
+                    "PASSIVE_COMPLETION_MESSAGE_ID_RECOVERY"
+                    if completion_observed
+                    else "CANONICAL_MESSAGE_ID_RECOVERY"
+                )
+            else:
+                node_changed = prepared.baseline_current_node is None or (
+                    isinstance(current_node, str)
+                    and bool(current_node)
+                    and current_node != prepared.baseline_current_node
+                )
+                write_matches = (
+                    node_changed
+                    and provider._current_branch_contains_user_text(canonical, text)
+                )
+                recovery_proof = (
+                    "PASSIVE_COMPLETION_PROMPT_RECOVERY"
+                    if completion_observed
+                    else "CANONICAL_PROMPT_RECOVERY"
+                )
+            if not write_matches:
+                raise RequestError(
+                    "WKWEBVIEW_IDENTITY_RECOVERY_WRITE_MISMATCH",
+                    request_stage="wkwebview_identity_recovery",
+                )
+            if provider._canonical_state.payload_is_final(canonical):
+                provider._cache_final_payload(conversation_id, canonical)
+                payload.update(
+                    {
+                        "conversation_id": conversation_id,
+                        "response_status": (
+                            payload.get("response_status")
+                            if isinstance(payload.get("response_status"), int)
+                            and 200 <= payload.get("response_status") < 300
+                            else 200
+                        ),
+                        "write_commit_proven": True,
+                        "write_commit_proof": recovery_proof,
+                        "canonical_committed": True,
+                        "canonical_final_completed": True,
+                        "committed_current_node": (
+                            current_node if isinstance(current_node, str) else ""
+                        ),
+                        "stream_terminal_observed": True,
+                        "_cwa_stream_finality_proven": True,
+                        "_cwa_identity_recovered": True,
+                        "_cwa_identity_recovery_transport": (
+                            "conversations_ws_then_curl_cffi"
+                            if completion_observed
+                            else "curl_cffi"
+                        ),
+                        "_cwa_identity_recovery_kind": (
+                            "passive_completion"
+                            if completion_observed
+                            else (
+                                "message_id"
+                                if client_message_id is not None
+                                else "prompt"
+                            )
+                        ),
+                        "_cwa_identity_recovery_elapsed_ms": int(
+                            (time.monotonic() - started) * 1000
+                        ),
+                    }
+                )
+                return payload
+
+            from .browser_native_client import _canonical_stream_identity
+
+            stream_topic_id, turn_exchange_id = _canonical_stream_identity(canonical)
+            if isinstance(stream_topic_id, str) and stream_topic_id.strip():
+                payload.update(
+                    {
+                        "conversation_id": conversation_id,
+                        "response_status": (
+                            payload.get("response_status")
+                            if isinstance(payload.get("response_status"), int)
+                            and 200 <= payload.get("response_status") < 300
+                            else 200
+                        ),
+                        "write_commit_proven": True,
+                        "write_commit_proof": "CANONICAL_STREAM_IDENTITY_RECOVERY",
+                        "canonical_committed": True,
+                        "canonical_final_completed": False,
+                        "committed_current_node": (
+                            current_node if isinstance(current_node, str) else ""
+                        ),
+                        "stream_terminal_observed": False,
+                        "stream_topic_id": stream_topic_id.strip(),
+                        "turn_exchange_id": (
+                            turn_exchange_id.strip()
+                            if isinstance(turn_exchange_id, str)
+                            and turn_exchange_id.strip()
+                            else ""
+                        ),
+                        "stream_conversation_id": conversation_id,
+                        "_cwa_identity_recovered": True,
+                        "_cwa_identity_recovery_transport": "curl_cffi",
+                        "_cwa_identity_recovery_kind": "stream_topic",
+                        "_cwa_identity_recovery_elapsed_ms": int(
+                            (time.monotonic() - started) * 1000
+                        ),
+                    }
+                )
+                return payload
+
+            raise RequestError(
+                "WKWEBVIEW_IDENTITY_RECOVERY_NO_FINAL_OR_STREAM_IDENTITY",
+                request_stage="wkwebview_identity_recovery",
+            )
+
+        if prepared.conversation_id is not None:
+            known_conversation_id = prepared.conversation_id
+            completion_observed = isinstance(verified_canonical, dict)
+            canonical = (
+                verified_canonical
+                if isinstance(verified_canonical, dict)
+                else None
+            )
+            if canonical is None and completion_watch_sequence is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+                completion_observed = transport.wait_for_conversation_completion(
+                    known_conversation_id,
+                    after_sequence=completion_watch_sequence,
+                    timeout=remaining,
+                    should_stop=stream_should_stop,
+                )
+                if stream_should_stop is not None:
+                    try:
+                        if bool(stream_should_stop()):
+                            raise RequestError(
+                                "WKWEBVIEW_IDENTITY_RECOVERY_STOPPED",
+                                request_stage="wkwebview_identity_recovery",
+                            )
+                    except RequestError:
+                        raise
+                    except Exception:
+                        pass
+            if canonical is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RequestError(
+                        "WKWEBVIEW_IDENTITY_RECOVERY_TIMEOUT",
+                        request_stage="wkwebview_identity_recovery",
+                    )
+                canonical, _fallback_reason = (
+                    provider._read_conversation_payload_via_coordinated_curl(
+                        known_conversation_id,
+                        timeout=min(8.0, max(1.0, remaining)),
+                    )
+                )
+            if not isinstance(canonical, dict):
+                raise RequestError(
+                    "WKWEBVIEW_IDENTITY_RECOVERY_CANONICAL_UNAVAILABLE",
+                    request_stage="wkwebview_identity_recovery",
+                )
+            return apply_known_conversation_candidate(
+                canonical,
+                conversation_id=known_conversation_id,
+                completion_observed=completion_observed,
+            )
+
         matched_payload: dict[str, Any] | None = None
         retry_delay = 1.0
 
@@ -229,6 +412,48 @@ class WKTurnOrchestrator:
                             }
                         )
                         return payload
+
+                    from .browser_native_client import _canonical_stream_identity
+
+                    stream_topic_id, turn_exchange_id = _canonical_stream_identity(
+                        canonical
+                    )
+                    if isinstance(stream_topic_id, str) and stream_topic_id.strip():
+                        payload.update(
+                            {
+                                "conversation_id": candidate_id,
+                                "response_status": (
+                                    payload.get("response_status")
+                                    if isinstance(payload.get("response_status"), int)
+                                    and 200 <= payload.get("response_status") < 300
+                                    else 200
+                                ),
+                                "write_commit_proven": True,
+                                "write_commit_proof": "CANONICAL_STREAM_IDENTITY_RECOVERY",
+                                "canonical_committed": True,
+                                "canonical_final_completed": False,
+                                "committed_current_node": current_node
+                                if isinstance(current_node, str)
+                                else "",
+                                "stream_terminal_observed": False,
+                                "stream_topic_id": stream_topic_id.strip(),
+                                "turn_exchange_id": (
+                                    turn_exchange_id.strip()
+                                    if isinstance(turn_exchange_id, str)
+                                    and turn_exchange_id.strip()
+                                    else ""
+                                ),
+                                "stream_conversation_id": candidate_id,
+                                "_cwa_identity_recovered": True,
+                                "_cwa_identity_recovery_transport": "curl_cffi",
+                                "_cwa_identity_recovery_kind": "stream_topic",
+                                "_cwa_identity_recovery_elapsed_ms": int(
+                                    (time.monotonic() - started) * 1000
+                                ),
+                            }
+                        )
+                        return payload
+
                     wait_before_retry()
                     continue
                 if prepared.conversation_id is not None:
@@ -341,7 +566,7 @@ class WKTurnOrchestrator:
             else:
                 baseline_current_node = provider._cached_current_node(conversation_id)
             if baseline_current_node is None:
-                prewrite_payload = provider.read_conversation_payload(
+                prewrite_payload = provider.read_prewrite_conversation_payload(
                     conversation_id,
                     timeout=min(15.0, total_timeout),
                 )
@@ -364,7 +589,7 @@ class WKTurnOrchestrator:
 
         if use_minimal_security_shell and conversation_id is not None:
             if not isinstance(prewrite_payload, dict):
-                prewrite_payload = provider.read_conversation_payload(
+                prewrite_payload = provider.read_prewrite_conversation_payload(
                     conversation_id,
                     timeout=min(15.0, total_timeout),
                 )
@@ -525,25 +750,13 @@ class WKTurnOrchestrator:
             if callable(on_transport_event)
             else {}
         )
-        if provider._lightweight_path_enabled():
-            gate_wait = max(0.001, total_timeout - (time.monotonic() - started))
-            with provider._heavy_submit_gate(gate_wait) as gate_wait_ms:
-                phase_timeout = max(1.0, total_timeout - (time.monotonic() - started))
-                payload = provider._run_helper_streaming(
-                    invocation,
-                    timeout=phase_timeout,
-                    on_text_event=on_text_event,
-                    on_lifecycle_event=on_write_identity,
-                    **transport_event_kwargs,
-                )
-        else:
-            payload = provider._run_helper_streaming(
-                invocation,
-                timeout=phase_timeout,
-                on_text_event=on_text_event,
-                on_lifecycle_event=on_write_identity,
-                **transport_event_kwargs,
-            )
+        payload = provider._run_helper_streaming(
+            invocation,
+            timeout=phase_timeout,
+            on_text_event=on_text_event,
+            on_lifecycle_event=on_write_identity,
+            **transport_event_kwargs,
+        )
         payload["_cwa_phase_a_transport"] = phase_a_transport
         payload["_cwa_phase_a_gate_wait_ms"] = gate_wait_ms
         payload["_cwa_phase_a_elapsed_ms"] = int(
@@ -655,6 +868,7 @@ class WKTurnOrchestrator:
         make_stream_relay: Callable[[], Callable[[dict[str, Any]], None]],
         on_transport_event: Callable[[dict[str, Any]], None] | None = None,
         stream_should_stop: Callable[[], bool] | None = None,
+        passive_completion_check: Callable[[], bool] | None = None,
     ) -> bool:
         provider = self.provider
         phase_b_started = time.monotonic()
@@ -675,7 +889,10 @@ class WKTurnOrchestrator:
         direct_topic_id = payload.get("stream_topic_id")
         direct_turn_exchange_id = payload.get("turn_exchange_id")
         direct_stream_conversation_id = payload.get("stream_conversation_id")
-        if payload.get("_cwa_identity_recovered") is True:
+        if (
+            payload.get("_cwa_identity_recovered") is True
+            and payload.get("_cwa_identity_recovery_kind") != "stream_topic"
+        ):
             recovery_kind = payload.get("_cwa_identity_recovery_kind")
             record_phase_b(
                 "canonical_prompt_recovery"
@@ -683,10 +900,29 @@ class WKTurnOrchestrator:
                 else "canonical_message_id_recovery"
             )
             return passive_observer_armed
-        phase_one_completed = phase_one_final_cached or bool(
-            payload.get("stream_terminal_observed")
-        )
+        phase_one_stream_terminal = bool(payload.get("stream_terminal_observed"))
+        phase_one_completed = phase_one_final_cached or phase_one_stream_terminal
         if phase_one_completed:
+            if phase_one_stream_terminal:
+                payload["_cwa_stream_finality_proven"] = True
+                assistant_message_id = payload.get("assistant_message_id")
+                if isinstance(assistant_message_id, str) and assistant_message_id.strip():
+                    submit_model = payload.get("submit_model")
+                    submit_effort = payload.get("submit_thinking_effort")
+                    provider.cache_continuation_cursor(
+                        result_conversation_id,
+                        message_id=assistant_message_id.strip(),
+                        model_slug=(
+                            submit_model.strip()
+                            if isinstance(submit_model, str) and submit_model.strip()
+                            else prepared.minimal_model_slug
+                        ),
+                        thinking_effort=(
+                            submit_effort.strip()
+                            if isinstance(submit_effort, str) and submit_effort.strip()
+                            else prepared.minimal_thinking_effort
+                        ),
+                    )
             record_phase_b("phase_one_terminal")
             return passive_observer_armed
         direct_topic_available = (
@@ -733,6 +969,7 @@ class WKTurnOrchestrator:
                         relay_text_event=make_stream_relay(),
                         on_transport_event=on_transport_event,
                         stream_should_stop=stream_should_stop,
+                        passive_completion_check=passive_completion_check,
                     )
                 else:
                     resume_payload = provider._resume_via_curl_ws_second_leg(
@@ -742,6 +979,7 @@ class WKTurnOrchestrator:
                         relay_text_event=make_stream_relay(),
                         on_transport_event=on_transport_event,
                         stream_should_stop=stream_should_stop,
+                        passive_completion_check=passive_completion_check,
                         text=text,
                         baseline_current_node=prepared.baseline_current_node,
                     )
@@ -928,6 +1166,16 @@ class WKTurnOrchestrator:
             stream_model_slug=(
                 payload.get("_cwa_stream_model_slug")
                 if isinstance(payload.get("_cwa_stream_model_slug"), str)
+                else None
+            ),
+            stream_topic_id=(
+                payload.get("_cwa_deferred_stream_topic_id")
+                if isinstance(payload.get("_cwa_deferred_stream_topic_id"), str)
+                else None
+            ),
+            stream_resume_value=(
+                payload.get("_cwa_deferred_stream_resume_value")
+                if isinstance(payload.get("_cwa_deferred_stream_resume_value"), str)
                 else None
             ),
         )

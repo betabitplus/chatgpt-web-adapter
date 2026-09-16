@@ -53,6 +53,7 @@ class BrowserNativeSubmission:
     stream_state: RevisionSafeTextAccumulator
     on_token: Callable[[str], None] | None
     on_event: Callable[[dict[str, Any]], None] | None
+    topic_normalizer: Any | None = None
     final_response: ChatResponse | None = None
 
 
@@ -1266,7 +1267,10 @@ def _emit_revision_safe_event(
 
 
 def _provider_supports_revision_safe_streaming(provider: Any) -> bool:
-    if not callable(getattr(provider, "send_text_streaming", None)):
+    if not (
+        callable(getattr(provider, "submit_text_streaming", None))
+        or callable(getattr(provider, "send_text_streaming", None))
+    ):
         return False
     if getattr(provider, "revision_safe_streaming_supported", False) is True:
         return True
@@ -1445,9 +1449,15 @@ def submit_browser_native(
 
         recovery_send = getattr(provider, "send_text_with_stale_ui_recovery", None)
         recovery_stream_send = getattr(
-            provider, "send_text_with_stale_ui_recovery_streaming", None
+            provider, "submit_text_with_stale_ui_recovery_streaming", None
         )
-        stream_send = getattr(provider, "send_text_streaming", None)
+        if not callable(recovery_stream_send):
+            recovery_stream_send = getattr(
+                provider, "send_text_with_stale_ui_recovery_streaming", None
+            )
+        stream_send = getattr(provider, "submit_text_streaming", None)
+        if not callable(stream_send):
+            stream_send = getattr(provider, "send_text_streaming", None)
         canonical_status_recovery_confirm = None
         recovery_authorized = False
         recovery_completed_at_ms: int | None = None
@@ -1729,6 +1739,7 @@ def submit_browser_native(
         stream_state=stream_state,
         on_token=on_token,
         on_event=on_event,
+        topic_normalizer=topic_normalizer,
     )
 
 
@@ -1786,6 +1797,105 @@ def await_browser_native_final(
     passive_text_sequence = submission.stream_state.last_sequence
     passive_text_message_id: str | None = submission.stream_state.message_id
     passive_text_snapshot = submission.stream_state.text
+
+    deferred_topic_id = getattr(turn, "stream_topic_id", None)
+    follow_submitted_turn = getattr(provider, "follow_submitted_turn", None)
+    if (
+        not stream_finality_proven
+        and isinstance(deferred_topic_id, str)
+        and deferred_topic_id.strip()
+        and callable(follow_submitted_turn)
+    ):
+        topic_normalizer = submission.topic_normalizer
+        if not isinstance(topic_normalizer, CanonicalTopicStreamNormalizer):
+            topic_normalizer = CanonicalTopicStreamNormalizer(
+                emitted_message_ids=tuple(submission.baseline_message_ids),
+                answer_message_id=submission.stream_state.message_id,
+                answer_text=submission.stream_state.text,
+            )
+        deferred_sequence = submission.stream_state.last_sequence
+
+        def handle_deferred_transport_event(event: dict[str, Any]) -> None:
+            nonlocal deferred_sequence
+            topic_normalizer.answer_message_id = submission.stream_state.message_id
+            topic_normalizer.answer_text = submission.stream_state.text
+            for normalized in topic_normalizer.feed_transport_event(event):
+                if normalized.get("type") in {
+                    ASSISTANT_TEXT_SNAPSHOT,
+                    ASSISTANT_TEXT_DELTA,
+                    ASSISTANT_TEXT_REVISION,
+                }:
+                    deferred_sequence = max(
+                        deferred_sequence + 1,
+                        submission.stream_state.last_sequence + 1,
+                    )
+                    applied = submission.stream_state.apply(
+                        {**normalized, "sequence": deferred_sequence}
+                    )
+                    if applied is not None:
+                        _emit_revision_safe_event(
+                            self,
+                            submission.on_event,
+                            {**applied, "submission_id": submission.submission_id},
+                        )
+                    continue
+                _emit_revision_safe_event(
+                    self,
+                    submission.on_event,
+                    {**normalized, "submission_id": submission.submission_id},
+                )
+
+        deferred_should_stop = _make_passive_terminal_stop_check(
+            lambda: topic_normalizer.turn_completed,
+            cancelled=provider_stop_requested,
+            settled=lambda: topic_normalizer.segment_kind is None,
+        )
+        deferred_result = follow_submitted_turn(
+            turn,
+            timeout=remaining,
+            on_transport_event=handle_deferred_transport_event,
+            stream_should_stop=deferred_should_stop,
+        )
+        passive_observer_used = True
+        candidate_message_id = (
+            deferred_result.get("message_id")
+            if isinstance(deferred_result, dict)
+            else None
+        )
+        if isinstance(candidate_message_id, str) and candidate_message_id.strip():
+            stream_message_id = candidate_message_id.strip()
+            passive_message_id = stream_message_id
+        candidate_finish_reason = (
+            deferred_result.get("finish_reason")
+            if isinstance(deferred_result, dict)
+            else None
+        )
+        if isinstance(candidate_finish_reason, str) and candidate_finish_reason.strip():
+            stream_finish_reason = candidate_finish_reason.strip()
+            passive_finish_reason = stream_finish_reason
+        candidate_model = (
+            deferred_result.get("observed_model")
+            if isinstance(deferred_result, dict)
+            else None
+        )
+        if isinstance(candidate_model, str) and candidate_model.strip():
+            stream_model_slug = candidate_model.strip()
+        stream_finality_proven = (
+            isinstance(deferred_result, dict)
+            and deferred_result.get("stream_finality_proven") is True
+            and submission.stream_state.observation_count > 0
+            and not submission.stream_state.delivery_incomplete
+            and isinstance(stream_message_id, str)
+            and bool(stream_message_id.strip())
+        )
+        if not stream_finality_proven and not provider_stop_requested():
+            raise RequestError(
+                "BROWSER_NATIVE_DEFERRED_TOPIC_FINALITY_MISSING",
+                request_stage="browser_native_observe_turn",
+            )
+        if provider_stop_requested():
+            passive_finish_reason = "stopped"
+            passive_message_id = submission.stream_state.message_id
 
     if (
         not stream_finality_proven
@@ -1954,6 +2064,28 @@ def await_browser_native_final(
                 and stream_finish_reason.strip()
                 else "stop"
             ),
+        )
+        canonical_payload = None
+        canonical_payload_read_count = 0
+    elif (
+        stopped_by_user
+        and isinstance(deferred_topic_id, str)
+        and bool(deferred_topic_id.strip())
+        and callable(follow_submitted_turn)
+    ):
+        stopped_message_id = submission.stream_state.message_id or passive_message_id
+        final_message = ChatMessage(
+            node_id=stopped_message_id,
+            message_id=stopped_message_id,
+            role="assistant",
+            text=submission.stream_state.text,
+            recipient="all",
+            model=(
+                stream_model_slug
+                if isinstance(stream_model_slug, str) and stream_model_slug.strip()
+                else None
+            ),
+            finish_reason="stopped",
         )
         canonical_payload = None
         canonical_payload_read_count = 0

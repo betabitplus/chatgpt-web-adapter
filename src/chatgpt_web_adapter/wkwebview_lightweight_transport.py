@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import mimetypes
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
@@ -40,6 +43,7 @@ class WKLightweightSourceClient(Protocol):
 _LIGHTWEIGHT_MEDIA_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
 _CHAT_FILES_URL = "https://chatgpt.com/backend-api/files"
 _ATTACHMENT_UPLOAD_TIMEOUT_SECONDS = 60.0
+_CELSIUS_URL_CACHE_SECONDS = 300.0
 
 
 class WKLightweightTransport:
@@ -67,6 +71,17 @@ class WKLightweightTransport:
         self._cache_final_payload = cache_final_payload
         self._stop_requested = stop_requested
         self._observation_context = threading.local()
+        self._celsius_cache_lock = threading.Lock()
+        self._celsius_cached_url: str | None = None
+        self._celsius_cached_at = 0.0
+        self._completion_condition = threading.Condition()
+        self._completion_sequence = 0
+        self._completion_by_conversation: dict[str, int] = {}
+        self._completion_thread: threading.Thread | None = None
+        self._completion_ready = threading.Event()
+        self._completion_error: str | None = None
+        self._early_handoff_expected: dict[str, str | None] = {}
+        self._early_handoff_controls: dict[str, dict[str, str | None]] = {}
 
     @staticmethod
     def request_error_allows_fallback(error: RequestError) -> bool:
@@ -564,6 +579,14 @@ class WKLightweightTransport:
 
     def _resolve_celsius_websocket_url(self, *, timeout: float) -> tuple[Any, str]:
         curl_requests = self._curl_requests()
+        now = time.monotonic()
+        with self._celsius_cache_lock:
+            if (
+                isinstance(self._celsius_cached_url, str)
+                and self._celsius_cached_url
+                and now - self._celsius_cached_at < _CELSIUS_URL_CACHE_SECONDS
+            ):
+                return curl_requests, self._celsius_cached_url
         celsius_path = "/backend-api/celsius/ws/user"
         try:
             celsius_headers = self.source_client.wk_transport_headers(
@@ -614,7 +637,322 @@ class WKLightweightTransport:
                 "WKWEBVIEW_CURL_WS_URL_MISSING",
                 request_stage="wkwebview_curl_ws_second_leg",
             )
+        with self._celsius_cache_lock:
+            self._celsius_cached_url = websocket_url
+            self._celsius_cached_at = time.monotonic()
         return curl_requests, websocket_url
+
+    def _record_conversation_completion(self, conversation_id: str) -> None:
+        normalized = conversation_id.strip() if isinstance(conversation_id, str) else ""
+        if not normalized:
+            return
+        with self._completion_condition:
+            self._completion_sequence += 1
+            self._completion_by_conversation[normalized] = self._completion_sequence
+            self._completion_condition.notify_all()
+
+    @staticmethod
+    def _conversation_completion_commands() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": 1,
+                "command": {
+                    "type": "connect",
+                    "presence": {
+                        "type": "presence",
+                        "state": "foreground",
+                    },
+                },
+            },
+            {
+                "id": 2,
+                "command": {
+                    "type": "subscribe",
+                    "topic_id": "conversations",
+                },
+            },
+        ]
+
+    @staticmethod
+    def _conversation_completion_ids(raw_frame: str) -> tuple[str, ...]:
+        if not isinstance(raw_frame, str) or not raw_frame:
+            return ()
+        try:
+            items = json.loads(raw_frame)
+        except ValueError:
+            return ()
+        if not isinstance(items, list):
+            items = [items]
+        conversation_ids: list[str] = []
+        for item in items[:128]:
+            if (
+                not isinstance(item, dict)
+                or item.get("type") != "message"
+                or item.get("topic_id") != "conversations"
+            ):
+                continue
+            payload = item.get("payload")
+            if (
+                not isinstance(payload, dict)
+                or payload.get("type") != "conversation-turn-complete"
+            ):
+                continue
+            inner = payload.get("payload")
+            conversation_id = (
+                inner.get("conversation_id") if isinstance(inner, dict) else None
+            )
+            if isinstance(conversation_id, str) and conversation_id.strip():
+                conversation_ids.append(conversation_id.strip())
+        return tuple(conversation_ids)
+
+    @staticmethod
+    def _early_handoff_control(raw_frame: str) -> dict[str, str | None] | None:
+        if not isinstance(raw_frame, str) or not raw_frame:
+            return None
+        try:
+            event = json.loads(raw_frame)
+        except ValueError:
+            return None
+        if not isinstance(event, dict) or event.get("type") != (
+            "conversation-turn-handoff-control"
+        ):
+            return None
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        attempt_id = payload.get("handoff_attempt_id")
+        conversation_id = payload.get("conversation_id")
+        turn_exchange_id = payload.get("turn_exchange_id")
+        topic_id = payload.get("topic_id")
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id.strip()
+            or not isinstance(conversation_id, str)
+            or not conversation_id.strip()
+            or not isinstance(turn_exchange_id, str)
+            or not turn_exchange_id.strip()
+            or not isinstance(topic_id, str)
+            or not topic_id.strip()
+            or not (
+                topic_id.startswith("conversation-")
+                or topic_id.startswith("conv-turn-low-ttl-")
+            )
+        ):
+            return None
+        server_request_id = payload.get("server_request_id")
+        return {
+            "attempt_id": attempt_id.strip(),
+            "conversation_id": conversation_id.strip(),
+            "turn_exchange_id": turn_exchange_id.strip(),
+            "topic_id": topic_id.strip(),
+            "server_request_id": (
+                server_request_id.strip()
+                if isinstance(server_request_id, str) and server_request_id.strip()
+                else None
+            ),
+        }
+
+    def _record_early_handoff_control(
+        self, control: dict[str, str | None]
+    ) -> None:
+        attempt_id = control.get("attempt_id")
+        conversation_id = control.get("conversation_id")
+        if not isinstance(attempt_id, str) or not isinstance(conversation_id, str):
+            return
+        with self._completion_condition:
+            if attempt_id not in self._early_handoff_expected:
+                return
+            expected_conversation_id = self._early_handoff_expected[attempt_id]
+            if (
+                expected_conversation_id is not None
+                and expected_conversation_id != conversation_id
+            ):
+                return
+            self._early_handoff_controls[attempt_id] = dict(control)
+            self._completion_condition.notify_all()
+
+    def arm_early_handoff(self, conversation_id: str | None = None) -> str | None:
+        if conversation_id is None:
+            normalized: str | None = None
+        elif isinstance(conversation_id, str):
+            normalized = conversation_id.strip()
+            if not normalized:
+                return None
+        else:
+            return None
+        attempt_id = str(uuid.uuid4())
+        with self._completion_condition:
+            if self._completion_error is not None:
+                return None
+            self._early_handoff_expected[attempt_id] = normalized
+            self._early_handoff_controls.pop(attempt_id, None)
+        return attempt_id
+
+    def early_handoff_control(
+        self, attempt_id: str, *, consume: bool = False
+    ) -> dict[str, str | None] | None:
+        normalized = attempt_id.strip() if isinstance(attempt_id, str) else ""
+        if not normalized:
+            return None
+        with self._completion_condition:
+            value = self._early_handoff_controls.get(normalized)
+            if value is None:
+                return None
+            result = dict(value)
+            if consume:
+                self._early_handoff_controls.pop(normalized, None)
+                self._early_handoff_expected.pop(normalized, None)
+            return result
+
+    def release_early_handoff(self, attempt_id: str | None) -> None:
+        normalized = attempt_id.strip() if isinstance(attempt_id, str) else ""
+        if not normalized:
+            return
+        with self._completion_condition:
+            self._early_handoff_controls.pop(normalized, None)
+            self._early_handoff_expected.pop(normalized, None)
+
+    async def _run_conversation_completion_socket(self) -> None:
+        import websockets
+
+        _curl_requests, websocket_url = self._resolve_celsius_websocket_url(
+            timeout=20.0
+        )
+        try:
+            headers = self.source_client.wk_transport_headers(
+                {"origin": "https://chatgpt.com"}
+            )
+        except AttributeError as error:
+            raise RequestError(
+                "WKWEBVIEW_GLOBAL_WS_SOURCE_CONTRACT_MISSING",
+                request_stage="wkwebview_global_completion_observer",
+            ) from error
+
+        async with websockets.connect(
+            websocket_url,
+            additional_headers=headers,
+            open_timeout=10,
+            close_timeout=0.25,
+            ping_interval=None,
+            ping_timeout=None,
+            max_size=None,
+        ) as websocket:
+            await websocket.send(
+                json.dumps(
+                    self._conversation_completion_commands(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            self._completion_ready.set()
+            while True:
+                raw_frame = await websocket.recv()
+                if not isinstance(raw_frame, str):
+                    continue
+                control = self._early_handoff_control(raw_frame)
+                if control is not None:
+                    self._record_early_handoff_control(control)
+                for conversation_id in self._conversation_completion_ids(raw_frame):
+                    self._record_conversation_completion(conversation_id)
+
+    def _conversation_completion_observer_main(self) -> None:
+        error: str | None = None
+        try:
+            asyncio.run(self._run_conversation_completion_socket())
+        except Exception as exc:
+            error = type(exc).__name__
+        finally:
+            with self._completion_condition:
+                self._completion_error = error
+                self._completion_condition.notify_all()
+            self._completion_ready.set()
+
+    def ensure_conversation_completion_observer(
+        self,
+        *,
+        timeout: float = 12.0,
+    ) -> bool:
+        with self._completion_condition:
+            thread = self._completion_thread
+            if thread is None or not thread.is_alive():
+                self._completion_ready.clear()
+                self._completion_error = None
+                thread = threading.Thread(
+                    target=self._conversation_completion_observer_main,
+                    name="cwa-wk-conversation-completion",
+                    daemon=True,
+                )
+                self._completion_thread = thread
+                thread.start()
+        if not self._completion_ready.wait(max(0.1, float(timeout))):
+            return False
+        with self._completion_condition:
+            return self._completion_error is None
+
+    def arm_conversation_completion(
+        self,
+        conversation_id: str,
+        *,
+        timeout: float = 12.0,
+    ) -> int | None:
+        normalized = conversation_id.strip() if isinstance(conversation_id, str) else ""
+        if not normalized:
+            return None
+        if not self.ensure_conversation_completion_observer(timeout=timeout):
+            return None
+        with self._completion_condition:
+            return self._completion_sequence
+
+    def current_completion_sequence(self) -> int:
+        with self._completion_condition:
+            return self._completion_sequence
+
+    def conversation_completion_sequence(self, conversation_id: str) -> int:
+        normalized = conversation_id.strip() if isinstance(conversation_id, str) else ""
+        if not normalized:
+            return 0
+        with self._completion_condition:
+            return self._completion_by_conversation.get(normalized, 0)
+
+    def conversation_completion_observed(
+        self,
+        conversation_id: str,
+        *,
+        after_sequence: int,
+    ) -> bool:
+        return self.conversation_completion_sequence(conversation_id) > int(
+            after_sequence
+        )
+
+    def wait_for_conversation_completion(
+        self,
+        conversation_id: str,
+        *,
+        after_sequence: int,
+        timeout: float,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> bool:
+        normalized = conversation_id.strip() if isinstance(conversation_id, str) else ""
+        if not normalized:
+            return False
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._completion_condition:
+            while True:
+                latest = self._completion_by_conversation.get(normalized, 0)
+                if latest > int(after_sequence):
+                    return True
+                if self._completion_error is not None:
+                    return False
+                if should_stop is not None:
+                    try:
+                        if bool(should_stop()):
+                            return False
+                    except Exception:
+                        pass
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._completion_condition.wait(timeout=min(0.25, remaining))
 
     def _stream_resume_topic(
         self,
@@ -625,6 +963,7 @@ class WKLightweightTransport:
         relay_text_event: Callable[[dict[str, Any]], None],
         on_transport_event: Callable[[dict[str, Any]], None] | None = None,
         stream_should_stop: Callable[[], bool] | None = None,
+        passive_completion_check: Callable[[], bool] | None = None,
     ) -> tuple[Any, dict[str, Any], int, float]:
         try:
             topic_id, state = self.source_client.wk_transport_resume_state(
@@ -675,9 +1014,21 @@ class WKLightweightTransport:
                 return True
             if raw_live_observer and stream_should_stop is not None:
                 try:
-                    return bool(stream_should_stop())
+                    if bool(stream_should_stop()):
+                        state["stream_terminal_observed"] = True
+                        state.setdefault("finish_reason", "stream_terminal")
+                        return True
                 except Exception:
-                    return False
+                    pass
+            if passive_completion_check is not None:
+                try:
+                    passive_terminal = bool(passive_completion_check())
+                except Exception:
+                    passive_terminal = False
+                if passive_terminal:
+                    state["stream_terminal_observed"] = True
+                    state.setdefault("finish_reason", "conversation_turn_complete")
+                    return True
             return False
 
         stream_kwargs: dict[str, Any] = {
@@ -719,6 +1070,7 @@ class WKLightweightTransport:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         on_token: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        passive_completion_check: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         normalized_topic = topic_id.strip() if isinstance(topic_id, str) else ""
         if not normalized_topic:
@@ -734,6 +1086,7 @@ class WKLightweightTransport:
             "resume_turn_topic_id": normalized_topic,
         }
         segment_done_count = 0
+        passive_terminal_observed = False
 
         def relay_event(event: dict[str, Any]) -> None:
             nonlocal segment_done_count
@@ -741,6 +1094,29 @@ class WKLightweightTransport:
                 segment_done_count += 1
             if on_event is not None:
                 on_event(event)
+
+        def topic_should_stop() -> bool:
+            nonlocal passive_terminal_observed
+            if should_stop is not None:
+                try:
+                    if bool(should_stop()):
+                        passive_terminal_observed = True
+                        state["stream_terminal_observed"] = True
+                        state.setdefault("finish_reason", "stream_terminal")
+                        return True
+                except Exception:
+                    pass
+            if passive_completion_check is not None:
+                try:
+                    terminal = bool(passive_completion_check())
+                except Exception:
+                    terminal = False
+                if terminal:
+                    passive_terminal_observed = True
+                    state["stream_terminal_observed"] = True
+                    state.setdefault("finish_reason", "conversation_turn_complete")
+                    return True
+            return False
 
         started = time.monotonic()
         try:
@@ -750,7 +1126,7 @@ class WKLightweightTransport:
                 state=state,
                 on_event=relay_event,
                 on_token=on_token,
-                should_stop=should_stop,
+                should_stop=topic_should_stop,
                 stop_on_done=False,
             )
         except AttributeError as error:
@@ -760,7 +1136,7 @@ class WKLightweightTransport:
             ) from error
         message_id = state.get("message_id")
         finish_reason = state.get("finish_reason")
-        stream_finality_proven = (
+        stream_finality_proven = passive_terminal_observed or (
             segment_done_count > 0
             and isinstance(message_id, str)
             and bool(message_id.strip())
@@ -838,6 +1214,7 @@ class WKLightweightTransport:
         relay_text_event: Callable[[dict[str, Any]], None],
         on_transport_event: Callable[[dict[str, Any]], None] | None = None,
         stream_should_stop: Callable[[], bool] | None = None,
+        passive_completion_check: Callable[[], bool] | None = None,
         text: str,
         baseline_current_node: str | None,
     ) -> dict[str, Any]:
@@ -848,6 +1225,7 @@ class WKLightweightTransport:
             relay_text_event=relay_text_event,
             on_transport_event=on_transport_event,
             stream_should_stop=stream_should_stop,
+            passive_completion_check=passive_completion_check,
         )
         message_id = state.get("message_id")
         finish_reason = state.get("finish_reason")
@@ -869,13 +1247,19 @@ class WKLightweightTransport:
                 "observed_reasoning_effort": observed_effort,
                 "ws_token_events": raw_sequence,
             }
-        if (
+        legacy_terminal = (
             raw_sequence > 0
             and isinstance(message_id, str)
-            and message_id.strip()
+            and bool(message_id.strip())
             and isinstance(finish_reason, str)
-            and finish_reason.strip()
-        ):
+            and bool(finish_reason.strip())
+        )
+        passive_terminal = (
+            state.get("stream_terminal_observed") is True
+            and isinstance(finish_reason, str)
+            and bool(finish_reason.strip())
+        )
+        if legacy_terminal or passive_terminal:
             return {
                 "ok": True,
                 "status": 200,
@@ -885,7 +1269,11 @@ class WKLightweightTransport:
                 "stream_ended": True,
                 "stream_terminal_observed": True,
                 "stream_finality_proven": True,
-                "message_id": message_id.strip(),
+                "message_id": (
+                    message_id.strip()
+                    if isinstance(message_id, str) and message_id.strip()
+                    else None
+                ),
                 "finish_reason": finish_reason.strip(),
                 "observed_model": observed_model,
                 "observed_reasoning_effort": observed_effort,

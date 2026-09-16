@@ -315,7 +315,10 @@ def _canonical_commit_snapshot(
                 int(time.time() * 1000),
             )
 
-    reader = getattr(client, "_get_conversation_payload", None)
+    prewrite_reader = getattr(client, "read_prewrite_canonical_payload", None)
+    reader = prewrite_reader if callable(prewrite_reader) else getattr(
+        client, "_get_conversation_payload", None
+    )
     if callable(reader):
         payload = reader(conversation_id)
         if isinstance(payload, dict):

@@ -33,6 +33,7 @@ from chatgpt_web_adapter.wkwebview_canonical import (
 )
 from chatgpt_web_adapter.wkwebview_helper_runtime import WKWebViewHelperRuntime
 from chatgpt_web_adapter.wkwebview_provider import WKWebViewTurnProvider
+from chatgpt_web_adapter.wkwebview_turn_orchestrator import WKTurnOrchestrator
 
 
 def _invocation_argv(invocation) -> list[str]:
@@ -89,6 +90,85 @@ def _final_canonical_for_prompt(prompt: str, *, assistant_text: str = "done") ->
             },
         },
     }
+
+
+def test_wkwebview_completed_turn_confirmation_rejects_stale_or_nonfinal() -> None:
+    provider = WKWebViewTurnProvider()
+    stale = _final_canonical_for_prompt("previous")
+    current = _final_canonical_for_prompt("current")
+    nonfinal = _final_canonical_for_prompt("current")
+    nonfinal["mapping"]["node-final"]["message"]["status"] = "in_progress"
+    nonfinal["mapping"]["node-final"]["message"]["end_turn"] = False
+
+    assert (
+        provider._canonical_confirms_completed_turn(
+            stale,
+            text="current",
+            baseline_current_node="node-before",
+        )
+        is False
+    )
+    assert (
+        provider._canonical_confirms_completed_turn(
+            current,
+            text="current",
+            baseline_current_node="node-before",
+        )
+        is True
+    )
+    assert (
+        provider._canonical_confirms_completed_turn(
+            current,
+            text="current",
+            baseline_current_node="node-final",
+        )
+        is False
+    )
+    assert (
+        provider._canonical_confirms_completed_turn(
+            nonfinal,
+            text="current",
+            baseline_current_node="node-before",
+        )
+        is False
+    )
+
+
+def test_wkwebview_completion_push_candidate_distinguishes_stale_from_lagging() -> None:
+    provider = WKWebViewTurnProvider()
+    stale = _final_canonical_for_prompt("previous")
+    stale["current_node"] = "node-before"
+
+    pending = _final_canonical_for_prompt("current")
+    pending["mapping"]["node-final"]["message"]["status"] = "in_progress"
+    pending["mapping"]["node-final"]["message"]["end_turn"] = False
+
+    complete = _final_canonical_for_prompt("current")
+
+    assert (
+        provider._classify_completion_push_candidate(
+            stale,
+            text="current",
+            baseline_current_node="node-before",
+        )
+        == "stale"
+    )
+    assert (
+        provider._classify_completion_push_candidate(
+            pending,
+            text="current",
+            baseline_current_node="node-before",
+        )
+        == "pending"
+    )
+    assert (
+        provider._classify_completion_push_candidate(
+            complete,
+            text="current",
+            baseline_current_node="node-before",
+        )
+        == "complete"
+    )
 
 
 def test_wk_shared_final_wait_survives_registry_cleanup_race(
@@ -510,6 +590,109 @@ print("WK_RESULT " + json.dumps({
     assert payload["stream_conversation_id"] == "conversation-private"
     assert payload["_cwa_stop_conduit_token"] == "conduit-test"
     assert payload["_cwa_stop_turn_trace_id"] == "trace-test"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="helper process control is POSIX-only")
+def test_wkwebview_helper_can_finish_from_browser_stream_completion(
+    monkeypatch, tmp_path
+) -> None:
+    helper = tmp_path / "fake-wk-helper"
+    helper.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+import time
+
+json.load(sys.stdin)
+print("WK_EVENT " + json.dumps({
+    "type": "submit_request_observed",
+    "temporary_mode": True,
+}), flush=True)
+print("WK_EVENT " + json.dumps({
+    "type": "assistant_text_delta",
+    "message_id": "assistant-stream-complete",
+    "sequence": 1,
+    "delta": "done",
+}), flush=True)
+print("WK_EVENT " + json.dumps({
+    "type": "raw_ws_event",
+    "parsed": {
+        "type": "message_stream_complete",
+        "conversation_id": "conversation-stream-complete",
+    },
+}), flush=True)
+time.sleep(10)
+print("WK_RESULT " + json.dumps({
+    "ok": False,
+    "error": "SHOULD_NOT_REACH_RESULT",
+}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    helper.chmod(0o700)
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: helper)
+    invocation = provider._helper_command(
+        conversation_id=None,
+        text="prompt-private",
+        timeout=10,
+    )
+
+    state: dict[str, Any] = {
+        "temporary_mode": False,
+        "assistant_message_id": None,
+        "conversation_id": None,
+    }
+
+    def on_text(event: dict[str, Any]) -> None:
+        message_id = event.get("message_id")
+        if isinstance(message_id, str) and message_id:
+            state["assistant_message_id"] = message_id
+
+    def on_transport(event: dict[str, Any]) -> None:
+        if (
+            event.get("type") == "submit_request_observed"
+            and event.get("temporary_mode") is True
+        ):
+            state["temporary_mode"] = True
+        parsed = event.get("parsed")
+        if (
+            event.get("type") == "raw_ws_event"
+            and isinstance(parsed, dict)
+            and parsed.get("type") == "message_stream_complete"
+        ):
+            state["conversation_id"] = parsed.get("conversation_id")
+
+    def completion_check() -> bool | dict[str, Any]:
+        if (
+            state["temporary_mode"] is not True
+            or not state["assistant_message_id"]
+            or not state["conversation_id"]
+        ):
+            return False
+        return {
+            "kind": "browser_stream_complete",
+            "conversation_id": state["conversation_id"],
+            "assistant_message_id": state["assistant_message_id"],
+        }
+
+    started = time.monotonic()
+    payload = provider._run_helper_streaming(
+        invocation,
+        timeout=10,
+        on_text_event=on_text,
+        on_transport_event=on_transport,
+        external_completion_check=completion_check,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3
+    assert payload["conversation_id"] == "conversation-stream-complete"
+    assert payload["assistant_message_id"] == "assistant-stream-complete"
+    assert payload["stream_terminal_observed"] is True
+    assert payload["write_commit_proven"] is True
+    assert payload["write_commit_proof"] == "BROWSER_STREAM_COMPLETE"
+    assert payload["_cwa_browser_stream_complete_observed"] is True
 
 
 def test_wkwebview_canonical_read_caches_current_node(monkeypatch) -> None:
@@ -1392,6 +1575,229 @@ def test_wkwebview_minimal_security_shell_terminal_continuation_skips_resume(
     assert result.phase_a_transport == "wkwebview_minimal_security_shell"
     assert result.phase_b_transport == "phase_one_terminal"
     assert result.phase_b_fallback_reason is None
+    assert result.stream_finality_proven is True
+
+
+def test_wkwebview_minimal_completion_verification_waits_for_post_submit_grace(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    prewrite = {
+        "current_node": "node-before",
+        "mapping": {
+            "node-before": {
+                "message": {
+                    "id": "assistant-message-before",
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["previous answer"]},
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(
+        provider, "read_conversation_payload", lambda *args, **kwargs: prewrite
+    )
+
+    clock = {"now": 100.0}
+    completion = {"sequence": 10}
+    reads = {"count": 0}
+    provider._lightweight_transport = SimpleNamespace(
+        arm_conversation_completion=lambda conversation_id, timeout: 10,
+        current_completion_sequence=lambda: completion["sequence"],
+        conversation_completion_sequence=lambda conversation_id: completion["sequence"],
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_provider.time.monotonic",
+        lambda: clock["now"],
+    )
+
+    canonical = _final_canonical_for_prompt("continue")
+
+    def read_once(conversation_id, *, timeout):
+        reads["count"] += 1
+        return canonical, None
+
+    monkeypatch.setattr(
+        provider, "_read_conversation_payload_via_coordinated_curl", read_once
+    )
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        submit_started = provider._authority_context.on_submit_started
+        completion_check = provider._authority_context.external_completion_check
+        assert callable(submit_started)
+        assert callable(completion_check)
+        submit_started()
+        completion["sequence"] = 11
+
+        clock["now"] = 105.0
+        assert completion_check() is False
+        assert reads["count"] == 0
+
+        clock["now"] = 119.9
+        assert completion_check() is False
+        assert reads["count"] == 0
+
+        clock["now"] = 120.6
+        assert completion_check() is True
+        assert reads["count"] == 1
+
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "write_commit_proof": "PHASE_A_TERMINAL",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": True,
+            "stream_terminal_observed": True,
+            "stream_resume_present": False,
+            "stream_resume_handoff_written": False,
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(
+        provider,
+        "_resume_via_curl_ws_second_leg",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("terminal Phase A must not start a resume second leg")
+        ),
+    )
+
+    with provider.require_profile("FAST"):
+        result = provider.send_text_streaming(
+            "continue",
+            conversation="conversation-1",
+            on_text_event=lambda event: None,
+        )
+
+    assert result.stream_finality_proven is True
+    assert reads["count"] == 1
+
+
+def test_wkwebview_minimal_completion_verifies_each_passive_sequence_once(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    prewrite = {
+        "current_node": "node-before",
+        "mapping": {
+            "node-before": {
+                "message": {
+                    "id": "assistant-message-before",
+                    "author": {"role": "assistant"},
+                    "content": {"parts": ["previous answer"]},
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(
+        provider, "read_conversation_payload", lambda *args, **kwargs: prewrite
+    )
+
+    clock = {"now": 100.0}
+    completion = {"sequence": 10}
+    reads = {"count": 0}
+    provider._lightweight_transport = SimpleNamespace(
+        arm_conversation_completion=lambda conversation_id, timeout: 10,
+        current_completion_sequence=lambda: completion["sequence"],
+        conversation_completion_sequence=lambda conversation_id: completion["sequence"],
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_provider.time.monotonic",
+        lambda: clock["now"],
+    )
+
+    pending = _final_canonical_for_prompt("continue")
+    pending["mapping"]["node-final"]["message"]["status"] = "in_progress"
+    pending["mapping"]["node-final"]["message"]["end_turn"] = False
+
+    def read_pending(conversation_id, *, timeout):
+        reads["count"] += 1
+        return pending, None
+
+    monkeypatch.setattr(
+        provider, "_read_conversation_payload_via_coordinated_curl", read_pending
+    )
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        extra_env=None,
+    ):
+        submit_started = provider._authority_context.on_submit_started
+        completion_check = provider._authority_context.external_completion_check
+        assert callable(submit_started)
+        assert callable(completion_check)
+        submit_started()
+
+        completion["sequence"] = 11
+        clock["now"] = 120.0
+        assert completion_check() is False
+        clock["now"] = 122.1
+        assert completion_check() is False
+        assert reads["count"] == 1
+
+        for now in (124.5, 130.0, 145.0):
+            clock["now"] = now
+            assert completion_check() is False
+            assert reads["count"] == 1
+
+        completion["sequence"] = 12
+        clock["now"] = 146.0
+        assert completion_check() is False
+        clock["now"] = 148.1
+        assert completion_check() is False
+        assert reads["count"] == 2
+
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "write_commit_proof": "PHASE_A_TERMINAL",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_ended": True,
+            "stream_terminal_observed": True,
+            "stream_resume_present": False,
+            "stream_resume_handoff_written": False,
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    monkeypatch.setattr(
+        provider,
+        "_resume_via_curl_ws_second_leg",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("terminal Phase A must not start a resume second leg")
+        ),
+    )
+
+    with provider.require_profile("FAST"):
+        result = provider.send_text_streaming(
+            "continue",
+            conversation="conversation-1",
+            on_text_event=lambda event: None,
+        )
+
+    assert result.stream_finality_proven is True
+    assert reads["count"] == 2
 
 
 def test_wkwebview_new_chat_recovers_identity_by_client_message_id(
@@ -2168,6 +2574,220 @@ def test_wkwebview_write_commit_retry_uses_bounded_backoff(monkeypatch) -> None:
     assert calls == [1.0]
 
 
+def test_wkwebview_identity_recovery_switches_to_passive_topic_after_one_read(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    provider._lightweight_transport = SimpleNamespace()
+    partial_payload = {
+        "current_node": "user-current",
+        "mapping": {
+            "node-before": {
+                "id": "node-before",
+                "parent": None,
+                "children": ["user-current"],
+                "message": {
+                    "id": "assistant-before",
+                    "author": {"role": "assistant"},
+                    "content": {"content_type": "text", "parts": ["before"]},
+                    "metadata": {},
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                },
+            },
+            "user-current": {
+                "id": "user-current",
+                "parent": "node-before",
+                "children": [],
+                "message": {
+                    "id": "client-message-1",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["recover live"]},
+                    "metadata": {
+                        "turn_exchange_id": "11111111-2222-3333-4444-555555555555"
+                    },
+                    "status": "finished_successfully",
+                    "end_turn": None,
+                },
+            },
+        },
+    }
+    reads = 0
+
+    def read_once(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return partial_payload, None
+
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_via_coordinated_curl",
+        read_once,
+    )
+    prepared = SimpleNamespace(
+        conversation_id="conversation-1",
+        baseline_current_node="node-before",
+        minimal_model_slug=None,
+        minimal_thinking_effort=None,
+    )
+    payload = provider._turn_orchestrator.recover_phase_one_identity(
+        {
+            "identity_recovery_required": True,
+            "client_message_id": "client-message-1",
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+        },
+        prepared=prepared,
+        text="recover live",
+        total_timeout=30,
+        started=time.monotonic(),
+    )
+
+    assert reads == 1
+    assert payload["stream_topic_id"] == (
+        "conversation-turn-11111111-2222-3333-4444-555555555555"
+    )
+    assert payload["turn_exchange_id"] == "11111111-2222-3333-4444-555555555555"
+    assert payload["_cwa_identity_recovery_kind"] == "stream_topic"
+    assert payload["stream_terminal_observed"] is False
+
+    followed = {}
+
+    monkeypatch.setattr(provider, "_lightweight_path_enabled", lambda: True)
+
+    def follow_topic(**kwargs):
+        followed.update(kwargs)
+        return {
+            "stream_finality_proven": True,
+            "message_id": "assistant-final",
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(provider, "_resume_via_curl_ws_topic_second_leg", follow_topic)
+    monkeypatch.setattr(provider, "cache_continuation_cursor", lambda *args, **kwargs: None)
+
+    passive = provider._turn_orchestrator.resume_after_phase_one(
+        payload,
+        result_conversation_id="conversation-1",
+        phase_one_final_cached=False,
+        prepared=prepared,
+        text="recover live",
+        total_timeout=30,
+        started=time.monotonic(),
+        streaming=True,
+        make_stream_relay=lambda: (lambda _event: None),
+    )
+
+    assert passive is False
+    assert followed["conversation_id"] == "conversation-1"
+    assert followed["topic_id"] == (
+        "conversation-turn-11111111-2222-3333-4444-555555555555"
+    )
+    assert followed["turn_exchange_id"] == "11111111-2222-3333-4444-555555555555"
+    assert payload["_cwa_phase_b_transport"] == "curl_cffi_websocket_topic_handoff"
+
+
+def test_wkwebview_verified_completion_reuses_canonical_without_second_read(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    final_payload = _final_canonical_for_prompt("verified final", assistant_text="done")
+    provider._lightweight_transport = SimpleNamespace()
+
+    def fail_read(*args, **kwargs):
+        raise AssertionError("verified canonical must avoid a second network read")
+
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_via_coordinated_curl",
+        fail_read,
+    )
+
+    result = provider._turn_orchestrator.recover_phase_one_identity(
+        {
+            "identity_recovery_required": True,
+            "client_message_id": "",
+            "conversation_id": "conversation-1",
+            "response_status": 0,
+        },
+        prepared=SimpleNamespace(
+            conversation_id="conversation-1",
+            baseline_current_node="node-before",
+        ),
+        text="verified final",
+        total_timeout=30,
+        started=time.monotonic(),
+        completion_watch_sequence=9,
+        verified_canonical=final_payload,
+    )
+
+    assert result["conversation_id"] == "conversation-1"
+    assert result["write_commit_proof"] == "PASSIVE_COMPLETION_PROMPT_RECOVERY"
+    assert result["_cwa_identity_recovery_transport"] == (
+        "conversations_ws_then_curl_cffi"
+    )
+    assert result["_cwa_identity_recovery_kind"] == "passive_completion"
+    assert result["stream_terminal_observed"] is True
+    assert result["_cwa_stream_finality_proven"] is True
+
+
+def test_wkwebview_known_continuation_waits_for_passive_completion_then_reads_once(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    final_payload = _final_canonical_for_prompt("push final", assistant_text="done")
+    final_payload["mapping"]["user-final"]["message"]["id"] = "client-message-1"
+    waits: list[dict[str, object]] = []
+
+    def wait_for_completion(conversation_id, **kwargs):
+        waits.append({"conversation_id": conversation_id, **kwargs})
+        return True
+
+    provider._lightweight_transport = SimpleNamespace(
+        wait_for_conversation_completion=wait_for_completion
+    )
+    reads = 0
+
+    def read_once(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return final_payload, None
+
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_via_coordinated_curl",
+        read_once,
+    )
+
+    result = provider._turn_orchestrator.recover_phase_one_identity(
+        {
+            "identity_recovery_required": True,
+            "client_message_id": "client-message-1",
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+        },
+        prepared=SimpleNamespace(
+            conversation_id="conversation-1",
+            baseline_current_node="node-before",
+        ),
+        text="push final",
+        total_timeout=30,
+        started=time.monotonic(),
+        completion_watch_sequence=7,
+    )
+
+    assert reads == 1
+    assert len(waits) == 1
+    assert waits[0]["conversation_id"] == "conversation-1"
+    assert waits[0]["after_sequence"] == 7
+    assert result["write_commit_proof"] == "PASSIVE_COMPLETION_MESSAGE_ID_RECOVERY"
+    assert result["_cwa_identity_recovery_transport"] == (
+        "conversations_ws_then_curl_cffi"
+    )
+    assert result["_cwa_identity_recovery_kind"] == "passive_completion"
+    assert result["stream_terminal_observed"] is True
+
+
 def test_wkwebview_known_continuation_recovers_without_client_message_id(
     monkeypatch,
 ) -> None:
@@ -2406,3 +3026,41 @@ def test_wkwebview_architecture_docs_capture_production_boundaries() -> None:
         "Fallback reasons are normalized",
     ):
         assert required in architecture
+
+
+def test_lightweight_phase_one_does_not_use_global_heavy_submit_gate() -> None:
+    calls: list[str] = []
+
+    class Provider:
+        @staticmethod
+        def _lightweight_path_enabled() -> bool:
+            return True
+
+        def _heavy_submit_gate(self, timeout: float):
+            raise AssertionError("lightweight phase one must not enter global heavy submit gate")
+
+        def _run_helper_streaming(
+            self,
+            invocation,
+            *,
+            timeout: float,
+            on_text_event,
+            on_lifecycle_event,
+            **kwargs,
+        ) -> dict[str, Any]:
+            calls.append("stream")
+            return {"ok": True, "conversation_id": "conv", "response_status": 200}
+
+    orchestrator = WKTurnOrchestrator(Provider())
+    result = orchestrator.run_protected_phase_one(
+        SimpleNamespace(command=["helper", "--minimal-security-shell"]),
+        total_timeout=30.0,
+        started=time.monotonic(),
+        streaming=True,
+        on_text_event=lambda event: None,
+        on_write_identity=lambda event: None,
+    )
+
+    assert calls == ["stream"]
+    assert result["_cwa_phase_a_gate_wait_ms"] == 0
+    assert result["_cwa_phase_a_transport"] == "wkwebview_minimal_security_shell"

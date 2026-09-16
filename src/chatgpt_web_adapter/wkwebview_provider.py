@@ -58,6 +58,8 @@ class WKWebViewTurnProvider:
     _canonical_read_min_spacing_seconds = 5.0
     _canonical_rate_limit_initial_backoff_seconds = 15.0
     _canonical_rate_limit_max_backoff_seconds = 60.0
+    _minimal_completion_verify_grace_seconds = 20.0
+    _minimal_completion_consistency_delay_seconds = 2.0
     _shared_heavy_submit_lock_path = (
         Path.home()
         / "Library"
@@ -702,6 +704,7 @@ class WKWebViewTurnProvider:
         relay_text_event: Any,
         on_transport_event: Any = None,
         stream_should_stop: Any = None,
+        passive_completion_check: Any = None,
         text: str,
         baseline_current_node: str | None,
     ) -> dict[str, Any]:
@@ -741,6 +744,7 @@ class WKWebViewTurnProvider:
                 relay_text_event=relay_text_event,
                 on_transport_event=on_transport_event,
                 stream_should_stop=stream_should_stop,
+                passive_completion_check=passive_completion_check,
                 text=text,
                 baseline_current_node=baseline_current_node,
             )
@@ -761,6 +765,7 @@ class WKWebViewTurnProvider:
         relay_text_event: Any,
         on_transport_event: Any = None,
         stream_should_stop: Any = None,
+        passive_completion_check: Any = None,
     ) -> dict[str, Any]:
         transport = self._lightweight_transport
         if transport is None:
@@ -797,6 +802,7 @@ class WKWebViewTurnProvider:
                 on_event=on_transport_event,
                 on_token=None if callable(on_transport_event) else relay_token,
                 should_stop=stream_should_stop,
+                passive_completion_check=passive_completion_check,
             )
         finally:
             self._clear_active_stream(
@@ -988,15 +994,28 @@ class WKWebViewTurnProvider:
         conversation_id: str,
         *,
         timeout: float,
+        coordinated: bool = True,
     ) -> dict[str, Any]:
         fallback_reason = None
         if self._lightweight_path_enabled():
-            payload, fallback_reason = (
-                self._read_conversation_payload_via_coordinated_curl(
+            if coordinated:
+                payload, fallback_reason = (
+                    self._read_conversation_payload_via_coordinated_curl(
+                        conversation_id,
+                        timeout=timeout,
+                    )
+                )
+            else:
+                payload = self._read_conversation_payload_via_curl(
                     conversation_id,
                     timeout=timeout,
                 )
-            )
+                transport = self._lightweight_transport
+                fallback_reason = (
+                    transport.take_canonical_fallback_reason()
+                    if transport is not None
+                    else None
+                )
             if isinstance(payload, dict):
                 self._record_canonical_read_observation("curl_cffi")
                 return payload
@@ -1020,6 +1039,26 @@ class WKWebViewTurnProvider:
         self._record_canonical_read_observation("wkwebview", fallback_reason)
         return parsed
 
+    def read_prewrite_conversation_payload(
+        self,
+        conversation_id: str,
+        *,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        previous = bool(
+            getattr(self._canonical_read_context, "prewrite_uncoordinated", False)
+        )
+        self._canonical_read_context.prewrite_uncoordinated = True
+        try:
+            payload = self.read_conversation_payload(conversation_id, timeout=timeout)
+            self._canonical_state.cache_continuation_cursor_from_payload(
+                ConversationRef(conversation_id).conversation_id,
+                payload,
+            )
+            return payload
+        finally:
+            self._canonical_read_context.prewrite_uncoordinated = previous
+
     def read_conversation_payload(
         self,
         conversation_id: str,
@@ -1037,6 +1076,9 @@ class WKWebViewTurnProvider:
         parsed = self._read_conversation_payload_uncached(
             ref.conversation_id,
             timeout=total_timeout,
+            coordinated=not bool(
+                getattr(self._canonical_read_context, "prewrite_uncoordinated", False)
+            ),
         )
         if self._canonical_state.payload_is_final(parsed):
             self._canonical_state.cache_final_payload(ref.conversation_id, parsed)
@@ -1114,6 +1156,51 @@ class WKWebViewTurnProvider:
     @staticmethod
     def _current_branch_contains_user_text(payload: dict[str, Any], text: str) -> bool:
         return WKCanonicalState.current_branch_contains_user_text(payload, text)
+
+    def _canonical_confirms_completed_turn(
+        self,
+        payload: dict[str, Any],
+        *,
+        text: str,
+        baseline_current_node: str | None,
+    ) -> bool:
+        current_node = payload.get("current_node")
+        node_changed = baseline_current_node is None or (
+            isinstance(current_node, str)
+            and bool(current_node)
+            and current_node != baseline_current_node
+        )
+        return (
+            node_changed
+            and self._current_branch_contains_user_text(payload, text)
+            and self._canonical_state.payload_is_final(payload)
+        )
+
+    def _classify_completion_push_candidate(
+        self,
+        payload: dict[str, Any],
+        *,
+        text: str,
+        baseline_current_node: str | None,
+    ) -> str:
+        if self._canonical_confirms_completed_turn(
+            payload,
+            text=text,
+            baseline_current_node=baseline_current_node,
+        ):
+            return "complete"
+
+        current_node = payload.get("current_node")
+        contains_current_prompt = self._current_branch_contains_user_text(payload, text)
+        if (
+            isinstance(baseline_current_node, str)
+            and baseline_current_node
+            and current_node == baseline_current_node
+            and not contains_current_prompt
+        ):
+            return "stale"
+
+        return "pending"
 
     def _wait_for_canonical_write_commit(
         self,
@@ -1274,14 +1361,24 @@ class WKWebViewTurnProvider:
         on_text_event: Any,
         on_lifecycle_event: Any = None,
         on_transport_event: Any = None,
+        external_completion_check: Any = None,
         extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        completion_check = external_completion_check
+        if completion_check is None:
+            completion_check = getattr(
+                self._authority_context, "external_completion_check", None
+            )
         return self._helper_runtime.run_streaming(
             invocation,
             timeout=timeout,
             on_text_event=on_text_event,
             on_lifecycle_event=on_lifecycle_event,
             on_transport_event=on_transport_event,
+            on_submit_started=getattr(
+                self._authority_context, "on_submit_started", None
+            ),
+            external_completion_check=completion_check,
             extra_env=extra_env,
         )
 
@@ -1425,6 +1522,7 @@ class WKWebViewTurnProvider:
         on_write_identity: Any = None,
         on_transport_event: Any = None,
         stream_should_stop: Any = None,
+        defer_phase_b: bool = False,
     ) -> BrowserNativeTurnResult:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("text is required")
@@ -1445,12 +1543,47 @@ class WKWebViewTurnProvider:
             model_slug=model_slug,
             streaming=streaming,
         )
+        completion_watch_sequence: int | None = None
+        completion_watch_state: dict[str, Any] | None = None
+        early_handoff_attempt_id: str | None = None
+        if (
+            streaming
+            and prepared.conversation_id is not None
+            and self._lightweight_path_enabled()
+            and self._lightweight_transport is not None
+        ):
+            completion_watch_sequence = (
+                self._lightweight_transport.arm_conversation_completion(
+                    prepared.conversation_id,
+                    timeout=min(8.0, total_timeout),
+                )
+            )
+            if completion_watch_sequence is not None:
+                completion_watch_state = {
+                    "sequence": completion_watch_sequence,
+                    "activated": False,
+                    "activated_at": None,
+                    "pending_sequence": None,
+                    "verify_after": 0.0,
+                    "verify_attempts": 0,
+                    "verified_canonical": None,
+                }
+                if prepared.use_minimal_security_shell:
+                    arm_early_handoff = getattr(
+                        self._lightweight_transport, "arm_early_handoff", None
+                    )
+                    if callable(arm_early_handoff):
+                        early_handoff_attempt_id = arm_early_handoff(
+                            prepared.conversation_id
+                        )
         invocation = self._turn_orchestrator.build_turn_invocation(
             text=text,
             total_timeout=total_timeout,
             prepared=prepared,
             streaming=streaming,
         )
+        if early_handoff_attempt_id is not None:
+            invocation.request["minimal_handoff_attempt_id"] = early_handoff_attempt_id
         make_stream_relay = (
             self._turn_orchestrator.stream_relay_factory(on_text_event)
             if streaming
@@ -1470,24 +1603,241 @@ class WKWebViewTurnProvider:
             if on_write_identity is not None:
                 on_write_identity(event)
 
-        try:
-            payload = self._turn_orchestrator.run_protected_phase_one(
-                invocation,
-                total_timeout=total_timeout,
-                started=started,
-                streaming=streaming,
-                on_text_event=make_stream_relay()
-                if make_stream_relay is not None
-                else None,
-                on_write_identity=handle_write_identity,
-                on_transport_event=on_transport_event,
+        completion_consistency_delays = (0.5, 0.75, 1.25)
+
+        def handle_submit_started() -> None:
+            if (
+                completion_watch_state is None
+                or self._lightweight_transport is None
+            ):
+                return
+            completion_watch_state.update(
+                {
+                    "sequence": (
+                        self._lightweight_transport.current_completion_sequence()
+                    ),
+                    "activated": True,
+                    "activated_at": time.monotonic(),
+                    "pending_sequence": None,
+                    "verify_after": 0.0,
+                    "verify_attempts": 0,
+                    "verified_canonical": None,
+                }
             )
+
+        def external_completion_observed() -> bool | dict[str, Any]:
+            if (
+                early_handoff_attempt_id is not None
+                and self._lightweight_transport is not None
+            ):
+                read_early_handoff = getattr(
+                    self._lightweight_transport, "early_handoff_control", None
+                )
+                control = (
+                    read_early_handoff(early_handoff_attempt_id)
+                    if callable(read_early_handoff)
+                    else None
+                )
+                if control is not None:
+                    return {
+                        "kind": "early_handoff",
+                        **control,
+                    }
+            if (
+                completion_watch_state is None
+                or completion_watch_state.get("activated") is not True
+                or prepared.conversation_id is None
+                or self._lightweight_transport is None
+            ):
+                return False
+            baseline_sequence = completion_watch_state.get("sequence")
+            if not isinstance(baseline_sequence, int) or isinstance(
+                baseline_sequence, bool
+            ):
+                return False
+
+            latest_sequence = (
+                self._lightweight_transport.conversation_completion_sequence(
+                    prepared.conversation_id
+                )
+            )
+            if latest_sequence <= baseline_sequence:
+                return False
+
+            now = time.monotonic()
+            pending_sequence = completion_watch_state.get("pending_sequence")
+            if pending_sequence != latest_sequence:
+                consistency_delay = (
+                    self._minimal_completion_consistency_delay_seconds
+                    if prepared.use_minimal_security_shell
+                    else completion_consistency_delays[0]
+                )
+                verify_after = now + consistency_delay
+                activated_at = completion_watch_state.get("activated_at")
+                if (
+                    prepared.use_minimal_security_shell
+                    and isinstance(activated_at, (int, float))
+                ):
+                    verify_after = max(
+                        verify_after,
+                        float(activated_at)
+                        + self._minimal_completion_verify_grace_seconds,
+                    )
+                completion_watch_state.update(
+                    {
+                        "pending_sequence": latest_sequence,
+                        "verify_after": verify_after,
+                        "verify_attempts": 0,
+                        "verified_canonical": None,
+                    }
+                )
+                return False
+
+            verify_after = completion_watch_state.get("verify_after")
+            if isinstance(verify_after, (int, float)) and now < float(verify_after):
+                return False
+
+            attempts_value = completion_watch_state.get("verify_attempts")
+            attempts = (
+                attempts_value
+                if isinstance(attempts_value, int)
+                and not isinstance(attempts_value, bool)
+                else 0
+            )
+            attempts += 1
+            completion_watch_state["verify_attempts"] = attempts
+
+            canonical: dict[str, Any] | None = None
+            remaining = max(0.0, total_timeout - (now - started))
+            if remaining > 0:
+                try:
+                    candidate, _fallback_reason = (
+                        self._read_conversation_payload_via_coordinated_curl(
+                            prepared.conversation_id,
+                            timeout=min(5.0, max(1.0, remaining)),
+                        )
+                    )
+                except Exception:
+                    candidate = None
+                if isinstance(candidate, dict):
+                    canonical = candidate
+
+            if canonical is not None:
+                candidate_state = self._classify_completion_push_candidate(
+                    canonical,
+                    text=text,
+                    baseline_current_node=prepared.baseline_current_node,
+                )
+                if candidate_state == "complete":
+                    completion_watch_state["verified_canonical"] = canonical
+                    completion_watch_state["sequence"] = latest_sequence
+                    return True
+                if candidate_state == "stale":
+                    completion_watch_state.update(
+                        {
+                            "sequence": latest_sequence,
+                            "pending_sequence": None,
+                            "verify_after": 0.0,
+                            "verify_attempts": 0,
+                            "verified_canonical": None,
+                        }
+                    )
+                    return False
+
+            if prepared.use_minimal_security_shell:
+                completion_watch_state.update(
+                    {
+                        "sequence": latest_sequence,
+                        "pending_sequence": None,
+                        "verify_after": 0.0,
+                        "verify_attempts": 0,
+                        "verified_canonical": None,
+                    }
+                )
+                return False
+
+            if attempts < len(completion_consistency_delays):
+                completion_watch_state["verify_after"] = (
+                    time.monotonic()
+                    + completion_consistency_delays[attempts]
+                )
+                return False
+
+            # A late completion for the previous turn can arrive after the next
+            # submit. Consume that sequence without detaching the current helper.
+            completion_watch_state.update(
+                {
+                    "sequence": latest_sequence,
+                    "pending_sequence": None,
+                    "verify_after": 0.0,
+                    "verify_attempts": 0,
+                    "verified_canonical": None,
+                }
+            )
+            return False
+
+        def phase_b_completion_observed() -> bool:
+            if (
+                completion_watch_state is None
+                or completion_watch_state.get("activated") is not True
+                or prepared.conversation_id is None
+                or self._lightweight_transport is None
+            ):
+                return False
+            baseline_sequence = completion_watch_state.get("sequence")
+            if not isinstance(baseline_sequence, int) or isinstance(
+                baseline_sequence, bool
+            ):
+                return False
+            return self._lightweight_transport.conversation_completion_observed(
+                prepared.conversation_id,
+                after_sequence=baseline_sequence,
+            )
+
+        try:
+            self._authority_context.on_submit_started = (
+                handle_submit_started if completion_watch_state is not None else None
+            )
+            self._authority_context.external_completion_check = (
+                external_completion_observed
+                if completion_watch_state is not None
+                else None
+            )
+            try:
+                payload = self._turn_orchestrator.run_protected_phase_one(
+                    invocation,
+                    total_timeout=total_timeout,
+                    started=started,
+                    streaming=streaming,
+                    on_text_event=make_stream_relay()
+                    if make_stream_relay is not None
+                    else None,
+                    on_write_identity=handle_write_identity,
+                    on_transport_event=on_transport_event,
+                )
+            finally:
+                self._authority_context.on_submit_started = None
+                self._authority_context.external_completion_check = None
+            verified_canonical = None
+            if completion_watch_state is not None:
+                sequence = completion_watch_state.get("sequence")
+                completion_watch_sequence = (
+                    sequence
+                    if isinstance(sequence, int) and not isinstance(sequence, bool)
+                    else completion_watch_sequence
+                )
+                candidate = completion_watch_state.get("verified_canonical")
+                if isinstance(candidate, dict):
+                    verified_canonical = candidate
             payload = self._turn_orchestrator.recover_phase_one_identity(
                 payload,
                 prepared=prepared,
                 text=text,
                 total_timeout=total_timeout,
                 started=started,
+                completion_watch_sequence=completion_watch_sequence,
+                verified_canonical=verified_canonical,
+                stream_should_stop=stream_should_stop,
             )
             recovered_conversation_id = payload.get("conversation_id")
             if (
@@ -1513,7 +1863,64 @@ class WKWebViewTurnProvider:
         except Exception:
             if identity_conversation_id is not None:
                 self._clear_stop_context(identity_conversation_id)
+            if self._lightweight_transport is not None:
+                release_early_handoff = getattr(
+                    self._lightweight_transport, "release_early_handoff", None
+                )
+                if callable(release_early_handoff):
+                    release_early_handoff(early_handoff_attempt_id)
             raise
+
+        deferred_topic_id = payload.get("stream_topic_id")
+        deferred_stream_conversation_id = payload.get("stream_conversation_id")
+        phase_one_terminal = (
+            phase_one.phase_one_final_cached
+            or payload.get("stream_terminal_observed") is True
+        )
+        exact_deferred_topic = (
+            defer_phase_b
+            and streaming
+            and not phase_one_terminal
+            and isinstance(deferred_topic_id, str)
+            and bool(deferred_topic_id.strip())
+            and (
+                not isinstance(deferred_stream_conversation_id, str)
+                or not deferred_stream_conversation_id.strip()
+                or deferred_stream_conversation_id.strip() == phase_one.conversation_id
+            )
+            and self._lightweight_path_enabled()
+        )
+        if exact_deferred_topic:
+            normalized_topic = deferred_topic_id.strip()
+            turn_exchange_id = payload.get("turn_exchange_id")
+            self._register_active_stream(
+                phase_one.conversation_id,
+                normalized_topic,
+                turn_exchange_id=(
+                    turn_exchange_id.strip()
+                    if isinstance(turn_exchange_id, str) and turn_exchange_id.strip()
+                    else None
+                ),
+                baseline_current_node=prepared.baseline_current_node,
+            )
+            payload["_cwa_deferred_stream_topic_id"] = normalized_topic
+            payload["_cwa_phase_b_transport"] = (
+                "deferred_curl_cffi_websocket_topic_handoff"
+            )
+            payload["_cwa_phase_b_elapsed_ms"] = 0
+            if self._lightweight_transport is not None:
+                release_early_handoff = getattr(
+                    self._lightweight_transport, "release_early_handoff", None
+                )
+                if callable(release_early_handoff):
+                    release_early_handoff(early_handoff_attempt_id)
+            return self._turn_orchestrator.build_turn_result(
+                payload,
+                phase_one=phase_one,
+                prepared=prepared,
+                started=started,
+                passive_observer_armed=True,
+            )
 
         try:
             passive_observer_armed = self._turn_orchestrator.resume_after_phase_one(
@@ -1532,6 +1939,11 @@ class WKWebViewTurnProvider:
                 ),
                 on_transport_event=on_transport_event,
                 stream_should_stop=stream_should_stop,
+                passive_completion_check=(
+                    phase_b_completion_observed
+                    if completion_watch_state is not None
+                    else None
+                ),
             )
             return self._turn_orchestrator.build_turn_result(
                 payload,
@@ -1542,6 +1954,12 @@ class WKWebViewTurnProvider:
             )
         finally:
             self._clear_stop_context(phase_one.conversation_id)
+            if self._lightweight_transport is not None:
+                release_early_handoff = getattr(
+                    self._lightweight_transport, "release_early_handoff", None
+                )
+                if callable(release_early_handoff):
+                    release_early_handoff(early_handoff_attempt_id)
 
     def send_text(
         self,
@@ -1604,6 +2022,111 @@ class WKWebViewTurnProvider:
             if active_conversation_id is not None:
                 self.end_active_turn(active_conversation_id)
 
+    def submit_text_streaming(
+        self,
+        text: str,
+        *,
+        conversation: ConversationRef
+        | ChatConversation
+        | dict[str, Any]
+        | str
+        | None = None,
+        timeout: float | None = None,
+        attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
+        on_text_event: Any,
+        on_write_identity: Any = None,
+        on_transport_event: Any = None,
+        stream_should_stop: Any = None,
+    ) -> BrowserNativeTurnResult:
+        active_conversation_id = (
+            ConversationRef.from_any(conversation).conversation_id
+            if conversation is not None
+            else None
+        )
+        result: BrowserNativeTurnResult | None = None
+        if active_conversation_id is not None:
+            self.begin_active_turn(active_conversation_id)
+        try:
+            result = self._send_text_impl(
+                text,
+                conversation=conversation,
+                timeout=timeout,
+                attachment_paths=attachment_paths,
+                model_slug=model_slug,
+                on_text_event=on_text_event,
+                on_write_identity=on_write_identity,
+                on_transport_event=on_transport_event,
+                stream_should_stop=stream_should_stop,
+                defer_phase_b=True,
+            )
+            return result
+        finally:
+            if (
+                active_conversation_id is not None
+                and (result is None or not result.stream_topic_id)
+            ):
+                self.end_active_turn(active_conversation_id)
+
+    def follow_submitted_turn(
+        self,
+        turn: BrowserNativeTurnResult,
+        *,
+        timeout: float,
+        on_transport_event: Any = None,
+        stream_should_stop: Any = None,
+    ) -> dict[str, Any]:
+        topic_id = turn.stream_topic_id
+        if not isinstance(topic_id, str) or not topic_id.strip():
+            raise RequestError(
+                "WKWEBVIEW_DEFERRED_STREAM_TOPIC_MISSING",
+                request_stage="wkwebview_deferred_stream",
+            )
+        conversation_id = turn.conversation_id
+        try:
+            result = self._resume_via_curl_ws_topic_second_leg(
+                conversation_id=conversation_id,
+                topic_id=topic_id.strip(),
+                turn_exchange_id=turn.turn_exchange_id,
+                timeout=timeout,
+                relay_text_event=lambda _event: None,
+                on_transport_event=on_transport_event,
+                stream_should_stop=stream_should_stop,
+                passive_completion_check=None,
+            )
+            message_id = result.get("message_id")
+            completed = result.get("stream_finality_proven") is True or (
+                isinstance(result.get("segment_done_count"), int)
+                and not isinstance(result.get("segment_done_count"), bool)
+                and result.get("segment_done_count", 0) > 0
+            )
+            if (
+                completed
+                and isinstance(message_id, str)
+                and message_id.strip()
+                and result.get("stop_requested") is not True
+            ):
+                observed_model = result.get("observed_model")
+                observed_effort = result.get("observed_reasoning_effort")
+                self.cache_continuation_cursor(
+                    conversation_id,
+                    message_id=message_id.strip(),
+                    model_slug=(
+                        observed_model.strip()
+                        if isinstance(observed_model, str) and observed_model.strip()
+                        else None
+                    ),
+                    thinking_effort=(
+                        observed_effort.strip()
+                        if isinstance(observed_effort, str) and observed_effort.strip()
+                        else None
+                    ),
+                )
+            return result
+        finally:
+            self._clear_stop_context(conversation_id)
+            self.end_active_turn(conversation_id)
+
     def send_text_with_stale_ui_recovery(
         self,
         text: str,
@@ -1628,6 +2151,37 @@ class WKWebViewTurnProvider:
             timeout=timeout,
             attachment_paths=attachment_paths,
             model_slug=model_slug,
+        )
+
+    def submit_text_with_stale_ui_recovery_streaming(
+        self,
+        text: str,
+        *,
+        conversation: ConversationRef | ChatConversation | dict[str, Any] | str,
+        timeout: float | None = None,
+        canonical_completed_at_ms: int,
+        attachment_paths: Sequence[str | Path] | None = None,
+        model_slug: str | None = None,
+        on_text_event: Any,
+        on_write_identity: Any = None,
+        on_transport_event: Any = None,
+        stream_should_stop: Any = None,
+    ) -> BrowserNativeTurnResult:
+        if (
+            isinstance(canonical_completed_at_ms, bool)
+            or canonical_completed_at_ms <= 0
+        ):
+            raise ValueError("canonical_completed_at_ms must be a positive integer")
+        return self.submit_text_streaming(
+            text,
+            conversation=conversation,
+            timeout=timeout,
+            attachment_paths=attachment_paths,
+            model_slug=model_slug,
+            on_text_event=on_text_event,
+            on_write_identity=on_write_identity,
+            on_transport_event=on_transport_event,
+            stream_should_stop=stream_should_stop,
         )
 
     def send_text_with_stale_ui_recovery_streaming(

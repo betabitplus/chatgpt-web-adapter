@@ -60,6 +60,8 @@ class BrowserNativeTurnResult:
     stream_message_id: str | None = None
     stream_finish_reason: str | None = None
     stream_model_slug: str | None = None
+    stream_topic_id: str | None = None
+    stream_resume_value: str | None = None
 
 
 @dataclass(frozen=True)

@@ -291,6 +291,22 @@ class WKCanonicalState:
             payload["default_model_slug"] = model_slug
         return payload
 
+    def cache_continuation_cursor_from_payload(
+        self, conversation_id: str, payload: dict[str, Any]
+    ) -> bool:
+        if not self.payload_is_final(payload):
+            return False
+        cursor = self._cursor_from_final_payload(payload)
+        if not isinstance(cursor, dict):
+            return False
+        self.cache_continuation_cursor(
+            conversation_id,
+            message_id=str(cursor["message_id"]),
+            model_slug=cursor.get("model_slug"),
+            thinking_effort=cursor.get("thinking_effort"),
+        )
+        return True
+
     def cache_final_payload(
         self, conversation_id: str, payload: dict[str, Any]
     ) -> None:
@@ -414,6 +430,15 @@ class WKWebViewCanonicalClient(BrowserContextCanonicalClient):
             return None
         cached = peeker(conversation_id)
         return cached if isinstance(cached, dict) else None
+
+    def read_prewrite_canonical_payload(
+        self,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        reader = getattr(self.provider, "read_prewrite_conversation_payload", None)
+        if not callable(reader):
+            return self.transport.read_conversation(conversation_id)
+        return reader(conversation_id, timeout=self.transport.read_timeout)
 
     def read_cached_conversation_payload(
         self,

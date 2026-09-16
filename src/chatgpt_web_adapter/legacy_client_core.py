@@ -887,6 +887,7 @@ class ChatGPTWebClient:
             await websocket.send(json.dumps([connect_command, subscribe_command], ensure_ascii=False))
             while not completed:
                 if cancellation_requested():
+                    completed = True
                     return
                 try:
                     raw_frame = await asyncio.wait_for(
@@ -1182,6 +1183,55 @@ class ChatGPTWebClient:
         output: list[str] = []
         value = payload.get("v")
         path = payload.get("p")
+
+        def capture_terminal_patch(patch_path: Any, patch_value: Any) -> None:
+            if state.get("current_message_is_final_text") is False:
+                return
+            normalized_path = str(patch_path or "")
+            completed_statuses = {
+                "completed",
+                "complete",
+                "finished",
+                "done",
+                "success",
+                "succeeded",
+                "finished_successfully",
+            }
+            if normalized_path == "/message/end_turn" and patch_value is True:
+                state.setdefault("finish_reason", "end_turn")
+                state["stream_terminal_observed"] = True
+                return
+            if normalized_path in {
+                "/message/status",
+                "/message/async_status",
+                "/message/metadata/status",
+                "/message/metadata/async_status",
+            }:
+                if (
+                    isinstance(patch_value, str)
+                    and patch_value.strip().lower() in completed_statuses
+                ):
+                    state.setdefault("finish_reason", patch_value.strip())
+                    state["stream_terminal_observed"] = True
+                return
+            if normalized_path in {
+                "/message/finish_reason",
+                "/message/metadata/finish_reason",
+            }:
+                if isinstance(patch_value, str) and patch_value.strip():
+                    state["finish_reason"] = patch_value.strip()
+                    state["stream_terminal_observed"] = True
+                return
+            if (
+                normalized_path == "/message/metadata/finish_details"
+                and isinstance(patch_value, dict)
+            ):
+                finish_type = patch_value.get("type")
+                if isinstance(finish_type, str) and finish_type.strip():
+                    state["finish_reason"] = finish_type.strip()
+                    state["stream_terminal_observed"] = True
+
+        capture_terminal_patch(path, value)
         if isinstance(value, dict):
             conversation_id = value.get("conversation_id")
             if isinstance(conversation_id, str) and conversation_id:
@@ -1212,12 +1262,20 @@ class ChatGPTWebClient:
                     token = item.get("v")
                     if isinstance(token, str):
                         output.append(token)
-                elif item.get("p") == "/message/metadata" and state.get("recipient", "all") == "all":
+                elif (
+                    item.get("p") == "/message/metadata"
+                    and state.get("recipient", "all") == "all"
+                ):
                     metadata = item.get("v")
                     ChatGPTWebClient._capture_metadata_diagnostics(metadata, state)
                     finish_reason = metadata.get("finish_details", {}).get("type") if isinstance(metadata, dict) else None
-                    if finish_reason:
+                    if (
+                        finish_reason
+                        and state.get("current_message_is_final_text") is not False
+                    ):
                         state["finish_reason"] = finish_reason
+                        state["stream_terminal_observed"] = True
+                capture_terminal_patch(item.get("p"), item.get("v"))
             return output, None
         if payload.get("type") == "server_ste_metadata":
             ChatGPTWebClient._capture_metadata_diagnostics(payload.get("metadata"), state)
@@ -1238,7 +1296,50 @@ class ChatGPTWebClient:
     def _capture_message_diagnostics(message: Any, state: dict[str, Any]) -> None:
         if not isinstance(message, dict):
             return
-        ChatGPTWebClient._capture_metadata_diagnostics(message.get("metadata"), state)
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        ChatGPTWebClient._capture_metadata_diagnostics(metadata, state)
+        author = message.get("author")
+        if not isinstance(author, dict):
+            author = {}
+        content = message.get("content")
+        if not isinstance(content, dict):
+            content = {}
+        recipient = message.get("recipient")
+        recipient = recipient.strip() if isinstance(recipient, str) else "all"
+        final_text_message = (
+            author.get("role") == "assistant"
+            and recipient in {"", "all"}
+            and content.get("content_type") == "text"
+            and metadata.get("is_thinking_preamble_message") is not True
+        )
+        state["current_message_is_final_text"] = final_text_message
+        if not final_text_message:
+            return
+        terminal_reason = message.get("finish_reason")
+        if isinstance(terminal_reason, str) and terminal_reason.strip():
+            state["finish_reason"] = terminal_reason.strip()
+            state["stream_terminal_observed"] = True
+            return
+        if message.get("end_turn") is True:
+            state.setdefault("finish_reason", "end_turn")
+            state["stream_terminal_observed"] = True
+            return
+        for key in ("status", "async_status"):
+            status = message.get(key)
+            if isinstance(status, str) and status.strip().lower() in {
+                "completed",
+                "complete",
+                "finished",
+                "done",
+                "success",
+                "succeeded",
+                "finished_successfully",
+            }:
+                state.setdefault("finish_reason", status.strip())
+                state["stream_terminal_observed"] = True
+                return
 
     @staticmethod
     def _capture_metadata_diagnostics(metadata: Any, state: dict[str, Any]) -> None:

@@ -272,6 +272,76 @@ def test_lightweight_follow_topic_uses_one_celsius_bootstrap_and_forwards_events
     assert url == "https://chatgpt.com/backend-api/celsius/ws/user"
 
 
+def test_lightweight_follow_topic_accepts_revision_safe_passive_terminal(
+    monkeypatch,
+) -> None:
+    class PassiveTerminalSource(_SourceClient):
+        def wk_transport_stream_topic(
+            self,
+            topic_id: str,
+            *,
+            websocket_url: str,
+            state: dict,
+            on_event=None,
+            on_token=None,
+            should_stop=None,
+            stop_on_done=True,
+        ) -> None:
+            self.stream_calls.append((topic_id, websocket_url))
+            self.stop_on_done = stop_on_done
+            assert on_event is not None
+            assert should_stop is not None
+            on_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "v": {
+                            "message": {
+                                "id": "assistant-final",
+                                "author": {"role": "assistant"},
+                                "recipient": "all",
+                                "content": {"content_type": "text", "parts": ["done"]},
+                                "end_turn": True,
+                                "metadata": {"turn_exchange_id": "turn-1"},
+                            }
+                        }
+                    },
+                }
+            )
+            assert should_stop() is True
+
+    source = PassiveTerminalSource()
+    transport, _ = _transport(source)
+    curl = _CurlRequests(
+        [[_Response(200, {"websocket_url": "wss://example.invalid/celsius"})]]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    terminal = False
+
+    def on_event(event: dict) -> None:
+        nonlocal terminal
+        parsed = event.get("parsed")
+        message = parsed.get("v", {}).get("message") if isinstance(parsed, dict) else None
+        if isinstance(message, dict) and message.get("end_turn") is True:
+            terminal = True
+
+    result = transport.follow_topic(
+        conversation_id="conversation-1",
+        topic_id="conversation-turn-turn-1",
+        timeout=30,
+        on_event=on_event,
+        should_stop=lambda: terminal,
+    )
+
+    assert result["stream_finality_proven"] is True
+    assert result["completed"] is True
+    assert result["message_id"] is None
+    assert result["finish_reason"] == "stream_terminal"
+    assert result["segment_done_count"] == 0
+    assert len(curl.sessions) == 1
+    assert len(curl.sessions[0].calls) == 1
+
+
 def test_lightweight_transport_uploads_attachments_through_explicit_contract(
     tmp_path,
 ) -> None:
@@ -418,8 +488,83 @@ def test_lightweight_transport_resumes_and_finalizes_through_explicit_contract(
     assert result["ws_token_events"] == 1
 
 
+def test_ws_parser_captures_terminal_evidence_without_canonical_reconcile() -> None:
+    full_message_state: dict = {}
+    ChatGPTWebClient._parse_event(
+        {
+            "v": {
+                "message": {
+                    "id": "assistant-final",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["done"]},
+                    "end_turn": True,
+                    "metadata": {"turn_exchange_id": "turn-1"},
+                }
+            }
+        },
+        full_message_state,
+    )
+
+    assert full_message_state["message_id"] == "assistant-final"
+    assert full_message_state["finish_reason"] == "end_turn"
+    assert full_message_state["stream_terminal_observed"] is True
+
+    patch_state: dict = {}
+    ChatGPTWebClient._parse_event(
+        {
+            "v": {
+                "message": {
+                    "id": "assistant-final",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["partial"]},
+                    "status": "in_progress",
+                    "metadata": {},
+                }
+            }
+        },
+        patch_state,
+    )
+    ChatGPTWebClient._parse_event(
+        {"p": "/message/status", "v": "completed"},
+        patch_state,
+    )
+
+    assert patch_state["finish_reason"] == "completed"
+    assert patch_state["stream_terminal_observed"] is True
+
+    non_answer_state: dict = {}
+    ChatGPTWebClient._parse_event(
+        {
+            "v": {
+                "message": {
+                    "id": "context-1",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {
+                        "content_type": "model_editable_context",
+                        "parts": [],
+                    },
+                    "status": "finished_successfully",
+                    "metadata": {},
+                }
+            }
+        },
+        non_answer_state,
+    )
+
+    assert non_answer_state["current_message_is_final_text"] is False
+    assert "finish_reason" not in non_answer_state
+    assert non_answer_state.get("stream_terminal_observed") is not True
+
+
 def test_lightweight_resume_raw_observer_crosses_segment_done_until_turn_stop(monkeypatch) -> None:
     class RawSource(_SourceClient):
+        def wk_transport_resume_state(self, resume_token: str, *, conversation_id: str):
+            self.resume_calls.append((resume_token, conversation_id))
+            return "topic-1", {"conversation_id": conversation_id}
+
         def wk_transport_stream_topic(
             self,
             topic_id: str,
@@ -455,7 +600,6 @@ def test_lightweight_resume_raw_observer_crosses_segment_done_until_turn_stop(mo
                 }
             )
             assert should_stop() is True
-            state["message_id"] = "assistant-final"
             if on_token is not None:
                 on_token("done")
 
@@ -495,9 +639,13 @@ def test_lightweight_resume_raw_observer_crosses_segment_done_until_turn_stop(mo
 
     assert source.stop_on_done is False
     assert [event["type"] for event in raw_events] == ["raw_ws_done", "raw_ws_event"]
-    assert result["canonical_completed"] is True
+    assert result["canonical_completed"] is False
+    assert result["stream_finality_proven"] is True
+    assert result["message_id"] is None
+    assert result["finish_reason"] == "stream_terminal"
     assert result["ws_token_events"] == 1
-    assert cached == [("conversation-1", final_payload)]
+    assert len(curl.sessions) == 1
+    assert cached == []
 
 
 def test_lightweight_resume_canonical_reconcile_uses_bounded_backoff(monkeypatch) -> None:

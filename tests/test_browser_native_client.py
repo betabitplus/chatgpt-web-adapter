@@ -268,6 +268,236 @@ def test_stream_terminal_finality_skips_canonical_readback(
     assert response.request.turn_exchange_id == "turn-stream"
 
 
+def test_split_submit_defers_exact_topic_and_await_final_never_polls_canonical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Provider(FakeProvider):
+        revision_safe_streaming_supported = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.submit_calls = 0
+            self.follow_calls = 0
+            self.observe_calls = 0
+
+        def submit_text_streaming(
+            self,
+            text,
+            *,
+            conversation=None,
+            timeout=None,
+            on_text_event,
+            on_write_identity=None,
+            on_transport_event=None,
+            stream_should_stop=None,
+        ):
+            self.submit_calls += 1
+            if on_write_identity is not None:
+                on_write_identity({"conversation_id": "conversation-1"})
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-deferred",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=120,
+                passive_observer_armed=True,
+                stream_topic_id="conversation-turn-deferred",
+            )
+
+        def follow_submitted_turn(
+            self,
+            turn,
+            *,
+            timeout,
+            on_transport_event=None,
+            stream_should_stop=None,
+        ):
+            self.follow_calls += 1
+            assert turn.stream_topic_id == "conversation-turn-deferred"
+            assert on_transport_event is not None
+            on_transport_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "message": {
+                            "id": "assistant-deferred",
+                            "author": {"role": "assistant"},
+                            "content": {"content_type": "text", "parts": ["deferred final"]},
+                            "status": "finished_successfully",
+                            "end_turn": True,
+                            "metadata": {"model_slug": "gpt-5-6-thinking"},
+                        }
+                    },
+                }
+            )
+            on_transport_event({"type": "raw_ws_done"})
+            return {
+                "stream_finality_proven": True,
+                "message_id": "assistant-deferred",
+                "finish_reason": "stop",
+                "observed_model": "gpt-5-6-thinking",
+                "segment_done_count": 1,
+            }
+
+        def observe_turn(self, **kwargs):
+            self.observe_calls += 1
+            raise AssertionError("exact deferred topic must not use canonical observer")
+
+    provider = Provider()
+    client = _client(provider)
+    delivered: list[dict] = []
+
+    def emit(callback, event_type, **payload):
+        client.events.append((event_type, payload))
+        if callback is not None:
+            callback({"type": event_type, **payload})
+
+    client._emit_event = emit
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._wait_for_new_final_assistant",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact deferred topic must not canonical-read")
+        ),
+    )
+
+    submission = submit_browser_native(
+        client,
+        "hello",
+        conversation="existing-conversation",
+        timeout=5,
+        poll_interval=0.01,
+        on_event=delivered.append,
+    )
+
+    assert provider.submit_calls == 1
+    assert provider.follow_calls == 0
+    assert submission.turn.stream_topic_id == "conversation-turn-deferred"
+    assert any(event.get("type") == "browser_native_write_completed" for event in delivered)
+
+    response = await_browser_native_final(client, submission)
+
+    assert provider.follow_calls == 1
+    assert provider.observe_calls == 0
+    assert response.text == "deferred final"
+    assert response.conversation.message_id == "assistant-deferred"
+    assert response.request.observed_model == "gpt-5-6-thinking"
+
+
+def test_split_submit_stop_cancels_topic_without_canonical_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Provider(FakeProvider):
+        revision_safe_streaming_supported = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.stopped = False
+            self.follow_calls = 0
+
+        def submit_text_streaming(
+            self,
+            text,
+            *,
+            conversation=None,
+            timeout=None,
+            on_text_event,
+            on_write_identity=None,
+            on_transport_event=None,
+            stream_should_stop=None,
+        ):
+            if on_write_identity is not None:
+                on_write_identity({"conversation_id": "conversation-1"})
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-stop",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=100,
+                passive_observer_armed=True,
+                stream_topic_id="conversation-turn-stop",
+            )
+
+        def follow_submitted_turn(
+            self,
+            turn,
+            *,
+            timeout,
+            on_transport_event=None,
+            stream_should_stop=None,
+        ):
+            self.follow_calls += 1
+            assert on_transport_event is not None
+            on_transport_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "message": {
+                            "id": "assistant-partial",
+                            "author": {"role": "assistant"},
+                            "content": {"content_type": "text", "parts": ["partial answer"]},
+                            "status": "in_progress",
+                            "end_turn": False,
+                        }
+                    },
+                }
+            )
+            self.stopped = True
+            assert stream_should_stop is not None and stream_should_stop() is True
+            return {
+                "stream_finality_proven": False,
+                "message_id": "assistant-partial",
+                "finish_reason": "stream_terminal",
+                "segment_done_count": 0,
+            }
+
+        def stop_requested_for(self, conversation_id):
+            return self.stopped
+
+        def clear_stop_requested_for(self, conversation_id):
+            self.stopped = False
+
+    provider = Provider()
+    client = _client(provider)
+    delivered: list[dict] = []
+
+    def emit(callback, event_type, **payload):
+        client.events.append((event_type, payload))
+        if callback is not None:
+            callback({"type": event_type, **payload})
+
+    client._emit_event = emit
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._wait_for_new_final_assistant",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("confirmed Stop must not canonical-read")
+        ),
+    )
+
+    submission = submit_browser_native(
+        client,
+        "hello",
+        conversation="existing-conversation",
+        timeout=5,
+        poll_interval=0.01,
+        on_event=delivered.append,
+    )
+    response = await_browser_native_final(client, submission)
+
+    assert provider.follow_calls == 1
+    assert response.text == "partial answer"
+    assert response.conversation.finish_reason == "stopped"
+    assert provider.stopped is False
+    readback = [event for event in delivered if event.get("type") == "browser_native_readback_completed"]
+    assert readback[-1]["canonical_payload_read_count"] == 0
+    assert readback[-1]["stopped_by_user"] is True
+
+
 def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

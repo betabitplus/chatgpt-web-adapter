@@ -96,13 +96,22 @@ run().catch((error) => {
     [
         (
             "conversation-small-deploy-a.js",
-            {"helperExport": "hA", "initializerExport": "iA"},
+            {
+                "helperExport": "hA",
+                "initializerExport": "iA",
+                "transportExport": "sA",
+                "transportInitializerExport": "tA",
+                "sharedRuntimePath": "./shared-runtime-a.js",
+            },
         ),
         (
             "conversation-small-deploy-b.js",
             {
                 "helperExport": "renamedHelperB",
                 "initializerExport": "renamedInitializerB",
+                "transportExport": "renamedTransportB",
+                "transportInitializerExport": "renamedTransportInitializerB",
+                "sharedRuntimePath": "./shared-runtime-b.js",
             },
         ),
     ],

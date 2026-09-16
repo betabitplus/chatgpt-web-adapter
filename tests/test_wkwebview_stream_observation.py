@@ -305,7 +305,7 @@ def test_minimal_security_prepare_matches_verified_continuation_dispatch() -> No
     assert '"x-conduit-token": "no-token"' not in shell
     assert 'officialApiClient.safePost(' in shell
     assert '"/f/conversation/prepare"' in shell
-    assert 'onSubmitReady: officialApiClient ? resolveSubmitReady : null' in shell
+    assert 'onSubmitReady: conversationId && !temporary ? resolveSubmitReady : null' in shell
     assert 'await submitReadyPromise;' in shell
     assert 'if (conversationId && !temporary) {' in shell
     assert 'const conduitToken = await conduitPromise;' in shell

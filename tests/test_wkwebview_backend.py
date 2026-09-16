@@ -2533,6 +2533,39 @@ def test_minimal_security_shell_keeps_named_stage_boundaries() -> None:
         assert invocation in entrypoint
 
 
+def test_minimal_security_shell_request_client_is_optional_for_continuation() -> None:
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "chatgpt_web_adapter"
+        / "wkwebview_helper"
+        / "minimal_security_shell.js"
+    ).read_text(encoding="utf-8")
+
+    shared_init = source[
+        source.index("const loadSharedConversationInitialization = async () => {"):
+        source.index("const loadSharedModelCatalog = async", source.index("const loadSharedConversationInitialization = async () => {"))
+    ]
+    assert "let officialApiClient = null;" in shared_init
+    assert "const loadedApiClient = await loadOfficialApiClient();" in shared_init
+    assert "catch (_)" in shared_init
+    assert "officialApiClient = null;" in shared_init
+    assert "officialConversationTransport: runtime.officialConversationTransport" in shared_init
+
+    prepare_start = source.index("const prepareConversation = async ({")
+    prepare_end = source.index("let lastBrokerResumeToken", prepare_start)
+    prepare = source[prepare_start:prepare_end]
+    fallback_start = prepare.index("const firstToken = await runPrepare({", prepare.index("if (officialApiClient)"))
+    fallback = prepare[fallback_start:]
+    second_start = fallback.index("const secondPromise = runPrepare({")
+    submit_ready = fallback.index('if (typeof onSubmitReady === "function") onSubmitReady();')
+    await_second = fallback.index("const secondToken = await secondPromise;")
+    assert second_start < submit_ready < await_second
+
+    entrypoint = source.rsplit("  (async () => {", 1)[1]
+    assert "onSubmitReady: conversationId && !temporary ? resolveSubmitReady : null" in entrypoint
+
+
 def test_wkwebview_status_does_not_hide_programming_errors(monkeypatch) -> None:
     provider = WKWebViewTurnProvider()
 

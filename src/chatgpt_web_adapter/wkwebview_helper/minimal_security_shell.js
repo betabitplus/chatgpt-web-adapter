@@ -683,12 +683,22 @@
         runtime.initializeConversationTransport();
         const accessToken = await loadSession();
         setStage("request_client_init");
-        const loadedApiClient = await loadOfficialApiClient();
+        let officialApiClient = null;
+        try {
+          const loadedApiClient = await loadOfficialApiClient();
+          officialApiClient = loadedApiClient.requestClient;
+        } catch (_) {
+          // The request-client singleton is a private frontend export and can
+          // change independently of the official conversation transport.
+          // Prepare has an authenticated page-fetch fallback, so keep writes
+          // available when only this optional optimization changes shape.
+          officialApiClient = null;
+        }
         return Object.freeze({
           accessToken,
           acquireIntegrity: runtime.acquireIntegrity,
           officialConversationTransport: runtime.officialConversationTransport,
-          officialApiClient: loadedApiClient.requestClient,
+          officialApiClient,
         });
       })();
       sharedConversationInitializationPromise = candidate;
@@ -997,20 +1007,21 @@
       return secondToken || firstToken || "";
     }
 
-    return Promise.all([
-      runPrepare({
-        prepareState: "none",
-        prepareDispatch: "immediate",
-        prepareSource: "context_change",
-        includePartialQuery: false,
-      }),
-      runPrepare({
-        prepareState: "sent",
-        prepareDispatch: "debounced",
-        prepareSource: "composer_editor_state",
-        includePartialQuery: true,
-      }),
-    ]).then((tokens) => tokens[1] || tokens[0] || "");
+    const firstToken = await runPrepare({
+      prepareState: "none",
+      prepareDispatch: "immediate",
+      prepareSource: "context_change",
+      includePartialQuery: false,
+    });
+    const secondPromise = runPrepare({
+      prepareState: "sent",
+      prepareDispatch: "debounced",
+      prepareSource: "composer_editor_state",
+      includePartialQuery: true,
+    });
+    if (typeof onSubmitReady === "function") onSubmitReady();
+    const secondToken = await secondPromise;
+    return secondToken || firstToken || "";
   };
 
   let lastBrokerResumeToken = "";
@@ -1595,7 +1606,7 @@
       effectiveParentMessageId: message.effectiveParentMessageId,
       messageContent: message.messageContent,
       officialApiClient,
-      onSubmitReady: officialApiClient ? resolveSubmitReady : null,
+      onSubmitReady: conversationId && !temporary ? resolveSubmitReady : null,
       turnTraceId,
     });
 

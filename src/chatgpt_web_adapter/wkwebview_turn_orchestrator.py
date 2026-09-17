@@ -696,6 +696,10 @@ class WKTurnOrchestrator:
             return invocation
 
         invocation.command.append("--minimal-security-shell")
+        provider._configure_protected_write_proxy(
+            invocation.request,
+            request_stage="wkwebview_authority_turn",
+        )
         if (
             prepared.conversation_id is not None
             and prepared.minimal_parent_message_id is not None

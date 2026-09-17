@@ -8,6 +8,9 @@
 
   const runMinimalSecurityShell = (config = null) => {
   const requestConfig = config && typeof config === "object" ? config : null;
+  if (requestConfig && Object.prototype.hasOwnProperty.call(requestConfig, "proxy_protected_write")) {
+    window.__CWA_PROXY_PROTECTED_WRITE__ = requestConfig.proxy_protected_write === true;
+  }
   const requestId = typeof requestConfig?.request_id === "string" ? requestConfig.request_id : "";
   const pageBaseURL = document.baseURI || location.href;
   const tagged = (body) => requestId ? {...body, request_id: requestId} : body;
@@ -151,7 +154,7 @@
   const exportAlias = (source, internalName) => {
     if (!internalName) return null;
     const expression = new RegExp(
-      `\\b${escapeRegex(internalName)}\\s+as\\s+([A-Za-z_$][A-Za-z0-9_$]*)(?=[,};\\s])`,
+      `(?:^|[^A-Za-z0-9_$])${escapeRegex(internalName)}\\s+as\\s+([A-Za-z_$][A-Za-z0-9_$]*)(?=[,};\\s])`,
       "g",
     );
     let alias = null;
@@ -190,7 +193,15 @@
       /(?:^|[;,}])\s*var\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*e\(\(\(\)\s*=>\s*\{/.exec(suffix) ||
       /(?:^|[;,}])\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*e\(\(\(\)\s*=>\s*\{/.exec(suffix);
     if (!initializerMatch) throw new Error("MINIMAL_INTEGRITY_INITIALIZER_DISCOVERY_FAILED");
-    return { helperName: helper.name, initializerName: initializerMatch[1] };
+    const helperReferenceIndex = suffix.indexOf(helper.name);
+    return {
+      helperName: helper.name,
+      initializerName: initializerMatch[1],
+      helperSuffix: suffix.slice(0, 900),
+      helperReference: helperReferenceIndex >= 0
+        ? suffix.slice(Math.max(0, helperReferenceIndex - 220), helperReferenceIndex + 520)
+        : "",
+    };
   };
 
   const conversationTransportMarkers = [
@@ -340,25 +351,36 @@
     let sharedImportCarry = "";
     let sharedRuntimeCandidate = null;
     let aliasCarry = "";
+    const aliasExports = new Map();
     let helperExport = null;
+    let helperContext = "";
+    let helperLaterContext = "";
     let initializerExport = null;
     let transportExport = null;
     let transportInitializerExport = null;
 
+    const scanAliasExports = (source) => {
+      const pattern = /(?:^|[^A-Za-z0-9_$])([A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)(?=[,};\s])/g;
+      for (const match of source.matchAll(pattern)) aliasExports.set(match[1], match[2]);
+    };
+
     const scanAliases = (source) => {
       if (names) {
-        if (!helperExport) helperExport = exportAlias(source, names.helperName);
-        if (!initializerExport) initializerExport = exportAlias(source, names.initializerName);
+        if (!helperExport) {
+          helperExport = aliasExports.get(names.helperName) || exportAlias(source, names.helperName);
+        }
+        if (!initializerExport) {
+          initializerExport = aliasExports.get(names.initializerName) || exportAlias(source, names.initializerName);
+        }
       }
       if (transportNames) {
         if (!transportExport) {
-          transportExport = exportAlias(source, transportNames.transportName);
+          transportExport = aliasExports.get(transportNames.transportName)
+            || exportAlias(source, transportNames.transportName);
         }
         if (!transportInitializerExport) {
-          transportInitializerExport = exportAlias(
-            source,
-            transportNames.initializerName,
-          );
+          transportInitializerExport = aliasExports.get(transportNames.initializerName)
+            || exportAlias(source, transportNames.initializerName);
         }
       }
     };
@@ -366,6 +388,12 @@
     while (true) {
       const { value, done } = await reader.read();
       const chunk = done ? decoder.decode() : decoder.decode(value, { stream: true });
+
+      {
+        const combined = aliasCarry + chunk;
+        scanAliasExports(combined);
+        aliasCarry = combined.slice(-256);
+      }
 
       {
         const combined = sharedImportCarry + chunk;
@@ -403,8 +431,15 @@
             if (discoveryWindow.length > 140000) throw error;
           }
           if (names) {
+            const helperNeedle = `function ${names.helperName}(`;
+            const helperIndex = discoveryWindow.indexOf(helperNeedle);
+            if (helperIndex >= 0) {
+              helperContext = discoveryWindow.slice(
+                helperIndex,
+                Math.min(discoveryWindow.length, helperIndex + 900),
+              );
+            }
             scanAliases(discoveryWindow);
-            aliasCarry = discoveryWindow.slice(-4096);
             discoveryWindow = "";
           }
         }
@@ -441,10 +476,18 @@
         }
       }
 
+      if (names) {
+        const helperLaterIndex = chunk.indexOf(names.helperName);
+        if (helperLaterIndex >= 0) {
+          helperLaterContext = chunk.slice(
+            Math.max(0, helperLaterIndex - 180),
+            Math.min(chunk.length, helperLaterIndex + 420),
+          );
+        }
+      }
+
       if (names || transportNames) {
-        const combined = aliasCarry + chunk;
-        scanAliases(combined);
-        aliasCarry = combined.slice(-4096);
+        scanAliases(chunk);
       }
 
       if (
@@ -469,7 +512,9 @@
       }
       if (done) break;
     }
-    throw new Error("MINIMAL_INTEGRITY_STREAM_DISCOVERY_FAILED");
+    throw new Error(
+      `MINIMAL_INTEGRITY_STREAM_DISCOVERY_FAILED helper_name=${names?.helperName || ""} helper_later=${helperLaterContext.replace(/\s+/g, " ").slice(0, 900)}`,
+    );
   };
 
   const decodeAttachmentDescriptors = () => {
@@ -1218,7 +1263,10 @@
     const content = value.content && typeof value.content === "object" ? value.content : null;
     const messageId = transportString(value.id);
     if (author && author.role === "assistant" && content && Array.isArray(content.parts) && messageId) {
-      const snapshot = content.parts.filter((part) => typeof part === "string").join("\n");
+      // `content.parts` is a transport segmentation boundary, not a paragraph
+      // boundary. Joining partial string parts with a newline corrupts visible
+      // assistant text when the product splits a token/word across parts.
+      const snapshot = content.parts.filter((part) => typeof part === "string").join("");
       if (snapshot && (messageId !== lastBrokerTextMessageId || snapshot !== lastBrokerTextSnapshot)) {
         lastBrokerTextMessageId = messageId;
         lastBrokerTextSnapshot = snapshot;
@@ -1378,6 +1426,7 @@
     const useOfficialConversationTransport =
       conversationId
       && !temporary
+      && window.__CWA_PROXY_PROTECTED_WRITE__ !== true
       && typeof officialConversationTransport === "function";
     const writeHeaders = {
       ...requestHeaders(accessToken, deviceId, "/backend-api/f/conversation"),
@@ -1408,6 +1457,13 @@
     }
 
     setStage("write");
+    if (window.__CWA_PROXY_PROTECTED_WRITE__ === true) {
+      if (requestId) window.__CWA_BROKER_REQUEST_ID__ = requestId;
+      const installSubmitObserver = window.__cwaRearmSubmitFetchObserver;
+      if (typeof installSubmitObserver !== "function" || installSubmitObserver() !== true) {
+        throw new Error("MINIMAL_PROXY_SUBMIT_OBSERVER_INSTALL_FAILED");
+      }
+    }
     if (useOfficialConversationTransport) {
       const officialAdditionalHeaders = { ...writeHeaders };
       const middlewareOwnedHeaders = new Set([
@@ -1515,14 +1571,28 @@
       return;
     }
 
-    postSubmit({ phase: "request", temporary_mode: temporary });
-    const writeResponse = await fetch("/backend-api/f/conversation", {
+    postSubmit({
+      phase: "request",
+      temporary_mode: temporary,
+      endpoint: `shell_preflight:proxy=${window.__CWA_PROXY_PROTECTED_WRITE__ === true ? "1" : "0"}:wrapper=${window.fetch?.__cwaIncludesSubmitObserver === true ? "1" : "0"}`,
+    });
+    const writePromise = window.fetch("/backend-api/f/conversation", {
       method: "POST",
       credentials: "include",
       headers: writeHeaders,
       body: JSON.stringify(writePayload),
       __cwaDirectObserve: true,
     });
+    if (requestId && window.__CWA_BROKER_REQUEST_ID__ === requestId) {
+      window.__CWA_BROKER_REQUEST_ID__ = "";
+    }
+    if (
+      window.__CWA_DEFER_SUBMIT_OBSERVER__ === true
+      && typeof window.__cwaRestoreSubmitFetchObserver === "function"
+    ) {
+      try { window.__cwaRestoreSubmitFetchObserver(); } catch (_) {}
+    }
+    const writeResponse = await writePromise;
     postSubmit({ phase: "response", status: writeResponse.status });
     postStream({ phase: "started", status: writeResponse.status, ok: writeResponse.ok === true });
     post({

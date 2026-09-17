@@ -119,6 +119,57 @@ class WKWebViewTurnProvider:
     def build_temporary_chat_provider(self) -> WKWebViewTurnProvider:
         return self
 
+    def _configure_protected_write_proxy(
+        self,
+        request: dict[str, Any],
+        *,
+        request_stage: str,
+        missing_cookies_error: str = "WKWEBVIEW_PROXY_COOKIES_MISSING",
+    ) -> bool:
+        proxy_setting = os.environ.get("CWA_WK_PROXY_PROTECTED_WRITE")
+        proxy_enabled = proxy_setting is None or proxy_setting.strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        if not proxy_enabled:
+            return False
+
+        transport = self._lightweight_transport
+        if transport is None:
+            # Direct provider unit/probe use can exist without a canonical client.
+            # Product runtime always binds the lightweight transport first.
+            return False
+        source_client = getattr(transport, "source_client", None)
+        auth = getattr(source_client, "auth", None)
+        cookies = getattr(auth, "cookies", None)
+        if not isinstance(cookies, dict) or not cookies:
+            raise RequestError(
+                missing_cookies_error,
+                request_stage=request_stage,
+            )
+        cookie_parts = [
+            f"{key}={value}"
+            for key, value in cookies.items()
+            if isinstance(key, str)
+            and key
+            and isinstance(value, str)
+            and value
+            and "\r" not in key
+            and "\n" not in key
+            and "\r" not in value
+            and "\n" not in value
+        ]
+        if not cookie_parts:
+            raise RequestError(
+                missing_cookies_error,
+                request_stage=request_stage,
+            )
+        request["proxy_protected_write"] = True
+        request["proxy_cookie_header"] = "; ".join(cookie_parts)
+        return True
+
     @contextmanager
     def _heavy_submit_gate(self, timeout: float) -> Iterator[int]:
         wait_timeout = max(0.001, float(timeout))

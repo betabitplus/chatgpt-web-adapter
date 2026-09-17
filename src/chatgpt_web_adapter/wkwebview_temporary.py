@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import threading
 import time
 from typing import Any
@@ -136,43 +135,15 @@ class WKTemporaryTurnRuntime:
         invocation.request["url"] = "https://chatgpt.com/?temporary-chat=true"
         invocation.request["minimal_temporary"] = True
         invocation.request["minimal_temporary_lifecycle_id"] = lifecycle_id
-        proxy_setting = os.environ.get("CWA_WK_PROXY_PROTECTED_WRITE")
-        proxy_enabled = proxy_setting is None or proxy_setting.strip().lower() not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
-        if proxy_enabled:
-            source_client = getattr(transport, "source_client", None)
-            auth = getattr(source_client, "auth", None)
-            cookies = getattr(auth, "cookies", None)
-            if not isinstance(cookies, dict) or not cookies:
-                invalidate_fresh_lifecycle()
-                raise RequestError(
-                    "WKWEBVIEW_TEMPORARY_PROXY_COOKIES_MISSING",
-                    request_stage="wkwebview_temporary_preflight",
-                )
-            cookie_parts = [
-                f"{key}={value}"
-                for key, value in cookies.items()
-                if isinstance(key, str)
-                and key
-                and isinstance(value, str)
-                and value
-                and "\r" not in key
-                and "\n" not in key
-                and "\r" not in value
-                and "\n" not in value
-            ]
-            if not cookie_parts:
-                invalidate_fresh_lifecycle()
-                raise RequestError(
-                    "WKWEBVIEW_TEMPORARY_PROXY_COOKIES_MISSING",
-                    request_stage="wkwebview_temporary_preflight",
-                )
-            invocation.request["proxy_protected_write"] = True
-            invocation.request["proxy_cookie_header"] = "; ".join(cookie_parts)
+        try:
+            self.provider._configure_protected_write_proxy(
+                invocation.request,
+                request_stage="wkwebview_temporary_preflight",
+                missing_cookies_error="WKWEBVIEW_TEMPORARY_PROXY_COOKIES_MISSING",
+            )
+        except Exception:
+            invalidate_fresh_lifecycle()
+            raise
         if conversation_id is not None and parent_message_id is not None:
             invocation.request["minimal_conversation_id"] = conversation_id
             invocation.request["minimal_parent_message_id"] = parent_message_id

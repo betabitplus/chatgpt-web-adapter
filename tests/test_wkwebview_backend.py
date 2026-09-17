@@ -1309,6 +1309,40 @@ def test_wkwebview_stop_requires_canonical_client_stopped_proof(monkeypatch) -> 
     assert provider.stop_requested_for("conversation-1") is False
 
 
+def test_wkwebview_stop_accepts_product_stop_control_click_without_canonical_polling(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    monkeypatch.setattr(
+        provider,
+        "_run_helper",
+        lambda command, *, timeout: {
+            "ok": True,
+            "stop_requested": True,
+            "stop_control_clicked": True,
+            "conversation_id": "conversation-1",
+        },
+    )
+    monkeypatch.setattr(
+        provider,
+        "_wait_for_stopped_final_payload",
+        lambda conversation_id, *, timeout: None,
+    )
+
+    def fail_if_network_stop_proof_runs(*args, **kwargs):
+        raise AssertionError("product Stop control click is already explicit stop proof")
+
+    monkeypatch.setattr(provider, "_wait_for_stream_stop_proof", fail_if_network_stop_proof_runs)
+    monkeypatch.setattr(provider, "_wait_for_canonical_stop_proof", fail_if_network_stop_proof_runs)
+
+    result = provider.stop_generation("conversation-1", timeout=5)
+
+    assert result["stopped"] is True
+    assert result["proof"] == "browser_stop_control"
+    assert provider.stop_requested_for("conversation-1") is True
+
+
 def test_wkwebview_stop_uses_worker_stopped_final_without_second_canonical_reader(
     monkeypatch,
 ) -> None:
@@ -1370,6 +1404,12 @@ def test_wkwebview_stop_uses_worker_stopped_final_without_second_canonical_reade
 def test_wkwebview_minimal_security_shell_gate_is_narrow(monkeypatch) -> None:
     provider = WKWebViewTurnProvider()
     monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    monkeypatch.delenv("CWA_WK_PROXY_PROTECTED_WRITE", raising=False)
+    provider._lightweight_transport = SimpleNamespace(
+        source_client=SimpleNamespace(
+            auth=SimpleNamespace(cookies={"session": "test-cookie"})
+        )
+    )
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     commands: list[list[str]] = []
     requests: list[dict[str, Any]] = []
@@ -1423,6 +1463,10 @@ def test_wkwebview_minimal_security_shell_gate_is_narrow(monkeypatch) -> None:
 
     assert "--minimal-security-shell" in commands[0]
     assert "--minimal-security-shell" in commands[1]
+    assert requests[0]["proxy_protected_write"] is True
+    assert requests[0]["proxy_cookie_header"] == "session=test-cookie"
+    assert requests[1]["proxy_protected_write"] is True
+    assert requests[1]["proxy_cookie_header"] == "session=test-cookie"
     assert "minimal_model_slug" not in requests[0]
     assert requests[1]["minimal_model_slug"] == "gpt-5-6-thinking"
 
@@ -1432,6 +1476,13 @@ def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(
 ) -> None:
     provider = WKWebViewTurnProvider()
     monkeypatch.delenv("CWA_WK_FORCE_LEGACY", raising=False)
+    monkeypatch.delenv("CWA_WK_PROXY_PROTECTED_WRITE", raising=False)
+    provider._lightweight_transport = SimpleNamespace(
+        source_client=SimpleNamespace(
+            auth=SimpleNamespace(cookies={"session": "test-cookie"})
+        ),
+        arm_conversation_completion=lambda conversation_id, timeout: None,
+    )
     monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
     prewrite = {
         "current_node": "node-before",
@@ -1506,6 +1557,8 @@ def test_wkwebview_minimal_security_shell_continuation_uses_canonical_parent(
     command = commands[0]
     assert "--minimal-security-shell" in command
     request = requests[0]
+    assert request["proxy_protected_write"] is True
+    assert request["proxy_cookie_header"] == "session=test-cookie"
     assert request["minimal_conversation_id"] == "conversation-1"
     assert request["minimal_parent_message_id"] == "assistant-message-before"
     assert request["expected_current_node"] == "node-before"
@@ -1604,6 +1657,9 @@ def test_wkwebview_minimal_completion_verification_waits_for_post_submit_grace(
     completion = {"sequence": 10}
     reads = {"count": 0}
     provider._lightweight_transport = SimpleNamespace(
+        source_client=SimpleNamespace(
+            auth=SimpleNamespace(cookies={"session": "test-cookie"})
+        ),
         arm_conversation_completion=lambda conversation_id, timeout: 10,
         current_completion_sequence=lambda: completion["sequence"],
         conversation_completion_sequence=lambda conversation_id: completion["sequence"],
@@ -1711,6 +1767,9 @@ def test_wkwebview_minimal_completion_verifies_each_passive_sequence_once(
     completion = {"sequence": 10}
     reads = {"count": 0}
     provider._lightweight_transport = SimpleNamespace(
+        source_client=SimpleNamespace(
+            auth=SimpleNamespace(cookies={"session": "test-cookie"})
+        ),
         arm_conversation_completion=lambda conversation_id, timeout: 10,
         current_completion_sequence=lambda: completion["sequence"],
         conversation_completion_sequence=lambda conversation_id: completion["sequence"],
@@ -1836,6 +1895,9 @@ def test_wkwebview_new_chat_recovers_identity_by_client_message_id(
     canonical = _final_canonical_for_prompt("recover me", assistant_text="recovered")
     canonical["mapping"]["user-final"]["message"]["id"] = "client-message-1"
     provider._lightweight_transport = SimpleNamespace(
+        source_client=SimpleNamespace(
+            auth=SimpleNamespace(cookies={"session": "test-cookie"})
+        ),
         read_catalog=lambda *args, **kwargs: {
             "items": [{"id": "conversation-recovered"}],
             "total": 1,
@@ -1910,6 +1972,9 @@ def test_wkwebview_identity_recovery_curl_failure_fails_closed_without_wk_fallba
         }
 
     provider._lightweight_transport = SimpleNamespace(
+        source_client=SimpleNamespace(
+            auth=SimpleNamespace(cookies={"session": "test-cookie"})
+        ),
         read_catalog=lambda *args, **kwargs: {
             "items": [{"id": "conversation-unreadable"}],
             "total": 1,
@@ -2129,6 +2194,8 @@ def test_wkwebview_minimal_security_shell_uploads_attachments_before_wk(
     attachment.write_bytes(b"fake-png")
 
     class FakeSourceClient:
+        auth = SimpleNamespace(cookies={"session": "test-cookie"})
+
         def wk_transport_upload_media_files(self, media):
             assert len(media) == 1
             assert Path(media[0][0]) == attachment
@@ -2866,6 +2933,9 @@ def test_wkwebview_identity_recovery_retry_uses_bounded_backoff(
     final_payload["mapping"]["user-final"]["message"]["id"] = "client-message-1"
     reads = [None, final_payload]
     provider._lightweight_transport = SimpleNamespace(
+        source_client=SimpleNamespace(
+            auth=SimpleNamespace(cookies={"session": "test-cookie"})
+        ),
         read_catalog=lambda *args, **kwargs: {
             "items": [{"id": "conversation-recovered"}],
             "total": 1,

@@ -202,9 +202,9 @@ class WKTurnObserver:
             conversation_id,
             timeout=0.0,
         )
-        proof_kind = None
+        proof_kind = "browser_stop_control" if payload.get("stop_control_clicked") is True else None
         stream_status = None
-        if final_payload is not None and provider._is_client_stopped_payload(
+        if proof_kind is None and final_payload is not None and provider._is_client_stopped_payload(
             final_payload
         ):
             proof_kind = "canonical_client_stopped"

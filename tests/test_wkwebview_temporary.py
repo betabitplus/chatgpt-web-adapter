@@ -9,6 +9,7 @@ import pytest
 
 from chatgpt_web_adapter.exceptions import RequestError
 from chatgpt_web_adapter.wkwebview_helper_runtime import WKHelperInvocation
+from chatgpt_web_adapter.wkwebview_provider import WKWebViewTurnProvider
 from chatgpt_web_adapter.wkwebview_temporary import WKTemporaryTurnRuntime
 
 
@@ -134,6 +135,11 @@ class _Provider:
 
     def _current_browser_authority_lease_id(self) -> str:
         return self.current_lease
+
+    def _configure_protected_write_proxy(self, request, **kwargs):
+        return WKWebViewTurnProvider._configure_protected_write_proxy(
+            self, request, **kwargs
+        )
 
     def _helper_command(
         self,

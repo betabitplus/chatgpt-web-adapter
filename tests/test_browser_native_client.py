@@ -386,6 +386,122 @@ def test_split_submit_defers_exact_topic_and_await_final_never_polls_canonical(
     assert response.request.observed_model == "gpt-5-6-thinking"
 
 
+def test_split_submit_accepts_normalizer_terminal_proof_after_revision_without_canonical_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Provider(FakeProvider):
+        revision_safe_streaming_supported = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.observe_calls = 0
+
+        def submit_text_streaming(
+            self,
+            text,
+            *,
+            conversation=None,
+            timeout=None,
+            on_text_event,
+            on_write_identity=None,
+            on_transport_event=None,
+            stream_should_stop=None,
+        ):
+            if on_write_identity is not None:
+                on_write_identity({"conversation_id": "conversation-1"})
+            on_text_event(
+                {
+                    "type": "assistant_text_snapshot",
+                    "sequence": 1,
+                    "message_id": "assistant-revised",
+                    "text": "LOAD_WRONG",
+                }
+            )
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-revised",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=100,
+                passive_observer_armed=True,
+                stream_topic_id="conversation-turn-revised",
+            )
+
+        def follow_submitted_turn(
+            self,
+            turn,
+            *,
+            timeout,
+            on_transport_event=None,
+            stream_should_stop=None,
+        ):
+            assert on_transport_event is not None
+            on_transport_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "message": {
+                            "id": "assistant-revised",
+                            "author": {"role": "assistant"},
+                            "content": {
+                                "content_type": "text",
+                                "parts": ["LOAD_PTY_1_0_OK_20260917"],
+                            },
+                            "status": "in_progress",
+                            "end_turn": False,
+                        }
+                    },
+                }
+            )
+            on_transport_event({"type": "raw_ws_done"})
+            return {
+                "stream_finality_proven": False,
+                "message_id": None,
+                "finish_reason": None,
+                "segment_done_count": 1,
+            }
+
+        def observe_turn(self, **kwargs):
+            self.observe_calls += 1
+            raise AssertionError("normalizer terminal proof must not canonical-observe")
+
+    provider = Provider()
+    client = _client(provider)
+    delivered: list[dict] = []
+
+    def emit(callback, event_type, **payload):
+        client.events.append((event_type, payload))
+        if callback is not None:
+            callback({"type": event_type, **payload})
+
+    client._emit_event = emit
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._wait_for_new_final_assistant",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("normalizer terminal proof must not canonical-read")
+        ),
+    )
+
+    submission = submit_browser_native(
+        client,
+        "hello",
+        conversation="existing-conversation",
+        timeout=5,
+        poll_interval=0.01,
+        on_event=delivered.append,
+    )
+    response = await_browser_native_final(client, submission)
+
+    assert response.text == "LOAD_PTY_1_0_OK_20260917"
+    assert response.conversation.message_id == "assistant-revised"
+    assert response.conversation.finish_reason == "stop"
+    assert provider.observe_calls == 0
+    assert any(event.get("type") == "assistant_text_revision" for event in delivered)
+
+
 def test_split_submit_stop_cancels_topic_without_canonical_readback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

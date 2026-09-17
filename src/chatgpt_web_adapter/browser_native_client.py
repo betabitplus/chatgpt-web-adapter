@@ -1865,6 +1865,16 @@ def await_browser_native_final(
         if isinstance(candidate_message_id, str) and candidate_message_id.strip():
             stream_message_id = candidate_message_id.strip()
             passive_message_id = stream_message_id
+        elif (
+            isinstance(submission.stream_state.message_id, str)
+            and submission.stream_state.message_id.strip()
+        ):
+            # The low-level topic parser can miss terminal identity when a catch-up
+            # frame revises the answer immediately before the topic closes. The
+            # canonical topic normalizer has already applied that exact frame to
+            # the revision-safe stream state, so retain its message identity.
+            stream_message_id = submission.stream_state.message_id.strip()
+            passive_message_id = stream_message_id
         candidate_finish_reason = (
             deferred_result.get("finish_reason")
             if isinstance(deferred_result, dict)
@@ -1880,10 +1890,17 @@ def await_browser_native_final(
         )
         if isinstance(candidate_model, str) and candidate_model.strip():
             stream_model_slug = candidate_model.strip()
+        normalizer_finality_proven = bool(
+            topic_normalizer.turn_completed and topic_normalizer.segment_kind is None
+        )
         stream_finality_proven = (
-            isinstance(deferred_result, dict)
-            and deferred_result.get("stream_finality_proven") is True
-            and submission.stream_state.observation_count > 0
+            (
+                isinstance(deferred_result, dict)
+                and deferred_result.get("stream_finality_proven") is True
+            )
+            or normalizer_finality_proven
+        ) and (
+            submission.stream_state.observation_count > 0
             and not submission.stream_state.delivery_incomplete
             and isinstance(stream_message_id, str)
             and bool(stream_message_id.strip())

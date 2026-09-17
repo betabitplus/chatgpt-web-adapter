@@ -334,14 +334,20 @@ completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler {
             if (conversationId.length > 0) self.streamConversationId = conversationId;
             if (assistantMessageId.length > 0 && text.length > 0) {
                 self.streamAssistantMessageId = assistantMessageId;
-                self.streamTextEventCount += 1;
-                self.streamLastSequence += 1;
-                PrintEventForRequest(@{
-                    @"type": @"assistant_text_revision",
-                    @"sequence": @(self.streamLastSequence),
-                    @"message_id": assistantMessageId,
-                    @"text": text
-                }, self.brokerRequestId);
+                // Temporary protected writes have an authoritative proxy stream.
+                // DOM innerText may contain transient layout newlines while React
+                // is streaming, so do not let it rewrite Temporary proxy text.
+                // Normal turns still use DOM revisions for their richer live path.
+                if (!self.submitProxyDispatch || !self.submitTemporaryModeObserved) {
+                    self.streamTextEventCount += 1;
+                    self.streamLastSequence += 1;
+                    PrintEventForRequest(@{
+                        @"type": @"assistant_text_revision",
+                        @"sequence": @(self.streamLastSequence),
+                        @"message_id": assistantMessageId,
+                        @"text": text
+                    }, self.brokerRequestId);
+                }
             }
         } else if ([phase isEqualToString:@"dom_terminal"]) {
             NSString *assistantMessageId = [body[@"message_id"] isKindOfClass:[NSString class]] ? body[@"message_id"] : nil;
@@ -350,15 +356,19 @@ completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler {
             if (conversationId.length > 0) self.streamConversationId = conversationId;
             if (assistantMessageId.length > 0 && text.length > 0) {
                 self.streamAssistantMessageId = assistantMessageId;
-                self.streamTextEventCount += 1;
-                self.streamLastSequence += 1;
-                PrintEventForRequest(@{
-                    @"type": @"assistant_text_revision",
-                    @"sequence": @(self.streamLastSequence),
-                    @"message_id": assistantMessageId,
-                    @"text": text,
-                    @"finish_reason": @"stop"
-                }, self.brokerRequestId);
+                if (!self.submitProxyDispatch) {
+                    self.streamTextEventCount += 1;
+                    self.streamLastSequence += 1;
+                    PrintEventForRequest(@{
+                        @"type": @"assistant_text_revision",
+                        @"sequence": @(self.streamLastSequence),
+                        @"message_id": assistantMessageId,
+                        @"text": text,
+                        @"finish_reason": @"stop"
+                    }, self.brokerRequestId);
+                }
+                // Keep DOM terminal as a passive finality fence even when proxy
+                // text is authoritative; it must not rewrite the proxy text.
                 self.streamTerminalObserved = YES;
             }
         } else if ([phase isEqualToString:@"handoff"]) {
@@ -519,8 +529,8 @@ static NSString *SubmitObservationScript(void) {
                 "throw error;"
               "}"
             "};"
-            "try{wrapped.__cwaIncludesSubmitObserver=true;wrapped.__cwaIncludesStreamObserver=originalFetch.__cwaIncludesStreamObserver===true;}catch(_){}window.fetch=wrapped;window.__cwaSubmitFetchWrapper=wrapped;return true;};"
-            "window.__cwaRearmSubmitFetchObserver=install;return install();"
+            "try{wrapped.__cwaIncludesSubmitObserver=true;wrapped.__cwaIncludesStreamObserver=originalFetch.__cwaIncludesStreamObserver===true;}catch(_){}window.fetch=wrapped;window.__cwaSubmitFetchWrapper=wrapped;window.__cwaRestoreSubmitFetchObserver=()=>{if(window.fetch===wrapped)window.fetch=originalFetch;return window.fetch===originalFetch;};return true;};"
+            "window.__cwaRearmSubmitFetchObserver=install;return window.__CWA_DEFER_SUBMIT_OBSERVER__===true?true:install();"
             "})()";
 }
 
@@ -1021,25 +1031,6 @@ static NSString *AuthenticatedFetchScript(NSString *endpoint) {
             "})()", literal];
 }
 
-static NSString *StopConversationFetchScript(
-    NSString *conversationId,
-    NSString *conduitToken,
-    NSString *turnTraceId
-) {
-    NSString *idLiteral = JSONStringLiteral(conversationId ?: @"");
-    NSString *conduitLiteral = JSONStringLiteral(conduitToken ?: @"");
-    NSString *traceLiteral = JSONStringLiteral(turnTraceId ?: @"");
-    return [NSString stringWithFormat:
-            @"(()=>{"
-              "const id=%@,conduit=%@,trace=%@;"
-              "fetch('/api/auth/session',{credentials:'include',cache:'no-store'})"
-                ".then(async s=>{const session=await s.json();const token=session&&session.accessToken;if(!token)throw new Error('AUTH_SESSION_ACCESS_TOKEN_MISSING');const headers={Accept:'application/json','Content-Type':'application/json',Authorization:'Bearer '+token};if(conduit)headers['x-conduit-token']=conduit;if(trace)headers['x-oai-turn-trace-id']=trace;return fetch('/backend-api/stop_conversation',{method:'POST',credentials:'include',cache:'no-store',headers,body:JSON.stringify({conversation_id:id,exclude_async_types:[]})});})"
-                ".then(async r=>{const body=await r.text();window.webkit.messageHandlers.cwaCanonical.postMessage({ok:r.ok,status:r.status,body});})"
-                ".catch(e=>window.webkit.messageHandlers.cwaCanonical.postMessage({ok:false,status:0,error:String(e)}));"
-              "return true;"
-            "})()", idLiteral, conduitLiteral, traceLiteral];
-}
-
 static NSString *CanonicalFetchScript(NSString *conversationId) {
     NSString *escaped = [conversationId stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]] ?: @"";
     NSString *endpoint = [@"/backend-api/conversation/" stringByAppendingString:escaped];
@@ -1222,6 +1213,14 @@ static WKWebViewConfiguration *TurnBrokerConfiguration(
             injectionTime:WKUserScriptInjectionTimeAtDocumentStart
             forMainFrameOnly:NO]];
     } else {
+        [configuration.userContentController addUserScript:[[WKUserScript alloc]
+            initWithSource:@"window.__CWA_DEFER_SUBMIT_OBSERVER__=true;"
+            injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+            forMainFrameOnly:NO]];
+        [configuration.userContentController addUserScript:[[WKUserScript alloc]
+            initWithSource:SubmitObservationScript()
+            injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+            forMainFrameOnly:NO]];
         [configuration.userContentController addUserScript:[[WKUserScript alloc]
             initWithSource:shellSource
             injectionTime:WKUserScriptInjectionTimeAtDocumentStart
@@ -1460,6 +1459,7 @@ static void LaunchTurnBrokerEntry(WKTurnBrokerEntry *entry) {
         @"prompt": entry.prompt ?: @"",
         @"profile": entry.profile ?: @"",
         @"temporary": @(entry.temporary),
+        @"proxy_protected_write": @(entry.proxyProtectedWrite),
         @"conversation_id": entry.conversationId ?: @"",
         @"parent_message_id": entry.parentMessageId ?: @"",
         @"selected_model_slug": entry.modelSlug ?: @"",
@@ -2476,8 +2476,6 @@ int main(int argc, const char *argv[]) {
         NSTimeInterval timeout = RequestDouble(request, @"timeout", [ArgValue(args, @"--timeout", @"150") doubleValue]);
         BOOL stopOnly = RequestBool(request, @"stop_only", HasArg(args, @"--stop-only"));
         NSString *stopConversation = stopOnly ? ConversationIdFromURL(urlString) : @"";
-        NSString *stopContextConduit = RequestString(request, @"stop_context_conduit", @"");
-        NSString *stopContextTrace = RequestString(request, @"stop_context_trace", @"");
         BOOL visible = RequestBool(request, @"visible", HasArg(args, @"--visible"));
         BOOL observeSubmit = RequestBool(request, @"observe_submit", HasArg(args, @"--observe-submit"));
         BOOL observeStream = RequestBool(request, @"observe_stream", HasArg(args, @"--observe-stream"));
@@ -2498,7 +2496,11 @@ int main(int argc, const char *argv[]) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_RESUME_VALUE_REQUIRED"});
             return 25;
         }
-        if (readOnly) urlString = @"https://chatgpt.com/robots.txt";
+        if (stopOnly && stopConversation.length > 0) {
+            urlString = [@"https://chatgpt.com/c/" stringByAppendingString:stopConversation];
+        } else if (readOnly) {
+            urlString = @"https://chatgpt.com/robots.txt";
+        }
         if (domObserveOnly) urlString = [@"https://chatgpt.com/c/" stringByAppendingString:domObserveConversation];
         if (timeout <= 0) timeout = 150;
         if (observerPollInterval <= 0) observerPollInterval = 1.0;
@@ -2776,38 +2778,26 @@ int main(int argc, const char *argv[]) {
                     PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_STOP_CONVERSATION_ID_UNRESOLVED"});
                     return 28;
                 }
-                delegate.canonicalDone = NO;
-                delegate.canonicalResult = nil;
-                EvaluateSync(
-                    webView,
-                    StopConversationFetchScript(
-                        stopConversation,
-                        stopContextConduit,
-                        stopContextTrace
-                    ),
-                    2.0,
-                    nil
-                );
-                NSDate *stopRequestDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(8.0, MAX(0.1, [deadline timeIntervalSinceNow]))];
-                while (!delegate.canonicalDone && [stopRequestDeadline timeIntervalSinceNow] > 0) {
-                    RunLoopFor(0.05);
+                NSDate *stopControlDeadline = [NSDate dateWithTimeIntervalSinceNow:MIN(12.0, MAX(0.1, [deadline timeIntervalSinceNow]))];
+                NSDictionary *stopResult = nil;
+                while ([stopControlDeadline timeIntervalSinceNow] > 0) {
+                    stopResult = ParseJSONResult(EvaluateSync(webView, StopScript(), 0.5, nil));
+                    if ([stopResult[@"ok"] boolValue]) break;
+                    RunLoopFor(0.1);
                 }
-                NSDictionary *stopResult = delegate.canonicalResult;
-                BOOL stopRequestOK = [stopResult isKindOfClass:[NSDictionary class]] && [stopResult[@"ok"] boolValue];
-                NSNumber *stopStatus = [stopResult[@"status"] isKindOfClass:[NSNumber class]] ? stopResult[@"status"] : @0;
-                if (!stopRequestOK) {
+                if (![stopResult[@"ok"] boolValue]) {
                     PrintResult(@{
                         @"ok":@NO,
-                        @"error":@"WKWEBVIEW_STOP_HTTP_FAILED",
-                        @"status":stopStatus,
-                        @"conversation_id":stopConversation
+                        @"error":@"WKWEBVIEW_STOP_CONTROL_NOT_FOUND",
+                        @"conversation_id":stopConversation,
+                        @"detail": stopResult[@"reason"] ?: @"no_stop"
                     });
                     return 29;
                 }
                 PrintResult(@{
                     @"ok":@YES,
                     @"stop_requested":@YES,
-                    @"status":stopStatus,
+                    @"stop_control_clicked":@YES,
                     @"conversation_id":stopConversation
                 });
                 return 0;

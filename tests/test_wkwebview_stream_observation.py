@@ -310,10 +310,12 @@ def test_minimal_security_prepare_matches_verified_continuation_dispatch() -> No
     assert 'if (conversationId && !temporary) {' in shell
     assert 'const conduitToken = await conduitPromise;' in shell
     assert 'const useOfficialConversationTransport =' in shell
-    assert 'conversationId\n      && !temporary\n      && typeof officialConversationTransport === "function"' in shell
+    assert 'conversationId\n      && !temporary\n      && window.__CWA_PROXY_PROTECTED_WRITE__ !== true\n      && typeof officialConversationTransport === "function"' in shell
     assert 'sharedConversationInitializationPromise = Promise.resolve(Object.freeze({' in shell
     assert 'sharedModelCatalogPromises.set("temporary", Promise.resolve(modelsPayload));' in shell
     assert 'postStream({ phase: "handoff_released" });' in shell
+    assert 'content.parts.filter((part) => typeof part === "string").join("")' in shell
+    assert 'content.parts.filter((part) => typeof part === "string").join("\\n")' not in shell
     assert 'try { void reader.cancel(); } catch (_) {}' in shell
     assert 'try { await reader.cancel(); } catch (_) {}' not in shell
     assert 'const brokerHandoffPromise = new Promise((resolve) =>' in shell
@@ -371,6 +373,15 @@ def test_minimal_security_protected_write_observes_response_directly() -> None:
     shell = (root / "minimal_security_shell.js").read_text(encoding="utf-8")
 
     assert "window.__cwaObserveStreamResponse=observe;" in native_source
+    assert native_source.count("initWithSource:SubmitObservationScript()") >= 2
+    assert 'window.__CWA_DEFER_SUBMIT_OBSERVER__=true;' in native_source
+    assert "window.__CWA_DEFER_SUBMIT_OBSERVER__===true?true:install()" in native_source
+    assert "window.__cwaRestoreSubmitFetchObserver" in native_source
+    assert '@"proxy_protected_write": @(entry.proxyProtectedWrite)' in native_source
+    assert 'Object.prototype.hasOwnProperty.call(requestConfig, "proxy_protected_write")' in shell
+    assert "window.__CWA_PROXY_PROTECTED_WRITE__ = requestConfig.proxy_protected_write === true;" in shell
+    assert "MINIMAL_PROXY_SUBMIT_OBSERVER_INSTALL_FAILED" in shell
+    assert "window.__cwaRestoreSubmitFetchObserver" in shell
     assert "const observeProtectedWriteResponse =" in shell
     assert "const observeDirectWriteResponse = async (response) =>" in shell
     assert "observedResponse = response.clone()" in shell
@@ -409,3 +420,4 @@ def test_native_stream_bridge_forwards_done_as_raw_ws_done() -> None:
     assert 'else if ([phase isEqualToString:@"done"]) {' in source
     assert '@"type":@"raw_ws_done"' in source
     assert "PrintEventForRequest" in source
+    assert "if (!self.submitProxyDispatch || !self.submitTemporaryModeObserved)" in source

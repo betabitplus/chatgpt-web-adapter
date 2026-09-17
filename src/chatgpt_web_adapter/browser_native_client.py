@@ -420,6 +420,14 @@ def _canonical_intermediate_events(
         elif (
             role == "assistant"
             and recipient in {"", "all"}
+            and content_type == "text"
+            and _assistant_output_channel(raw_message) == "commentary"
+        ):
+            kind = "commentary"
+            text = _sanitize_intermediate_text(extract_message_text(raw_message))
+        elif (
+            role == "assistant"
+            and recipient in {"", "all"}
             and metadata.get("is_thinking_preamble_message") is True
         ):
             kind = "assistant_progress"
@@ -436,7 +444,7 @@ def _canonical_intermediate_events(
         # the conversation current_node. Never freeze a partial first snapshot
         # such as "Первый". Tool calls can be shown immediately, but thinking text
         # is emitted only after ChatGPT advances to the next canonical node.
-        revision_sensitive = kind in {"assistant_progress", "reasoning"} and bool(text)
+        revision_sensitive = kind in {"assistant_progress", "commentary", "reasoning"} and bool(text)
         if (
             revision_sensitive
             and node_id == current_node
@@ -514,6 +522,8 @@ def _canonical_stream_answer_seed(
             metadata = {}
         if metadata.get("is_thinking_preamble_message") is True:
             continue
+        if _assistant_output_channel(raw_message) == "commentary":
+            continue
         content = raw_message.get("content")
         if not isinstance(content, dict) or content.get("content_type") != "text":
             continue
@@ -560,6 +570,24 @@ def _stream_message_completed(message: dict[str, Any]) -> bool:
         if isinstance(value, str) and value.strip():
             return True
     return False
+
+
+def _assistant_output_channel(message: dict[str, Any]) -> str | None:
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    for value in (
+        message.get("channel"),
+        metadata.get("channel"),
+        metadata.get("output_channel"),
+        metadata.get("message_channel"),
+    ):
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip().lower()
+        if normalized in {"final", "commentary"}:
+            return normalized
+    return None
 
 
 def _clone_stream_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -747,12 +775,41 @@ class CanonicalTopicStreamNormalizer:
         if not isinstance(content, dict):
             content = {}
         content_type = content.get("content_type")
+        output_channel = _assistant_output_channel(message)
         if (
             role == "assistant"
             and recipient in {"", "all"}
+            and output_channel != "commentary"
             and message.get("end_turn") is True
         ):
             self.turn_completed = True
+
+        if (
+            role == "assistant"
+            and recipient in {"", "all"}
+            and content_type == "text"
+            and output_channel == "commentary"
+        ):
+            self.segment_kind = "intermediate"
+            self._flush_pending_thinking(output)
+            text = _sanitize_intermediate_text(extract_message_text(message))
+            if (
+                text
+                and _stream_message_completed(message)
+                and message_id not in self.emitted_message_ids
+            ):
+                self.emitted_message_ids.add(message_id)
+                output.append(
+                    {
+                        "type": "canonical_intermediate_message",
+                        "message_id": message_id,
+                        "message_kind": "commentary",
+                        "text": text,
+                        "label": None,
+                        "tool_name": None,
+                    }
+                )
+            return
 
         if (
             role == "assistant"
@@ -1070,6 +1127,8 @@ def _assistant_candidates_from_payload(
             content = {}
         content_type = content.get("content_type")
         if metadata.get("is_thinking_preamble_message") is True:
+            continue
+        if _assistant_output_channel(raw_message) == "commentary":
             continue
         if content_type in {"thoughts", "reasoning_recap"}:
             continue

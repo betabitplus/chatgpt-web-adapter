@@ -1720,6 +1720,194 @@ def test_topic_stream_normalizer_flushes_completed_thinking_before_tool() -> Non
     assert tool[0]["text"] == "Inspecting state"
 
 
+def test_topic_stream_normalizer_preserves_commentary_between_tools_and_final() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+
+    commentary = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "commentary-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "channel": "commentary",
+                        "status": "finished_successfully",
+                        "content": {
+                            "content_type": "text",
+                            "parts": ["Visible progress before the tool."],
+                        },
+                        "metadata": {
+                            "is_thinking_preamble_message": True,
+                            "turn_exchange_id": "turn-1",
+                        },
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+    tool = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "tool-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "functions.exec",
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["{}"]},
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+    commentary_after_tool = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "commentary-2",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "status": "finished_successfully",
+                        "content": {
+                            "content_type": "text",
+                            "parts": ["Visible progress after the tool."],
+                        },
+                        "metadata": {
+                            "output_channel": "commentary",
+                            "turn_exchange_id": "turn-1",
+                        },
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+    final = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "answer-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "channel": "final",
+                        "status": "in_progress",
+                        "content": {"content_type": "text", "parts": ["Final answer"]},
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+
+    assert commentary == [
+        {
+            "type": "canonical_intermediate_message",
+            "message_id": "commentary-1",
+            "message_kind": "commentary",
+            "text": "Visible progress before the tool.",
+            "label": None,
+            "tool_name": None,
+        }
+    ]
+    assert tool[0]["message_kind"] == "tool_call"
+    assert commentary_after_tool == [
+        {
+            "type": "canonical_intermediate_message",
+            "message_id": "commentary-2",
+            "message_kind": "commentary",
+            "text": "Visible progress after the tool.",
+            "label": None,
+            "tool_name": None,
+        }
+    ]
+    assert final == [
+        {
+            "type": "assistant_text_delta",
+            "message_id": "answer-1",
+            "sequence": 1,
+            "delta": "Final answer",
+        }
+    ]
+    assert normalizer.answer_message_id == "answer-1"
+    assert normalizer.turn_completed is False
+    assert normalizer.feed_transport_event({"type": "raw_ws_done"}) == []
+    assert normalizer.turn_completed is True
+
+
+def test_canonical_commentary_is_intermediate_and_never_answer_seed() -> None:
+    payload = {
+        "current_node": "answer-1",
+        "mapping": {
+            "commentary-1": {
+                "parent": None,
+                "children": ["answer-1"],
+                "message": {
+                    "id": "commentary-1",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "content": {"content_type": "text", "parts": ["Visible progress"]},
+                    "metadata": {
+                        "message_channel": "commentary",
+                        "turn_exchange_id": "turn-1",
+                    },
+                    "end_turn": False,
+                },
+            },
+            "answer-1": {
+                "parent": "commentary-1",
+                "children": [],
+                "message": {
+                    "id": "answer-1",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "channel": "final",
+                    "status": "finished_successfully",
+                    "content": {"content_type": "text", "parts": ["Final answer"]},
+                    "metadata": {"turn_exchange_id": "turn-1"},
+                    "end_turn": True,
+                },
+            },
+        },
+    }
+    emitted: set[str] = set()
+
+    events = _canonical_intermediate_events(
+        payload,
+        baseline_message_ids=frozenset(),
+        emitted_message_ids=emitted,
+        submission_id="submission-1",
+    )
+
+    assert events == [
+        {
+            "type": "canonical_intermediate_message",
+            "message_id": "commentary-1",
+            "message_kind": "commentary",
+            "turn_exchange_id": "turn-1",
+            "text": "Visible progress",
+            "label": None,
+            "tool_name": None,
+            "submission_id": "submission-1",
+        }
+    ]
+    assert _canonical_stream_answer_seed(payload, turn_exchange_id="turn-1") == (
+        "answer-1",
+        "Final answer",
+    )
+
+
 def test_topic_stream_normalizer_emits_public_thought_summary_without_reasoning_title() -> (
     None
 ):

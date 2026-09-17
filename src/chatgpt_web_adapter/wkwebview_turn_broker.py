@@ -13,9 +13,9 @@ import sys
 import threading
 import time
 import uuid
-from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .exceptions import RequestError
 
@@ -796,6 +796,23 @@ def _send_envelope(connection: socket.socket, payload: dict[str, Any]) -> None:
     )
 
 
+def _connection_peer_closed(connection: socket.socket) -> bool:
+    """Return True when the client disconnected without consuming socket data."""
+
+    try:
+        ready, _, _ = select.select([connection], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    if not ready:
+        return False
+    try:
+        return connection.recv(1, socket.MSG_PEEK) == b""
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
+
+
 def _serve_client(
     connection: socket.socket,
     broker: _NativeTurnBroker,
@@ -898,6 +915,8 @@ def _serve_client(
             try:
                 envelope = target.get(timeout=min(0.2, max(0.01, deadline - time.monotonic())))
             except queue.Empty:
+                if _connection_peer_closed(connection):
+                    return
                 continue
             if envelope.get("type") == "error":
                 _send_envelope(

@@ -25,6 +25,7 @@ _EVENT_PREFIX = "WK_EVENT "
 
 _ObserverResult = TypeVar("_ObserverResult")
 _MINIMUM_MACOS = (12, 0)
+_PRE_SUBMIT_TIMEOUT_SECONDS = 12.0
 
 
 @dataclass
@@ -410,7 +411,12 @@ class WKWebViewHelperRuntime:
     ) -> dict[str, Any]:
         client = WKSystemTurnBrokerClient(self.helper_binary)
         connection = client.start_turn(dict(invocation.request), timeout=timeout)
-        deadline = time.monotonic() + max(1.0, timeout + 5.0)
+        started = time.monotonic()
+        deadline = started + max(1.0, timeout + 5.0)
+        pre_submit_deadline = started + min(
+            max(1.0, float(timeout)),
+            _PRE_SUBMIT_TIMEOUT_SECONDS,
+        )
         submit_request_seen = False
         submit_temporary_mode_observed = False
         payload: dict[str, Any] | None = None
@@ -499,6 +505,25 @@ class WKWebViewHelperRuntime:
                     if candidate is not None:
                         payload = candidate
                         break
+
+                if not submit_request_seen and time.monotonic() >= pre_submit_deadline:
+                    if on_transport_event is not None:
+                        try:
+                            on_transport_event(
+                                {
+                                    "type": "pre_submit_timeout",
+                                    "timeout_seconds": min(
+                                        max(1.0, float(timeout)),
+                                        _PRE_SUBMIT_TIMEOUT_SECONDS,
+                                    ),
+                                }
+                            )
+                        except Exception:
+                            pass
+                    raise RequestError(
+                        "WKWEBVIEW_PRE_SUBMIT_TIMEOUT",
+                        request_stage="wkwebview_authority_turn",
+                    )
         finally:
             connection.close()
 

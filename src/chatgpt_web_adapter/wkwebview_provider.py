@@ -1845,7 +1845,7 @@ class WKWebViewTurnProvider:
                 after_sequence=baseline_sequence,
             )
 
-        try:
+        def run_phase_one_attempt() -> dict[str, Any]:
             self._authority_context.on_submit_started = (
                 handle_submit_started if completion_watch_state is not None else None
             )
@@ -1855,7 +1855,7 @@ class WKWebViewTurnProvider:
                 else None
             )
             try:
-                payload = self._turn_orchestrator.run_protected_phase_one(
+                return self._turn_orchestrator.run_protected_phase_one(
                     invocation,
                     total_timeout=total_timeout,
                     started=started,
@@ -1869,6 +1869,66 @@ class WKWebViewTurnProvider:
             finally:
                 self._authority_context.on_submit_started = None
                 self._authority_context.external_completion_check = None
+
+        try:
+            try:
+                payload = run_phase_one_attempt()
+            except RequestError as error:
+                retryable_pre_submit = (
+                    str(error) == "WKWEBVIEW_PRE_SUBMIT_TIMEOUT"
+                    and isinstance(prepared.conversation_id, str)
+                    and bool(prepared.conversation_id.strip())
+                    and isinstance(prepared.baseline_current_node, str)
+                    and bool(prepared.baseline_current_node.strip())
+                )
+                if not retryable_pre_submit:
+                    raise
+
+                # The minimal shell emits submit_request_observed synchronously
+                # before dispatching the protected POST. The timed-out broker
+                # connection is closed first, which cancels its native entry.
+                # Confirm the canonical branch still points at the pre-submit
+                # baseline before allowing exactly one retry.
+                time.sleep(0.25)
+                try:
+                    guard_payload, _guard_fallback = (
+                        self._read_conversation_payload_via_coordinated_curl(
+                            prepared.conversation_id,
+                            timeout=min(5.0, max(1.0, total_timeout)),
+                        )
+                    )
+                except Exception as guard_error:
+                    raise RequestError(
+                        "WKWEBVIEW_PRE_SUBMIT_GUARD_UNAVAILABLE",
+                        request_stage="wkwebview_authority_turn",
+                    ) from guard_error
+
+                guard_current_node = guard_payload.get("current_node")
+                guard_contains_prompt = self._current_branch_contains_user_text(
+                    guard_payload,
+                    text,
+                )
+                if (
+                    guard_current_node != prepared.baseline_current_node
+                    or guard_contains_prompt
+                ):
+                    raise RequestError(
+                        "WKWEBVIEW_PRE_SUBMIT_COMMIT_AMBIGUOUS",
+                        request_stage="wkwebview_authority_turn",
+                    ) from error
+
+                if on_transport_event is not None:
+                    try:
+                        on_transport_event(
+                            {
+                                "type": "pre_submit_retry",
+                                "conversation_id": prepared.conversation_id,
+                            }
+                        )
+                    except Exception:
+                        pass
+                payload = run_phase_one_attempt()
+
             verified_canonical = None
             if completion_watch_state is not None:
                 sequence = completion_watch_state.get("sequence")

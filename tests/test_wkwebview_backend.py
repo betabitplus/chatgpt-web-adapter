@@ -4,6 +4,9 @@ import asyncio
 import base64
 import json
 import os
+import queue
+import socket
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +15,7 @@ from typing import Any
 import pytest
 
 import chatgpt_web_adapter.browser_authority_backend as browser_backend
+import chatgpt_web_adapter.wkwebview_turn_broker as turn_broker
 from chatgpt_web_adapter.browser_authority_backend import (
     CHROME_NATIVE_BROWSER_AUTHORITY_BACKEND,
     WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
@@ -1277,6 +1281,167 @@ def test_wkwebview_streaming_without_resume_uses_stream_terminal_proof(
     assert len(calls) == 1
     assert result.passive_observer_armed is False
     assert events[0]["text"] == "done"
+
+
+def test_wkwebview_continuation_retries_once_after_pre_submit_timeout(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    monkeypatch.setattr(provider, "_lightweight_transport", None)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_provider.time.sleep",
+        lambda _seconds: None,
+    )
+    prewrite = {
+        "current_node": "assistant-old",
+        "mapping": {
+            "assistant-old": {
+                "message": {
+                    "id": "assistant-old",
+                    "author": {"role": "assistant"},
+                    "metadata": {},
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(provider, "peek_prewrite_payload", lambda _cid: prewrite)
+    guard_reads: list[str] = []
+
+    def guard_read(conversation_id: str, *, timeout: float):
+        guard_reads.append(conversation_id)
+        return prewrite, None
+
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_via_coordinated_curl",
+        guard_read,
+    )
+    calls = 0
+
+    def fake_stream(
+        command,
+        *,
+        timeout,
+        on_text_event,
+        on_lifecycle_event=None,
+        on_transport_event=None,
+        **kwargs,
+    ):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RequestError(
+                "WKWEBVIEW_PRE_SUBMIT_TIMEOUT",
+                request_stage="wkwebview_authority_turn",
+            )
+        if callable(on_lifecycle_event):
+            on_lifecycle_event(
+                {
+                    "type": "write_identity_resolved",
+                    "conversation_id": "conversation-1",
+                }
+            )
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "response_status": 200,
+            "attachment_count": 0,
+            "write_commit_proven": True,
+            "write_commit_proof": "STREAM_TERMINAL",
+            "canonical_committed": False,
+            "committed_current_node": "",
+            "stream_terminal_observed": True,
+            "stream_resume_present": False,
+            "stream_resume_handoff_written": False,
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+    transport_events: list[dict[str, Any]] = []
+
+    result = provider.send_text_streaming(
+        "continue",
+        conversation="conversation-1",
+        model_slug="model-1",
+        on_text_event=lambda _event: None,
+        on_transport_event=transport_events.append,
+    )
+
+    assert calls == 2
+    assert guard_reads == ["conversation-1"]
+    assert result.conversation_id == "conversation-1"
+    assert transport_events == [
+        {
+            "type": "pre_submit_retry",
+            "conversation_id": "conversation-1",
+        }
+    ]
+
+
+def test_wkwebview_continuation_does_not_retry_when_commit_is_ambiguous(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    monkeypatch.setattr(provider, "_lightweight_transport", None)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_provider.time.sleep",
+        lambda _seconds: None,
+    )
+    prewrite = {
+        "current_node": "assistant-old",
+        "mapping": {
+            "assistant-old": {
+                "message": {
+                    "id": "assistant-old",
+                    "author": {"role": "assistant"},
+                    "metadata": {},
+                }
+            }
+        },
+    }
+    changed = {
+        "current_node": "user-new",
+        "mapping": {
+            "user-new": {
+                "message": {
+                    "id": "user-new",
+                    "author": {"role": "user"},
+                    "content": {"parts": ["continue"]},
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(provider, "peek_prewrite_payload", lambda _cid: prewrite)
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_via_coordinated_curl",
+        lambda _cid, *, timeout: (changed, None),
+    )
+    calls = 0
+
+    def fake_stream(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise RequestError(
+            "WKWEBVIEW_PRE_SUBMIT_TIMEOUT",
+            request_stage="wkwebview_authority_turn",
+        )
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+
+    with pytest.raises(
+        RequestError,
+        match="WKWEBVIEW_PRE_SUBMIT_COMMIT_AMBIGUOUS",
+    ):
+        provider.send_text_streaming(
+            "continue",
+            conversation="conversation-1",
+            model_slug="model-1",
+            on_text_event=lambda _event: None,
+        )
+
+    assert calls == 1
 
 
 def test_wkwebview_stop_requires_canonical_client_stopped_proof(monkeypatch) -> None:
@@ -3088,6 +3253,107 @@ def test_wkwebview_dependencies_are_owned_by_cwa_packaging() -> None:
     assert "wkwebview = [" not in pyproject
     assert "\"curl-cffi==0.16.3; sys_platform == 'darwin'\"" in pyproject
     assert "\"websockets==16.1.1; sys_platform == 'darwin'\"" in pyproject
+
+
+def test_turn_broker_pre_submit_watchdog_fails_and_closes_connection(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def recv_envelope(self, timeout: float):
+            time.sleep(min(timeout, 0.01))
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FakeConnection()
+
+    class FakeBrokerClient:
+        def __init__(self, helper_binary: Path) -> None:
+            self.helper_binary = helper_binary
+
+        def start_turn(self, request: dict[str, Any], *, timeout: float):
+            assert request == {"prompt": "hello"}
+            assert timeout == 60.0
+            return connection
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_helper_runtime.WKSystemTurnBrokerClient",
+        FakeBrokerClient,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_helper_runtime._PRE_SUBMIT_TIMEOUT_SECONDS",
+        0.05,
+    )
+    runtime = WKWebViewHelperRuntime(tmp_path, build_timeout=1)
+    events: list[dict[str, Any]] = []
+    invocation = SimpleNamespace(request={"prompt": "hello"})
+
+    started = time.monotonic()
+    with pytest.raises(RequestError, match="WKWEBVIEW_PRE_SUBMIT_TIMEOUT"):
+        runtime._run_streaming_via_turn_broker(
+            invocation,
+            timeout=60.0,
+            on_text_event=lambda _event: None,
+            on_lifecycle_event=None,
+            on_transport_event=events.append,
+            on_submit_started=None,
+            external_completion_check=None,
+        )
+
+    assert time.monotonic() - started < 0.5
+    assert connection.closed is True
+    assert events == [{"type": "pre_submit_timeout", "timeout_seconds": 0.05}]
+
+
+def test_turn_broker_client_disconnect_cancels_native_request_promptly() -> None:
+    class FakeBroker:
+        def __init__(self) -> None:
+            self.target: queue.Queue[dict[str, Any]] = queue.Queue()
+            self.started = threading.Event()
+            self.finished: list[tuple[str, bool]] = []
+
+        def start(self, request_id: str, request: dict[str, Any]):
+            assert request == {"prompt": "hello"}
+            self.started.set()
+            return self.target
+
+        def finish(self, request_id: str, *, cancel: bool) -> None:
+            self.finished.append((request_id, cancel))
+
+    server, client = socket.socketpair()
+    broker = FakeBroker()
+    active_lock = threading.Lock()
+    active_state: dict[str, Any] = {"count": 1, "last_activity": 0.0}
+    worker = threading.Thread(
+        target=turn_broker._serve_client,
+        args=(server, broker, active_lock, active_state),
+        daemon=True,
+    )
+    worker.start()
+    client.sendall(
+        json.dumps(
+            {
+                "type": "turn",
+                "request_id": "request-1",
+                "request": {"prompt": "hello"},
+                "timeout": 60.0,
+            }
+        ).encode("utf-8")
+        + b"\n"
+    )
+    assert broker.started.wait(timeout=1.0)
+
+    client.close()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert broker.finished == [("request-1", True)]
+    assert active_state["count"] == 0
 
 
 def test_wkwebview_helper_rejects_macos_before_12(monkeypatch, tmp_path) -> None:

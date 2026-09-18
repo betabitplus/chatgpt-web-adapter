@@ -3070,6 +3070,42 @@ def test_wkwebview_verified_completion_reuses_canonical_without_second_read(
     assert result["_cwa_stream_finality_proven"] is True
 
 
+
+def test_wkwebview_completion_check_captures_baseline_before_observer_start() -> None:
+    provider = WKWebViewTurnProvider()
+    current_sequence = 7
+    observed_calls: list[tuple[str, int]] = []
+
+    def sequence(conversation_id: str) -> int:
+        assert conversation_id == "conversation-1"
+        return current_sequence
+
+    def ensure(*, timeout: float) -> bool:
+        nonlocal current_sequence
+        assert timeout == 12.0
+        current_sequence = 8
+        return True
+
+    def observed(conversation_id: str, *, after_sequence: int) -> bool:
+        observed_calls.append((conversation_id, after_sequence))
+        return current_sequence > after_sequence
+
+    provider._lightweight_transport = SimpleNamespace(
+        ensure_conversation_completion_observer=ensure,
+        conversation_completion_sequence=sequence,
+        conversation_completion_observed=observed,
+    )
+
+    check = provider._conversation_completion_check(
+        "conversation-1",
+        timeout=30,
+    )
+
+    assert callable(check)
+    assert check() is True
+    assert observed_calls == [("conversation-1", 7)]
+
+
 def test_wkwebview_known_continuation_waits_for_passive_completion_then_reads_once(
     monkeypatch,
 ) -> None:

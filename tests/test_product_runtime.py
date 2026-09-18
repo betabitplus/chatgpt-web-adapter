@@ -844,6 +844,67 @@ def test_runtime_topic_follow_terminal_stream_reconciles_once_with_canonical_fin
     assert result["stream_terminal_provisional_text"] == "broken pieces"
 
 
+def test_runtime_topic_follow_external_completion_reconciles_canonical_final_once(
+    monkeypatch,
+) -> None:
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    topic_id = "conversation-turn-turn-external-complete"
+    canonical_payload = {
+        "current_node": "assistant-final",
+        "mapping": {
+            "assistant-final": {
+                "id": "assistant-final",
+                "parent": "user-1",
+                "children": [],
+                "message": {
+                    "id": "assistant-final",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "content": {
+                        "content_type": "text",
+                        "parts": ["canonical final after lost topic"],
+                    },
+                    "metadata": {
+                        "stream_topic_id": topic_id,
+                        "turn_exchange_id": "turn-external-complete",
+                        "finish_details": {"type": "stop"},
+                    },
+                },
+            }
+        },
+    }
+    canonical_reads: list[str] = []
+
+    provider.follow_stream_topic = lambda **_kwargs: {
+        "topic_id": topic_id,
+        "external_completion_observed": True,
+        "stream_finality_proven": False,
+        "completed": True,
+    }
+    provider.wait_for_shared_final_payload = lambda *args, **kwargs: None
+    monkeypatch.setattr(
+        runtime,
+        "get_conversation_payload",
+        lambda conversation: (
+            canonical_reads.append(conversation.conversation_id) or canonical_payload
+        ),
+    )
+
+    result = runtime.conversation_follow_stream(
+        "conversation-1",
+        topic_id=topic_id,
+    )
+
+    assert canonical_reads == ["conversation-1"]
+    assert result["stream_completed"] is True
+    assert result["stream_terminal_reconciled"] is True
+    assert result["messages"][-1].message_id == "assistant-final"
+    assert result["messages"][-1].text == "canonical final after lost topic"
+
+
 def test_runtime_topic_follow_terminal_stream_falls_back_when_canonical_unavailable(
     monkeypatch,
 ) -> None:

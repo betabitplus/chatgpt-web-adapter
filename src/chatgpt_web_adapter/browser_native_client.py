@@ -1839,6 +1839,7 @@ def await_browser_native_final(
     passive_message_id: str | None = None
     passive_stream_ended_without_terminal = False
     incomplete_without_terminal = False
+    deferred_external_completion_observed = False
     stream_message_id = getattr(turn, "stream_message_id", None)
     if not isinstance(stream_message_id, str) or not stream_message_id.strip():
         stream_message_id = submission.stream_state.message_id
@@ -1920,6 +1921,10 @@ def await_browser_native_final(
             stream_should_stop=deferred_should_stop,
         )
         passive_observer_used = True
+        deferred_external_completion_observed = bool(
+            isinstance(deferred_result, dict)
+            and deferred_result.get("external_completion_observed") is True
+        )
         candidate_message_id = (
             deferred_result.get("message_id")
             if isinstance(deferred_result, dict)
@@ -1968,7 +1973,11 @@ def await_browser_native_final(
             and isinstance(stream_message_id, str)
             and bool(stream_message_id.strip())
         )
-        if not stream_finality_proven and not provider_stop_requested():
+        if (
+            not stream_finality_proven
+            and not deferred_external_completion_observed
+            and not provider_stop_requested()
+        ):
             raise RequestError(
                 "BROWSER_NATIVE_DEFERRED_TOPIC_FINALITY_MISSING",
                 request_stage="browser_native_observe_turn",
@@ -1979,6 +1988,7 @@ def await_browser_native_final(
 
     if (
         not stream_finality_proven
+        and not deferred_external_completion_observed
         and bool(getattr(turn, "passive_observer_armed", False))
         and callable(observe_turn)
         and isinstance(authority_lease_id, str)

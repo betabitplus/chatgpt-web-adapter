@@ -62,6 +62,7 @@ class BrowserNativeTurnResult:
     stream_model_slug: str | None = None
     stream_topic_id: str | None = None
     stream_resume_value: str | None = None
+    stream_completion_sequence: int | None = None
 
 
 @dataclass(frozen=True)

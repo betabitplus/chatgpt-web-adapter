@@ -742,7 +742,11 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             result_topic_id = follow_result.get("topic_id")
             if isinstance(result_topic_id, str) and result_topic_id.strip():
                 actual_topic_id = result_topic_id.strip()
-        completed = normalizer.turn_completed
+        external_completion_observed = bool(
+            isinstance(follow_result, dict)
+            and follow_result.get("external_completion_observed") is True
+        )
+        completed = normalizer.turn_completed or external_completion_observed
         if not completed:
             cancelled = False
             if should_stop is not None:

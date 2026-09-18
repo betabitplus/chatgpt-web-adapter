@@ -44,6 +44,8 @@ _LIGHTWEIGHT_MEDIA_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp
 _CHAT_FILES_URL = "https://chatgpt.com/backend-api/files"
 _ATTACHMENT_UPLOAD_TIMEOUT_SECONDS = 60.0
 _CELSIUS_URL_CACHE_SECONDS = 300.0
+_FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS = 300.0
+_FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS = (0.25, 1.0, 2.0, 5.0, 10.0, 30.0)
 
 
 class WKLightweightTransport:
@@ -577,6 +579,11 @@ class WKLightweightTransport:
             )
         return tuple(descriptors)
 
+    def _invalidate_celsius_websocket_url(self) -> None:
+        with self._celsius_cache_lock:
+            self._celsius_cached_url = None
+            self._celsius_cached_at = 0.0
+
     def _resolve_celsius_websocket_url(self, *, timeout: float) -> tuple[Any, str]:
         curl_requests = self._curl_requests()
         now = time.monotonic()
@@ -1078,71 +1085,148 @@ class WKLightweightTransport:
                 "WKWEBVIEW_CURL_WS_TOPIC_UNRESOLVED",
                 request_stage="wkwebview_curl_ws_follow",
             )
-        _curl_requests, websocket_url = self._resolve_celsius_websocket_url(
-            timeout=timeout
-        )
+
         state: dict[str, Any] = {
             "conversation_id": conversation_id,
             "resume_turn_topic_id": normalized_topic,
         }
         segment_done_count = 0
-        passive_terminal_observed = False
+        external_completion_observed = False
+        caller_stop_observed = False
+        deadline_expired = False
+        reconnect_count = 0
+        reconnect_reason: str | None = None
+        started = time.monotonic()
+        deadline = started + max(1.0, float(timeout))
+        last_topic_activity_at = started
 
         def relay_event(event: dict[str, Any]) -> None:
-            nonlocal segment_done_count
-            if isinstance(event, dict) and event.get("type") == "raw_ws_done":
+            nonlocal segment_done_count, last_topic_activity_at
+            if not isinstance(event, dict):
+                return
+            event_type = event.get("type")
+            if event_type in {
+                "stream_handoff_ws_subscribed",
+                "raw_ws_event",
+                "raw_ws_done",
+            }:
+                last_topic_activity_at = time.monotonic()
+            if event_type == "raw_ws_done":
                 segment_done_count += 1
             if on_event is not None:
                 on_event(event)
 
-        def topic_should_stop() -> bool:
-            nonlocal passive_terminal_observed
-            if should_stop is not None:
-                try:
-                    if bool(should_stop()):
-                        passive_terminal_observed = True
-                        state["stream_terminal_observed"] = True
-                        state.setdefault("finish_reason", "stream_terminal")
-                        return True
-                except Exception:
-                    pass
-            if passive_completion_check is not None:
-                try:
-                    terminal = bool(passive_completion_check())
-                except Exception:
-                    terminal = False
-                if terminal:
-                    passive_terminal_observed = True
-                    state["stream_terminal_observed"] = True
-                    state.setdefault("finish_reason", "conversation_turn_complete")
-                    return True
-            return False
+        while True:
+            reconnect_requested = False
 
-        started = time.monotonic()
-        try:
-            self.source_client.wk_transport_stream_topic(
-                normalized_topic,
-                websocket_url=websocket_url,
-                state=state,
-                on_event=relay_event,
-                on_token=on_token,
-                should_stop=topic_should_stop,
-                stop_on_done=False,
+            def topic_should_stop() -> bool:
+                nonlocal external_completion_observed
+                nonlocal caller_stop_observed
+                nonlocal deadline_expired
+                nonlocal reconnect_requested
+                nonlocal reconnect_reason
+                if should_stop is not None:
+                    try:
+                        if bool(should_stop()):
+                            caller_stop_observed = True
+                            state["stream_terminal_observed"] = True
+                            state.setdefault("finish_reason", "stream_terminal")
+                            return True
+                    except Exception:
+                        pass
+                if passive_completion_check is not None:
+                    try:
+                        terminal = bool(passive_completion_check())
+                    except Exception:
+                        terminal = False
+                    if terminal:
+                        external_completion_observed = True
+                        state["stream_terminal_observed"] = True
+                        state["finish_reason"] = "conversation_turn_complete"
+                        return True
+                now = time.monotonic()
+                if now >= deadline:
+                    deadline_expired = True
+                    return True
+                if (
+                    now - last_topic_activity_at
+                    >= _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS
+                ):
+                    reconnect_requested = True
+                    reconnect_reason = "topic_idle"
+                    return True
+                return False
+
+            remaining = max(1.0, deadline - time.monotonic())
+            try:
+                _curl_requests, websocket_url = self._resolve_celsius_websocket_url(
+                    timeout=remaining
+                )
+                self.source_client.wk_transport_stream_topic(
+                    normalized_topic,
+                    websocket_url=websocket_url,
+                    state=state,
+                    on_event=relay_event,
+                    on_token=on_token,
+                    should_stop=topic_should_stop,
+                    stop_on_done=False,
+                )
+            except AttributeError as error:
+                raise RequestError(
+                    "WKWEBVIEW_CURL_WS_SOURCE_CONTRACT_MISSING",
+                    request_stage="wkwebview_curl_ws_follow",
+                ) from error
+            except RequestError as error:
+                if time.monotonic() >= deadline:
+                    raise
+                retryable_stream_error = (
+                    error.request_stage is None
+                    or self.request_error_allows_fallback(error)
+                )
+                if not retryable_stream_error:
+                    raise
+                reconnect_requested = True
+                reconnect_reason = self.safe_fallback_reason(error)
+
+            if external_completion_observed or caller_stop_observed:
+                break
+            if not reconnect_requested:
+                break
+
+            reconnect_count += 1
+            self._invalidate_celsius_websocket_url()
+            if on_event is not None:
+                on_event(
+                    {
+                        "type": "stream_handoff_ws_reconnecting",
+                        "topic_id": normalized_topic,
+                        "reason": reconnect_reason or "transport",
+                        "attempt": reconnect_count,
+                    }
+                )
+            backoff_index = min(
+                reconnect_count - 1,
+                len(_FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS) - 1,
             )
-        except AttributeError as error:
-            raise RequestError(
-                "WKWEBVIEW_CURL_WS_SOURCE_CONTRACT_MISSING",
-                request_stage="wkwebview_curl_ws_follow",
-            ) from error
+            sleep_for = _FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS[backoff_index]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                caller_stop_observed = True
+                break
+            time.sleep(min(sleep_for, remaining))
+            last_topic_activity_at = time.monotonic()
+
         message_id = state.get("message_id")
         finish_reason = state.get("finish_reason")
-        stream_finality_proven = passive_terminal_observed or (
-            segment_done_count > 0
-            and isinstance(message_id, str)
-            and bool(message_id.strip())
-            and isinstance(finish_reason, str)
-            and bool(finish_reason.strip())
-        )
+        stream_finality_proven = False
+        if not external_completion_observed and not deadline_expired:
+            stream_finality_proven = caller_stop_observed or (
+                segment_done_count > 0
+                and isinstance(message_id, str)
+                and bool(message_id.strip())
+                and isinstance(finish_reason, str)
+                and bool(finish_reason.strip())
+            )
         return {
             "ok": True,
             "conversation_id": conversation_id,
@@ -1153,8 +1237,12 @@ class WKLightweightTransport:
             "observed_model": state.get("observed_model"),
             "observed_reasoning_effort": state.get("observed_reasoning_effort"),
             "stream_finality_proven": stream_finality_proven,
-            "completed": stream_finality_proven,
+            "external_completion_observed": external_completion_observed,
+            "caller_stop_observed": caller_stop_observed,
+            "completed": stream_finality_proven or external_completion_observed,
             "segment_done_count": segment_done_count,
+            "reconnect_count": reconnect_count,
+            "reconnect_reason": reconnect_reason,
             "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
         }
 

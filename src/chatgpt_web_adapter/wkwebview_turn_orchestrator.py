@@ -1182,4 +1182,10 @@ class WKTurnOrchestrator:
                 if isinstance(payload.get("_cwa_deferred_stream_resume_value"), str)
                 else None
             ),
+            stream_completion_sequence=(
+                payload.get("_cwa_stream_completion_sequence")
+                if isinstance(payload.get("_cwa_stream_completion_sequence"), int)
+                and not isinstance(payload.get("_cwa_stream_completion_sequence"), bool)
+                else None
+            ),
         )

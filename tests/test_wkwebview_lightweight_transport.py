@@ -272,6 +272,158 @@ def test_lightweight_follow_topic_uses_one_celsius_bootstrap_and_forwards_events
     assert url == "https://chatgpt.com/backend-api/celsius/ws/user"
 
 
+def test_lightweight_follow_topic_reconnects_after_idle_with_fresh_celsius_url(
+    monkeypatch,
+) -> None:
+    class IdleThenLiveSource(_SourceClient):
+        def wk_transport_stream_topic(
+            self,
+            topic_id: str,
+            *,
+            websocket_url: str,
+            state: dict,
+            on_event=None,
+            on_token=None,
+            should_stop=None,
+            stop_on_done=True,
+        ) -> None:
+            self.stream_calls.append((topic_id, websocket_url))
+            assert should_stop is not None
+            if len(self.stream_calls) == 1:
+                assert should_stop() is True
+                return
+            state["message_id"] = "assistant-1"
+            state["finish_reason"] = "stop"
+            if on_event is not None:
+                on_event({"type": "raw_ws_done", "topic_id": topic_id})
+
+    source = IdleThenLiveSource()
+    transport, _ = _transport(source)
+    curl = _CurlRequests(
+        [
+            [_Response(200, {"websocket_url": "wss://example.invalid/first"})],
+            [_Response(200, {"websocket_url": "wss://example.invalid/second"})],
+        ]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS",
+        (0.0,),
+    )
+
+    result = transport.follow_topic(
+        conversation_id="conversation-1",
+        topic_id="conversation-turn-turn-1",
+        timeout=30,
+    )
+
+    assert result["reconnect_count"] == 1
+    assert result["reconnect_reason"] == "topic_idle"
+    assert source.stream_calls == [
+        ("conversation-turn-turn-1", "wss://example.invalid/first"),
+        ("conversation-turn-turn-1", "wss://example.invalid/second"),
+    ]
+    assert len(curl.sessions) == 2
+    assert [len(session.calls) for session in curl.sessions] == [1, 1]
+
+
+def test_lightweight_follow_topic_reconnects_after_transport_error(
+    monkeypatch,
+) -> None:
+    class ErrorThenLiveSource(_SourceClient):
+        def wk_transport_stream_topic(
+            self,
+            topic_id: str,
+            *,
+            websocket_url: str,
+            state: dict,
+            on_event=None,
+            on_token=None,
+            should_stop=None,
+            stop_on_done=True,
+        ) -> None:
+            self.stream_calls.append((topic_id, websocket_url))
+            if len(self.stream_calls) == 1:
+                raise RequestError("socket closed", request_stage="transport")
+            state["message_id"] = "assistant-1"
+            state["finish_reason"] = "stop"
+            if on_event is not None:
+                on_event({"type": "raw_ws_done", "topic_id": topic_id})
+
+    source = ErrorThenLiveSource()
+    transport, _ = _transport(source)
+    curl = _CurlRequests(
+        [
+            [_Response(200, {"websocket_url": "wss://example.invalid/first"})],
+            [_Response(200, {"websocket_url": "wss://example.invalid/second"})],
+        ]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS",
+        (0.0,),
+    )
+
+    result = transport.follow_topic(
+        conversation_id="conversation-1",
+        topic_id="conversation-turn-turn-1",
+        timeout=30,
+    )
+
+    assert result["reconnect_count"] == 1
+    assert result["reconnect_reason"] == "transport"
+    assert source.stream_calls == [
+        ("conversation-turn-turn-1", "wss://example.invalid/first"),
+        ("conversation-turn-turn-1", "wss://example.invalid/second"),
+    ]
+
+
+def test_lightweight_follow_topic_external_completion_requires_reconcile(
+    monkeypatch,
+) -> None:
+    class ExternalCompletionSource(_SourceClient):
+        def wk_transport_stream_topic(
+            self,
+            topic_id: str,
+            *,
+            websocket_url: str,
+            state: dict,
+            on_event=None,
+            on_token=None,
+            should_stop=None,
+            stop_on_done=True,
+        ) -> None:
+            self.stream_calls.append((topic_id, websocket_url))
+            state["message_id"] = "assistant-partial"
+            if on_event is not None:
+                on_event({"type": "raw_ws_done", "topic_id": topic_id})
+            assert should_stop is not None
+            assert should_stop() is True
+
+    source = ExternalCompletionSource()
+    transport, _ = _transport(source)
+    curl = _CurlRequests(
+        [[_Response(200, {"websocket_url": "wss://example.invalid/celsius"})]]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+
+    result = transport.follow_topic(
+        conversation_id="conversation-1",
+        topic_id="conversation-turn-turn-1",
+        timeout=30,
+        passive_completion_check=lambda: True,
+    )
+
+    assert result["external_completion_observed"] is True
+    assert result["stream_finality_proven"] is False
+    assert result["completed"] is True
+    assert result["finish_reason"] == "conversation_turn_complete"
+
+
 def test_lightweight_follow_topic_accepts_revision_safe_passive_terminal(
     monkeypatch,
 ) -> None:

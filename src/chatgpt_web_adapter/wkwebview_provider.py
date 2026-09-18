@@ -1480,6 +1480,39 @@ class WKWebViewTurnProvider:
             on_event=on_event,
         )
 
+    def _conversation_completion_check(
+        self,
+        conversation_id: str,
+        *,
+        timeout: float,
+        after_sequence: int | None = None,
+    ) -> Any:
+        transport = self._lightweight_transport
+        if transport is None:
+            return None
+        ensure = getattr(transport, "ensure_conversation_completion_observer", None)
+        sequence = getattr(transport, "conversation_completion_sequence", None)
+        observed = getattr(transport, "conversation_completion_observed", None)
+        if not callable(ensure) or not callable(sequence) or not callable(observed):
+            return None
+        baseline = (
+            after_sequence
+            if isinstance(after_sequence, int) and not isinstance(after_sequence, bool)
+            else sequence(conversation_id)
+        )
+        if not ensure(timeout=min(12.0, max(0.1, float(timeout)))):
+            return None
+
+        def completed() -> bool:
+            return bool(
+                observed(
+                    conversation_id,
+                    after_sequence=baseline,
+                )
+            )
+
+        return completed
+
     def follow_stream_topic(
         self,
         *,
@@ -1515,6 +1548,10 @@ class WKWebViewTurnProvider:
                     "topic_id": topic_id,
                 }
             actual_topic_id = candidate.strip()
+        completion_check = self._conversation_completion_check(
+            conversation_id,
+            timeout=timeout,
+        )
         result = self._lightweight_transport.follow_topic(
             conversation_id=conversation_id,
             topic_id=actual_topic_id,
@@ -1522,6 +1559,7 @@ class WKWebViewTurnProvider:
             on_event=on_event,
             on_token=None,
             should_stop=should_stop,
+            passive_completion_check=completion_check,
         )
         if isinstance(result, dict):
             return {**result, "topic_id": actual_topic_id}
@@ -2019,6 +2057,12 @@ class WKWebViewTurnProvider:
                 baseline_current_node=prepared.baseline_current_node,
             )
             payload["_cwa_deferred_stream_topic_id"] = normalized_topic
+            if completion_watch_state is not None:
+                completion_sequence = completion_watch_state.get("sequence")
+                if isinstance(completion_sequence, int) and not isinstance(
+                    completion_sequence, bool
+                ):
+                    payload["_cwa_stream_completion_sequence"] = completion_sequence
             payload["_cwa_phase_b_transport"] = (
                 "deferred_curl_cffi_websocket_topic_handoff"
             )
@@ -2198,6 +2242,11 @@ class WKWebViewTurnProvider:
                 request_stage="wkwebview_deferred_stream",
             )
         conversation_id = turn.conversation_id
+        completion_check = self._conversation_completion_check(
+            conversation_id,
+            timeout=timeout,
+            after_sequence=turn.stream_completion_sequence,
+        )
         try:
             result = self._resume_via_curl_ws_topic_second_leg(
                 conversation_id=conversation_id,
@@ -2207,7 +2256,7 @@ class WKWebViewTurnProvider:
                 relay_text_event=lambda _event: None,
                 on_transport_event=on_transport_event,
                 stream_should_stop=stream_should_stop,
-                passive_completion_check=None,
+                passive_completion_check=completion_check,
             )
             message_id = result.get("message_id")
             completed = result.get("stream_finality_proven") is True or (

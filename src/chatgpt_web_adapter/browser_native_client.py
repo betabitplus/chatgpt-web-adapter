@@ -466,6 +466,16 @@ def _canonical_intermediate_events(
             if isinstance(tool_name, str) and tool_name.strip()
             else None,
         }
+        if kind == "tool_call":
+            create_time = raw_message.get("create_time")
+            if (
+                isinstance(create_time, (int, float))
+                and not isinstance(create_time, bool)
+                and create_time > 0
+            ):
+                event["source_time_ms"] = int(
+                    create_time if create_time >= 100_000_000_000 else create_time * 1000
+                )
         if submission_id is not None:
             event["submission_id"] = submission_id
         events.append(event)
@@ -694,6 +704,14 @@ class CanonicalTopicStreamNormalizer:
             return []
         output: list[dict[str, Any]] = []
         self._process_payload(payload, output)
+        source_offset = event.get("offset")
+        if isinstance(source_offset, str) and source_offset.strip():
+            for item in output:
+                if (
+                    item.get("type") == "canonical_intermediate_message"
+                    and item.get("message_kind") == "tool_call"
+                ):
+                    item["source_offset"] = source_offset.strip()
         if self.catchup_remaining > 0:
             self.catchup_remaining -= 1
         return output

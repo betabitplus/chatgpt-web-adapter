@@ -1714,6 +1714,7 @@ def test_topic_stream_normalizer_replays_only_new_answer_delta_and_live_tool() -
     tool = normalizer.feed_transport_event(
         {
             "type": "raw_ws_event",
+            "offset": "1789764066954-0",
             "parsed": {
                 "v": {
                     "message": {
@@ -1766,6 +1767,7 @@ def test_topic_stream_normalizer_replays_only_new_answer_delta_and_live_tool() -
     assert tool[0]["message_id"] == "tool-new"
     assert tool[0]["tool_name"] == "api_tool.call_tool"
     assert tool[0]["label"] == "Searching needle..."
+    assert tool[0]["source_offset"] == "1789764066954-0"
     assert duplicate_tool == []
 
 
@@ -2461,6 +2463,7 @@ def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitiv
                 "id": "m-call",
                 "author": {"role": "assistant"},
                 "recipient": "api_tool.call_tool",
+                "create_time": 1789764263.550104,
                 "content": {
                     "content_type": "code",
                     "text": json.dumps(
@@ -2551,6 +2554,7 @@ def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitiv
     ]
     assert events[0]["text"] == "Reading files…"
     assert events[1]["label"] == "Reading README…"
+    assert events[1]["source_time_ms"] == 1789764263550
     assert sensitive_value not in events[1]["text"]
     assert "[REDACTED]" in events[1]["text"]
     assert events[2]["label"] == "README read"

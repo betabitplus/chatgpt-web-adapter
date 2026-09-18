@@ -1891,17 +1891,21 @@ class WKWebViewTurnProvider:
                 # baseline before allowing exactly one retry.
                 time.sleep(0.25)
                 try:
-                    guard_payload, _guard_fallback = (
-                        self._read_conversation_payload_via_coordinated_curl(
-                            prepared.conversation_id,
-                            timeout=min(5.0, max(1.0, total_timeout)),
-                        )
+                    guard_payload = self._read_conversation_payload_uncached(
+                        prepared.conversation_id,
+                        timeout=min(5.0, max(1.0, total_timeout)),
+                        coordinated=True,
                     )
                 except Exception as guard_error:
                     raise RequestError(
                         "WKWEBVIEW_PRE_SUBMIT_GUARD_UNAVAILABLE",
                         request_stage="wkwebview_authority_turn",
                     ) from guard_error
+                if not isinstance(guard_payload, dict):
+                    raise RequestError(
+                        "WKWEBVIEW_PRE_SUBMIT_GUARD_UNAVAILABLE",
+                        request_stage="wkwebview_authority_turn",
+                    ) from error
 
                 guard_current_node = guard_payload.get("current_node")
                 guard_contains_prompt = self._current_branch_contains_user_text(

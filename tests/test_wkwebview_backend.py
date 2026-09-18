@@ -1308,13 +1308,19 @@ def test_wkwebview_continuation_retries_once_after_pre_submit_timeout(
     monkeypatch.setattr(provider, "peek_prewrite_payload", lambda _cid: prewrite)
     guard_reads: list[str] = []
 
-    def guard_read(conversation_id: str, *, timeout: float):
+    def guard_read(
+        conversation_id: str,
+        *,
+        timeout: float,
+        coordinated: bool = True,
+    ):
         guard_reads.append(conversation_id)
-        return prewrite, None
+        assert coordinated is True
+        return prewrite
 
     monkeypatch.setattr(
         provider,
-        "_read_conversation_payload_via_coordinated_curl",
+        "_read_conversation_payload_uncached",
         guard_read,
     )
     calls = 0
@@ -1378,6 +1384,74 @@ def test_wkwebview_continuation_retries_once_after_pre_submit_timeout(
     ]
 
 
+def test_wkwebview_continuation_reports_guard_unavailable_instead_of_none_crash(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    monkeypatch.setattr(provider, "_lightweight_transport", None)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_provider.time.sleep",
+        lambda _seconds: None,
+    )
+    prewrite = {
+        "current_node": "assistant-old",
+        "mapping": {
+            "assistant-old": {
+                "message": {
+                    "id": "assistant-old",
+                    "author": {"role": "assistant"},
+                    "metadata": {},
+                }
+            }
+        },
+    }
+    monkeypatch.setattr(provider, "peek_prewrite_payload", lambda _cid: prewrite)
+    guard_reads = 0
+
+    def missing_guard(
+        _conversation_id: str,
+        *,
+        timeout: float,
+        coordinated: bool = True,
+    ):
+        nonlocal guard_reads
+        guard_reads += 1
+        assert coordinated is True
+        return None
+
+    monkeypatch.setattr(
+        provider,
+        "_read_conversation_payload_uncached",
+        missing_guard,
+    )
+    stream_calls = 0
+
+    def fake_stream(command, **kwargs):
+        nonlocal stream_calls
+        stream_calls += 1
+        raise RequestError(
+            "WKWEBVIEW_PRE_SUBMIT_TIMEOUT",
+            request_stage="wkwebview_authority_turn",
+        )
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+
+    with pytest.raises(
+        RequestError,
+        match="WKWEBVIEW_PRE_SUBMIT_GUARD_UNAVAILABLE",
+    ):
+        provider.send_text_streaming(
+            "continue",
+            conversation="conversation-1",
+            model_slug="model-1",
+            on_text_event=lambda _event: None,
+        )
+
+    assert stream_calls == 1
+    assert guard_reads == 1
+
+
 def test_wkwebview_continuation_does_not_retry_when_commit_is_ambiguous(
     monkeypatch,
 ) -> None:
@@ -1415,8 +1489,8 @@ def test_wkwebview_continuation_does_not_retry_when_commit_is_ambiguous(
     monkeypatch.setattr(provider, "peek_prewrite_payload", lambda _cid: prewrite)
     monkeypatch.setattr(
         provider,
-        "_read_conversation_payload_via_coordinated_curl",
-        lambda _cid, *, timeout: (changed, None),
+        "_read_conversation_payload_uncached",
+        lambda _cid, *, timeout, coordinated=True: changed,
     )
     calls = 0
 

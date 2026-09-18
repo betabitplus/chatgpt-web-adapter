@@ -44,7 +44,8 @@ _LIGHTWEIGHT_MEDIA_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp
 _CHAT_FILES_URL = "https://chatgpt.com/backend-api/files"
 _ATTACHMENT_UPLOAD_TIMEOUT_SECONDS = 60.0
 _CELSIUS_URL_CACHE_SECONDS = 300.0
-_FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS = 300.0
+_FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS = 12.0
+_FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS = 60.0
 _FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS = (0.25, 1.0, 2.0, 5.0, 10.0, 30.0)
 
 
@@ -1099,9 +1100,10 @@ class WKLightweightTransport:
         started = time.monotonic()
         deadline = started + max(1.0, float(timeout))
         last_topic_activity_at = started
+        idle_reconnect_seconds = _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS
 
         def relay_event(event: dict[str, Any]) -> None:
-            nonlocal segment_done_count, last_topic_activity_at
+            nonlocal segment_done_count, last_topic_activity_at, idle_reconnect_seconds
             if not isinstance(event, dict):
                 return
             event_type = event.get("type")
@@ -1111,6 +1113,23 @@ class WKLightweightTransport:
                 "raw_ws_done",
             }:
                 last_topic_activity_at = time.monotonic()
+            if event_type == "raw_ws_event":
+                idle_reconnect_seconds = _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS
+            elif event_type == "stream_handoff_ws_subscribed" and reconnect_count > 0:
+                catchup_count = event.get("catchup_count")
+                if isinstance(catchup_count, int) and not isinstance(
+                    catchup_count, bool
+                ):
+                    if catchup_count > 0:
+                        idle_reconnect_seconds = _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS
+                    else:
+                        idle_reconnect_seconds = min(
+                            _FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS,
+                            max(
+                                _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS,
+                                idle_reconnect_seconds * 2.0,
+                            ),
+                        )
             if event_type == "raw_ws_done":
                 segment_done_count += 1
             if on_event is not None:
@@ -1148,10 +1167,7 @@ class WKLightweightTransport:
                 if now >= deadline:
                     deadline_expired = True
                     return True
-                if (
-                    now - last_topic_activity_at
-                    >= _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS
-                ):
+                if now - last_topic_activity_at >= idle_reconnect_seconds:
                     reconnect_requested = True
                     reconnect_reason = "topic_idle"
                     return True
@@ -1194,7 +1210,8 @@ class WKLightweightTransport:
                 break
 
             reconnect_count += 1
-            self._invalidate_celsius_websocket_url()
+            if reconnect_reason != "topic_idle":
+                self._invalidate_celsius_websocket_url()
             if on_event is not None:
                 on_event(
                     {
@@ -1243,6 +1260,7 @@ class WKLightweightTransport:
             "segment_done_count": segment_done_count,
             "reconnect_count": reconnect_count,
             "reconnect_reason": reconnect_reason,
+            "idle_reconnect_seconds": idle_reconnect_seconds,
             "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
         }
 

@@ -1002,6 +1002,78 @@ def test_wkwebview_ws_transport_uses_short_close_timeout(monkeypatch) -> None:
     assert connect_kwargs["close_timeout"] == 0.25
 
 
+def test_wkwebview_ws_transport_resumes_from_last_processed_offset(monkeypatch) -> None:
+    client = object.__new__(ChatGPTWebClient)
+    client.timeout = 30.0
+    sent: list[str] = []
+    stopped = False
+
+    class FakeWebSocket:
+        async def send(self, raw: str) -> None:
+            sent.append(raw)
+
+        async def recv(self) -> str:
+            return json.dumps(
+                {
+                    "id": 2,
+                    "reply": {
+                        "recovered": True,
+                        "catchups": [
+                            {
+                                "type": "message",
+                                "topic_id": "conversation-turn-1",
+                                "offset": "offset-new",
+                                "payload": {"type": "ignored"},
+                            }
+                        ],
+                        "last_offset": "offset-new",
+                    },
+                }
+            )
+
+    class FakeConnect:
+        async def __aenter__(self):
+            return FakeWebSocket()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    import websockets
+
+    monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: FakeConnect())
+    monkeypatch.setattr(
+        client,
+        "_probe_celsius_ws_user",
+        lambda: {"websocket_url": "wss://example.invalid/celsius"},
+    )
+    monkeypatch.setattr(client, "_build_headers", lambda extra=None: {})
+    monkeypatch.setattr(
+        client, "_capture_ws_url_diagnostics", lambda websocket_url, state: None
+    )
+
+    state = {"resume_ws_offset": "offset-old"}
+
+    def on_event(event: dict[str, Any]) -> None:
+        nonlocal stopped
+        if event.get("type") == "stream_handoff_ws_subscribed":
+            stopped = True
+
+    asyncio.run(
+        client._stream_handoff_via_ws_topic_async(
+            "conversation-turn-1",
+            state=state,
+            on_event=on_event,
+            on_token=None,
+            cancel_check=lambda: stopped,
+            stop_on_done=False,
+        )
+    )
+
+    commands = json.loads(sent[0])
+    assert commands[1]["command"]["offset"] == "offset-old"
+    assert state["resume_ws_offset"] == "offset-new"
+
+
 def test_wkwebview_lightweight_path_is_default_with_explicit_legacy_escape_hatch(
     monkeypatch,
 ) -> None:

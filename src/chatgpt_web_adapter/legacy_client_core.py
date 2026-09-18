@@ -804,7 +804,20 @@ class ChatGPTWebClient:
         self._capture_ws_url_diagnostics(websocket_url, state)
         headers = self._build_headers({"origin": CHAT_URL.rstrip("/")})
         connect_command = {"id": 1, "command": {"type": "connect", "presence": {"type": "presence", "state": "foreground"}}}
-        subscribe_command = {"id": 2, "command": {"type": "subscribe", "topic_id": topic_id, "offset": "0"}}
+        resume_offset = state.get("resume_ws_offset")
+        subscribe_offset = (
+            resume_offset.strip()
+            if isinstance(resume_offset, str) and resume_offset.strip()
+            else "0"
+        )
+        subscribe_command = {
+            "id": 2,
+            "command": {
+                "type": "subscribe",
+                "topic_id": topic_id,
+                "offset": subscribe_offset,
+            },
+        }
         completed = False
 
         def process_ws_message(message: dict[str, Any]) -> None:
@@ -859,6 +872,11 @@ class ChatGPTWebClient:
             for token in tokens:
                 if token and on_token is not None:
                     on_token(token)
+
+        def record_offset(item: dict[str, Any]) -> None:
+            offset = item.get("offset")
+            if isinstance(offset, str) and offset.strip():
+                state["resume_ws_offset"] = offset.strip()
 
         def cancellation_requested() -> bool:
             if cancel_check is None:
@@ -920,6 +938,7 @@ class ChatGPTWebClient:
                         continue
                     if item.get("type") == "message" and item.get("topic_id") == topic_id:
                         process_ws_message(item)
+                        record_offset(item)
                         continue
                     reply = item.get("reply")
                     if item.get("id") != 2 or not isinstance(reply, dict):
@@ -930,6 +949,8 @@ class ChatGPTWebClient:
                         topic_id=topic_id,
                         recovered=bool(reply.get("recovered")),
                         catchup_count=len(reply.get("catchups") or ()),
+                        subscribe_offset=subscribe_offset,
+                        last_offset=reply.get("last_offset"),
                         last_offset_present=reply.get("last_offset") is not None,
                     )
                     catchups = reply.get("catchups")
@@ -937,6 +958,10 @@ class ChatGPTWebClient:
                         for catchup in catchups:
                             if isinstance(catchup, dict):
                                 process_ws_message(catchup)
+                                record_offset(catchup)
+                    last_offset = reply.get("last_offset")
+                    if isinstance(last_offset, str) and last_offset.strip():
+                        state["resume_ws_offset"] = last_offset.strip()
                 if completed:
                     break
         if not completed:

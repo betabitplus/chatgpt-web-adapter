@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -272,7 +273,7 @@ def test_lightweight_follow_topic_uses_one_celsius_bootstrap_and_forwards_events
     assert url == "https://chatgpt.com/backend-api/celsius/ws/user"
 
 
-def test_lightweight_follow_topic_reconnects_after_idle_with_fresh_celsius_url(
+def test_lightweight_follow_topic_reconnects_after_idle_with_cursor_and_cached_celsius_url(
     monkeypatch,
 ) -> None:
     class IdleThenLiveSource(_SourceClient):
@@ -290,8 +291,10 @@ def test_lightweight_follow_topic_reconnects_after_idle_with_fresh_celsius_url(
             self.stream_calls.append((topic_id, websocket_url))
             assert should_stop is not None
             if len(self.stream_calls) == 1:
+                state["resume_ws_offset"] = "offset-17"
                 assert should_stop() is True
                 return
+            assert state["resume_ws_offset"] == "offset-17"
             state["message_id"] = "assistant-1"
             state["finish_reason"] = "stop"
             if on_event is not None:
@@ -300,10 +303,7 @@ def test_lightweight_follow_topic_reconnects_after_idle_with_fresh_celsius_url(
     source = IdleThenLiveSource()
     transport, _ = _transport(source)
     curl = _CurlRequests(
-        [
-            [_Response(200, {"websocket_url": "wss://example.invalid/first"})],
-            [_Response(200, {"websocket_url": "wss://example.invalid/second"})],
-        ]
+        [[_Response(200, {"websocket_url": "wss://example.invalid/first"})]]
     )
     monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
     monkeypatch.setattr(
@@ -325,10 +325,74 @@ def test_lightweight_follow_topic_reconnects_after_idle_with_fresh_celsius_url(
     assert result["reconnect_reason"] == "topic_idle"
     assert source.stream_calls == [
         ("conversation-turn-turn-1", "wss://example.invalid/first"),
-        ("conversation-turn-turn-1", "wss://example.invalid/second"),
+        ("conversation-turn-turn-1", "wss://example.invalid/first"),
     ]
-    assert len(curl.sessions) == 2
-    assert [len(session.calls) for session in curl.sessions] == [1, 1]
+    assert len(curl.sessions) == 1
+    assert [len(session.calls) for session in curl.sessions] == [1]
+
+
+def test_lightweight_follow_topic_empty_idle_recovery_backs_off_next_lease(
+    monkeypatch,
+) -> None:
+    class IdleEmptyThenTerminalSource(_SourceClient):
+        def wk_transport_stream_topic(
+            self,
+            topic_id: str,
+            *,
+            websocket_url: str,
+            state: dict,
+            on_event=None,
+            on_token=None,
+            should_stop=None,
+            stop_on_done=True,
+        ) -> None:
+            self.stream_calls.append((topic_id, websocket_url))
+            assert should_stop is not None
+            if len(self.stream_calls) == 1:
+                time.sleep(0.003)
+                assert should_stop() is True
+                return
+            if on_event is not None:
+                on_event(
+                    {
+                        "type": "stream_handoff_ws_subscribed",
+                        "topic_id": topic_id,
+                        "recovered": True,
+                        "catchup_count": 0,
+                    }
+                )
+            state["message_id"] = "assistant-1"
+            state["finish_reason"] = "stop"
+            if on_event is not None:
+                on_event({"type": "raw_ws_done", "topic_id": topic_id})
+
+    source = IdleEmptyThenTerminalSource()
+    transport, _ = _transport(source)
+    curl = _CurlRequests(
+        [[_Response(200, {"websocket_url": "wss://example.invalid/celsius"})]]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS",
+        0.001,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS",
+        (0.0,),
+    )
+
+    result = transport.follow_topic(
+        conversation_id="conversation-1",
+        topic_id="conversation-turn-turn-1",
+        timeout=30,
+    )
+
+    assert result["reconnect_count"] == 1
+    assert result["idle_reconnect_seconds"] == pytest.approx(0.002)
 
 
 def test_lightweight_follow_topic_reconnects_after_transport_error(

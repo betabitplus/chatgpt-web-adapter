@@ -457,6 +457,26 @@ def test_split_submit_accepts_normalizer_terminal_proof_after_revision_without_c
                 }
             )
             on_transport_event({"type": "raw_ws_done"})
+            on_transport_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "message": {
+                            "id": "assistant-revised",
+                            "author": {"role": "assistant"},
+                            "recipient": "all",
+                            "channel": "final",
+                            "content": {
+                                "content_type": "text",
+                                "parts": ["LOAD_PTY_1_0_OK_20260917"],
+                            },
+                            "status": "finished_successfully",
+                            "end_turn": True,
+                        }
+                    },
+                }
+            )
+            on_transport_event({"type": "raw_ws_done"})
             return {
                 "stream_finality_proven": False,
                 "message_id": None,
@@ -1842,6 +1862,13 @@ def test_topic_stream_normalizer_preserves_commentary_between_tools_and_final() 
     assert normalizer.answer_message_id == "answer-1"
     assert normalizer.turn_completed is False
     assert normalizer.feed_transport_event({"type": "raw_ws_done"}) == []
+    assert normalizer.turn_completed is False
+    assert normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {"p": "/message/end_turn", "v": True},
+        }
+    ) == []
     assert normalizer.turn_completed is True
 
 
@@ -2018,50 +2045,8 @@ def test_topic_stream_normalizer_reconstructs_public_thought_summary_patches() -
     assert "private" not in repr(events)
 
 
-def test_topic_stream_normalizer_completes_only_done_after_answer_segment() -> None:
+def test_topic_stream_normalizer_does_not_complete_on_segment_done_before_tool_chain() -> None:
     normalizer = CanonicalTopicStreamNormalizer()
-
-    normalizer.feed_transport_event(
-        {
-            "type": "raw_ws_event",
-            "parsed": {
-                "v": {
-                    "message": {
-                        "id": "thinking-1",
-                        "author": {"role": "assistant"},
-                        "recipient": "all",
-                        "status": "finished_successfully",
-                        "content": {"content_type": "text", "parts": ["Checking"]},
-                        "metadata": {"is_thinking_preamble_message": True},
-                        "end_turn": False,
-                    }
-                }
-            },
-        }
-    )
-    assert normalizer.feed_transport_event({"type": "raw_ws_done"}) == []
-    assert normalizer.turn_completed is False
-
-    normalizer.feed_transport_event(
-        {
-            "type": "raw_ws_event",
-            "parsed": {
-                "v": {
-                    "message": {
-                        "id": "tool-1",
-                        "author": {"role": "assistant"},
-                        "recipient": "web.run",
-                        "status": "finished_successfully",
-                        "content": {"content_type": "text", "parts": ["{}"]},
-                        "metadata": {},
-                        "end_turn": False,
-                    }
-                }
-            },
-        }
-    )
-    assert normalizer.feed_transport_event({"type": "raw_ws_done"}) == []
-    assert normalizer.turn_completed is False
 
     events = normalizer.feed_transport_event(
         {
@@ -2069,12 +2054,13 @@ def test_topic_stream_normalizer_completes_only_done_after_answer_segment() -> N
             "parsed": {
                 "v": {
                     "message": {
-                        "id": "answer-1",
+                        "id": "answer-early",
                         "author": {"role": "assistant"},
                         "recipient": "all",
-                        "status": "in_progress",
-                        "content": {"content_type": "text", "parts": ["FINAL"]},
-                        "metadata": {},
+                        "channel": "final",
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["Early text"]},
+                        "metadata": {"turn_exchange_id": "turn-1"},
                         "end_turn": False,
                     }
                 }
@@ -2084,14 +2070,80 @@ def test_topic_stream_normalizer_completes_only_done_after_answer_segment() -> N
     assert events == [
         {
             "type": "assistant_text_delta",
-            "message_id": "answer-1",
+            "message_id": "answer-early",
             "sequence": 1,
-            "delta": "FINAL",
+            "delta": "Early text",
         }
     ]
+    assert normalizer.feed_transport_event({"type": "raw_ws_done"}) == []
     assert normalizer.turn_completed is False
 
+    tool_events = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "tool-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "api_tool.call_tool",
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["{}"]},
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+    assert tool_events[0]["message_kind"] == "tool_call"
+    assert normalizer.turn_completed is False
+
+    commentary = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "commentary-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "channel": "commentary",
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["Still working"]},
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+    assert commentary[0]["message_kind"] == "commentary"
     assert normalizer.feed_transport_event({"type": "raw_ws_done"}) == []
+    assert normalizer.turn_completed is False
+
+    final_events = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "answer-final",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "channel": "final",
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["Complete final answer"]},
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                        "end_turn": True,
+                    }
+                }
+            },
+        }
+    )
+    assert final_events[-1]["type"] in {"assistant_text_delta", "assistant_text_revision"}
+    assert normalizer.answer_message_id == "answer-final"
+    assert normalizer.answer_text == "Complete final answer"
     assert normalizer.turn_completed is True
 
 

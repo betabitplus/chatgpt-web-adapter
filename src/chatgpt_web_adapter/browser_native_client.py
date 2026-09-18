@@ -660,8 +660,12 @@ class CanonicalTopicStreamNormalizer:
             )
             return []
         if event.get("type") == "raw_ws_done":
-            if self.segment_kind == "answer" and bool(self.answer_text):
-                self.turn_completed = True
+            # A Celsius topic can emit multiple done boundaries during one
+            # tool-heavy turn. In particular, a visible text/commentary segment
+            # may finish before the model calls another tool. Treat this as a
+            # segment boundary only; whole-turn finality requires an explicit
+            # terminal assistant message (end_turn=true) or a lower-level
+            # conversation-turn terminal proof.
             self.segment_kind = None
             return []
         if event.get("type") != "raw_ws_event":

@@ -1281,24 +1281,20 @@
       }
     }
     const metadata = value.metadata && typeof value.metadata === "object" ? value.metadata : null;
-    const finishDetails = metadata && metadata.finish_details && typeof metadata.finish_details === "object"
-      ? metadata.finish_details
-      : null;
-    const terminalStatus = ["completed", "complete", "finished", "done", "success", "succeeded", "finished_successfully"];
     const explicitTerminalType = ["conversation_turn_complete", "conversation_turn_completed", "turn_complete"].includes(type);
     const recipient = transportString(value.recipient) || "all";
     const contentType = transportString(content && content.content_type);
+    const outputChannel = transportString(value.channel);
     const visibleFinalAssistant = author && author.role === "assistant"
       && recipient === "all"
       && contentType === "text"
+      && outputChannel !== "commentary"
       && !(metadata && metadata.is_thinking_preamble_message === true);
-    const assistantTerminal = visibleFinalAssistant && (
-      value.end_turn === true
-      || terminalStatus.includes(String(value.status || "").toLowerCase())
-      || terminalStatus.includes(String(value.async_status || "").toLowerCase())
-      || (metadata && terminalStatus.includes(String(metadata.status || "").toLowerCase()))
-      || (finishDetails && transportString(finishDetails.type))
-    );
+    // Message-local status/finish details are not whole-turn terminal proof.
+    // Tool-heavy turns routinely finish commentary text and then continue with
+    // another tool. Only an explicit end-turn assistant message (or the
+    // dedicated conversation-turn-complete event below) closes the turn.
+    const assistantTerminal = visibleFinalAssistant && value.end_turn === true;
     const terminal = assistantTerminal
       || (explicitTerminalType && brokerCurrentIsFinalText && !!brokerCurrentMessageId);
     for (const key of Object.keys(value).slice(0, 128)) {

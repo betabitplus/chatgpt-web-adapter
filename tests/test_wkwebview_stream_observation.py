@@ -358,7 +358,9 @@ def test_minimal_security_prepare_matches_verified_continuation_dispatch() -> No
         "inspectBrokerTerminalPatch(path, value);"
     )
     assert 'const visibleFinalAssistant = author && author.role === "assistant"' in shell
-    assert 'const assistantTerminal = visibleFinalAssistant && (' in shell
+    assert 'outputChannel !== "commentary"' in shell
+    assert 'const assistantTerminal = visibleFinalAssistant && value.end_turn === true;' in shell
+    assert 'terminalStatus.includes' not in shell
     assert 'explicitTerminalType && brokerCurrentIsFinalText && !!brokerCurrentMessageId' in shell
 
 

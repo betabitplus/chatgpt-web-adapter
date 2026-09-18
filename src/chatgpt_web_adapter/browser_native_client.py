@@ -804,7 +804,13 @@ class CanonicalTopicStreamNormalizer:
             and content_type == "text"
             and output_channel == "commentary"
         )
-        if visually_hidden and not live_commentary:
+        live_tool_result = (
+            role == "tool"
+            and recipient in {"", "all"}
+            and content_type == "text"
+            and output_channel == "commentary"
+        )
+        if visually_hidden and not (live_commentary or live_tool_result):
             return
         if (
             role == "assistant"

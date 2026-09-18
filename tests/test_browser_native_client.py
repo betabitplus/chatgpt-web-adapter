@@ -2063,6 +2063,56 @@ def test_topic_stream_normalizer_emits_hidden_commentary_when_patch_completes() 
     ]
 
 
+def test_topic_stream_normalizer_preserves_hidden_tool_error_result() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+
+    output = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "tool-error-1",
+                        "author": {
+                            "role": "tool",
+                            "name": "api_tool.call_tool",
+                            "metadata": {},
+                        },
+                        "recipient": "all",
+                        "channel": "commentary",
+                        "status": "finished_successfully",
+                        "content": {
+                            "content_type": "text",
+                            "parts": [
+                                '{"codexpro_tool":"apply_patch",'
+                                '"error":"CodexProError: error: corrupt patch at line 13",'
+                                '"is_error":true}'
+                            ],
+                        },
+                        "metadata": {
+                            "is_visually_hidden_from_conversation": True,
+                            "turn_exchange_id": "turn-1",
+                        },
+                    }
+                }
+            },
+        }
+    )
+
+    assert len(output) == 1
+    event = output[0]
+    assert event["type"] == "canonical_intermediate_message"
+    assert event["message_id"] == "tool-error-1"
+    assert event["message_kind"] == "tool_result"
+    assert event["label"] is None
+    assert event["tool_name"] == "api_tool.call_tool"
+    assert json.loads(event["text"]) == {
+        "codexpro_tool": "apply_patch",
+        "error": "CodexProError: error: corrupt patch at line 13",
+        "is_error": True,
+    }
+
+
 def test_topic_stream_normalizer_still_filters_hidden_non_commentary() -> None:
     normalizer = CanonicalTopicStreamNormalizer()
 

@@ -1886,6 +1886,7 @@ def test_topic_stream_normalizer_preserves_commentary_between_tools_and_final() 
                         },
                         "metadata": {
                             "is_thinking_preamble_message": True,
+                            "is_visually_hidden_from_conversation": True,
                             "turn_exchange_id": "turn-1",
                         },
                         "end_turn": False,
@@ -1996,6 +1997,92 @@ def test_topic_stream_normalizer_preserves_commentary_between_tools_and_final() 
         }
     ) == []
     assert normalizer.turn_completed is True
+
+
+def test_topic_stream_normalizer_emits_hidden_commentary_when_patch_completes() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+
+    started = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "commentary-patched-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "channel": "commentary",
+                        "status": "in_progress",
+                        "content": {
+                            "content_type": "text",
+                            "parts": ["Qualification mismatch исчез"],
+                        },
+                        "metadata": {
+                            "is_thinking_preamble_message": True,
+                            "is_visually_hidden_from_conversation": True,
+                            "turn_exchange_id": "turn-1",
+                        },
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+    completed = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "p": "/message/status",
+                "v": "finished_successfully",
+            },
+        }
+    )
+
+    assert started == []
+    assert completed == [
+        {
+            "type": "canonical_intermediate_message",
+            "message_id": "commentary-patched-1",
+            "message_kind": "commentary",
+            "text": "Qualification mismatch исчез",
+            "label": None,
+            "tool_name": None,
+        }
+    ]
+
+
+def test_topic_stream_normalizer_still_filters_hidden_non_commentary() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+
+    hidden = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "hidden-internal-1",
+                        "author": {"role": "assistant"},
+                        "recipient": "all",
+                        "channel": "final",
+                        "status": "finished_successfully",
+                        "content": {
+                            "content_type": "text",
+                            "parts": ["Internal hidden text."],
+                        },
+                        "metadata": {
+                            "is_visually_hidden_from_conversation": True,
+                            "turn_exchange_id": "turn-1",
+                        },
+                        "end_turn": False,
+                    }
+                }
+            },
+        }
+    )
+
+    assert hidden == []
+    assert "hidden-internal-1" not in normalizer.emitted_message_ids
+    assert normalizer.answer_message_id is None
 
 
 def test_canonical_commentary_is_intermediate_and_never_answer_seed() -> None:

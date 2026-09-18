@@ -764,8 +764,7 @@ class CanonicalTopicStreamNormalizer:
         metadata = message.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
-        if metadata.get("is_visually_hidden_from_conversation") is True:
-            return
+        visually_hidden = metadata.get("is_visually_hidden_from_conversation") is True
         message_id = self._message_id(message)
         if message_id is None:
             return
@@ -780,6 +779,14 @@ class CanonicalTopicStreamNormalizer:
             content = {}
         content_type = content.get("content_type")
         output_channel = _assistant_output_channel(message)
+        live_commentary = (
+            role == "assistant"
+            and recipient in {"", "all"}
+            and content_type == "text"
+            and output_channel == "commentary"
+        )
+        if visually_hidden and not live_commentary:
+            return
         if (
             role == "assistant"
             and recipient in {"", "all"}

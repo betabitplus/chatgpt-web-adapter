@@ -477,6 +477,13 @@ def test_runtime_topic_follow_streams_events_then_finalizes_from_terminal(
         provider_calls.append((conversation_id, topic_id, timeout))
         on_event(
             {
+                "type": "stream_handoff_server_quiet",
+                "topic_id": topic_id,
+                "server_idle_seconds": 125.0,
+            }
+        )
+        on_event(
+            {
                 "type": "raw_ws_event",
                 "parsed": {
                     "v": {
@@ -546,12 +553,14 @@ def test_runtime_topic_follow_streams_events_then_finalizes_from_terminal(
     )
 
     assert provider_calls == [("conversation-1", "conversation-turn-turn-1", 90)]
-    assert len(events) == 2
-    assert events[0]["message_kind"] == "tool_call"
-    assert events[0]["message_id"] == "tool-1"
-    assert events[1]["type"] == "assistant_text_delta"
-    assert events[1]["message_id"] == "assistant-final"
-    assert events[1]["delta"] == "done"
+    assert len(events) == 3
+    assert events[0]["type"] == "stream_handoff_server_quiet"
+    assert events[0]["server_idle_seconds"] == 125.0
+    assert events[1]["message_kind"] == "tool_call"
+    assert events[1]["message_id"] == "tool-1"
+    assert events[2]["type"] == "assistant_text_delta"
+    assert events[2]["message_id"] == "assistant-final"
+    assert events[2]["delta"] == "done"
     assert final_calls == []
     assert result["stream_completed"] is True
     assert result["stream_topic_id"] == "conversation-turn-turn-1"

@@ -822,6 +822,12 @@ class ChatGPTWebClient:
 
         def process_ws_message(message: dict[str, Any]) -> None:
             nonlocal completed
+            message_offset = message.get("offset")
+            normalized_offset = (
+                message_offset.strip()
+                if isinstance(message_offset, str) and message_offset.strip()
+                else None
+            )
             payload = message.get("payload")
             if not isinstance(payload, dict) or payload.get("type") != "conversation-turn-stream":
                 return
@@ -830,7 +836,12 @@ class ChatGPTWebClient:
                 return
             inner_type = inner.get("type")
             if inner_type == "done":
-                self._emit_event(on_event, "raw_ws_done", topic_id=topic_id)
+                self._emit_event(
+                    on_event,
+                    "raw_ws_done",
+                    topic_id=topic_id,
+                    offset=normalized_offset,
+                )
                 if stop_on_done:
                     completed = True
                 return
@@ -842,7 +853,12 @@ class ChatGPTWebClient:
                 return
             raw_data = parsed_item["data"]
             if raw_data == "[DONE]":
-                self._emit_event(on_event, "raw_ws_done", topic_id=topic_id)
+                self._emit_event(
+                    on_event,
+                    "raw_ws_done",
+                    topic_id=topic_id,
+                    offset=normalized_offset,
+                )
                 if stop_on_done:
                     completed = True
                 return
@@ -856,6 +872,7 @@ class ChatGPTWebClient:
                     raw=raw_data,
                     parsed=None,
                     event=parsed_item["event"],
+                    offset=normalized_offset,
                 )
                 return
             self._emit_event(
@@ -865,6 +882,7 @@ class ChatGPTWebClient:
                 raw=raw_data,
                 parsed=parsed_payload,
                 event=parsed_item["event"],
+                offset=normalized_offset,
             )
             tokens, maybe_title = self._parse_event(parsed_payload, state)
             if maybe_title:

@@ -17,6 +17,7 @@ from .browser_native_client import (
     _canonical_intermediate_events,
     _canonical_stream_answer_seed,
     _canonical_stream_identity,
+    _is_stream_health_event,
     _make_passive_terminal_stop_check,
 )
 from .client import DEFAULT_TIMEOUT_SECONDS, ChatGPTWebClient
@@ -588,6 +589,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
         )
 
         def relay_transport_event(event: dict[str, Any]) -> None:
+            if _is_stream_health_event(event) and on_event is not None:
+                on_event(event)
             for normalized in normalizer.feed_transport_event(event):
                 if on_event is not None:
                     on_event(normalized)

@@ -46,7 +46,36 @@ _ATTACHMENT_UPLOAD_TIMEOUT_SECONDS = 60.0
 _CELSIUS_URL_CACHE_SECONDS = 300.0
 _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS = 12.0
 _FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS = 60.0
+_FOLLOW_TOPIC_SERVER_QUIET_SECONDS = 120.0
+_FOLLOW_TOPIC_SERVER_STALL_SECONDS = 300.0
 _FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS = (0.25, 1.0, 2.0, 5.0, 10.0, 30.0)
+
+
+def _celsius_offset_key(value: str | None) -> tuple[int, int] | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    head, separator, tail = value.strip().partition("-")
+    try:
+        milliseconds = int(head)
+        sequence = int(tail) if separator and tail else 0
+    except ValueError:
+        return None
+    return milliseconds, sequence
+
+
+def _celsius_offset_is_newer(candidate: str | None, current: str | None) -> bool:
+    candidate_key = _celsius_offset_key(candidate)
+    if candidate_key is None:
+        return False
+    current_key = _celsius_offset_key(current)
+    return current_key is None or candidate_key > current_key
+
+
+def _celsius_offset_wallclock(value: str | None) -> float | None:
+    key = _celsius_offset_key(value)
+    if key is None or key[0] <= 0:
+        return None
+    return key[0] / 1000.0
 
 
 class WKLightweightTransport:
@@ -1100,40 +1129,142 @@ class WKLightweightTransport:
         started = time.monotonic()
         deadline = started + max(1.0, float(timeout))
         last_topic_activity_at = started
+        last_server_activity_at = started
+        last_server_offset: str | None = None
+        last_server_wallclock_at: float | None = None
+        server_quiet_emitted = False
+        server_stalled_emitted = False
+        delivery_recovery_count = 0
         idle_reconnect_seconds = _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS
+
+        def server_idle_seconds(now: float | None = None) -> float:
+            current = time.monotonic() if now is None else now
+            return max(0.0, current - last_server_activity_at)
+
+        def emit_transport_event(event: dict[str, Any]) -> None:
+            if on_event is not None:
+                on_event(event)
 
         def relay_event(event: dict[str, Any]) -> None:
             nonlocal segment_done_count, last_topic_activity_at, idle_reconnect_seconds
+            nonlocal last_server_activity_at, last_server_offset
+            nonlocal last_server_wallclock_at, server_quiet_emitted
+            nonlocal server_stalled_emitted, delivery_recovery_count
             if not isinstance(event, dict):
                 return
             event_type = event.get("type")
+            now = time.monotonic()
             if event_type in {
                 "stream_handoff_ws_subscribed",
                 "raw_ws_event",
                 "raw_ws_done",
             }:
-                last_topic_activity_at = time.monotonic()
+                last_topic_activity_at = now
+
+            if event_type in {"raw_ws_event", "raw_ws_done"}:
+                offset = event.get("offset")
+                normalized_offset = (
+                    offset.strip()
+                    if isinstance(offset, str) and offset.strip()
+                    else None
+                )
+                progressed = (
+                    normalized_offset is None
+                    or _celsius_offset_is_newer(normalized_offset, last_server_offset)
+                )
+                if progressed:
+                    silent_for = server_idle_seconds(now)
+                    if normalized_offset is not None:
+                        last_server_offset = normalized_offset
+                        observed_wallclock = _celsius_offset_wallclock(normalized_offset)
+                        if observed_wallclock is not None:
+                            last_server_wallclock_at = observed_wallclock
+                            observed_age = max(
+                                0.0,
+                                time.time() - last_server_wallclock_at,
+                            )
+                            last_server_activity_at = now - observed_age
+                        else:
+                            last_server_activity_at = now
+                    else:
+                        last_server_activity_at = now
+                    if server_quiet_emitted or server_stalled_emitted:
+                        emit_transport_event(
+                            {
+                                "type": "stream_handoff_server_resumed",
+                                "topic_id": normalized_topic,
+                                "silent_seconds": silent_for,
+                                "last_offset": last_server_offset,
+                            }
+                        )
+                    server_quiet_emitted = False
+                    server_stalled_emitted = False
+
             if event_type == "raw_ws_event":
                 idle_reconnect_seconds = _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS
-            elif event_type == "stream_handoff_ws_subscribed" and reconnect_count > 0:
-                catchup_count = event.get("catchup_count")
-                if isinstance(catchup_count, int) and not isinstance(
-                    catchup_count, bool
-                ):
-                    if catchup_count > 0:
-                        idle_reconnect_seconds = _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS
-                    else:
-                        idle_reconnect_seconds = min(
-                            _FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS,
-                            max(
-                                _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS,
-                                idle_reconnect_seconds * 2.0,
-                            ),
+            elif event_type == "stream_handoff_ws_subscribed":
+                reported_offset = event.get("last_offset")
+                normalized_reported_offset = (
+                    reported_offset.strip()
+                    if isinstance(reported_offset, str) and reported_offset.strip()
+                    else None
+                )
+                reported_progress = _celsius_offset_is_newer(
+                    normalized_reported_offset,
+                    last_server_offset,
+                )
+                if reported_progress and normalized_reported_offset is not None:
+                    silent_for = server_idle_seconds(now)
+                    last_server_offset = normalized_reported_offset
+                    observed_wallclock = _celsius_offset_wallclock(last_server_offset)
+                    if observed_wallclock is not None:
+                        last_server_wallclock_at = observed_wallclock
+                        observed_age = max(
+                            0.0,
+                            time.time() - last_server_wallclock_at,
                         )
+                        last_server_activity_at = now - observed_age
+                    else:
+                        last_server_activity_at = now
+                    if server_quiet_emitted or server_stalled_emitted:
+                        emit_transport_event(
+                            {
+                                "type": "stream_handoff_server_resumed",
+                                "topic_id": normalized_topic,
+                                "silent_seconds": silent_for,
+                                "last_offset": last_server_offset,
+                            }
+                        )
+                    server_quiet_emitted = False
+                    server_stalled_emitted = False
+                if reconnect_count > 0:
+                    catchup_count = event.get("catchup_count")
+                    if isinstance(catchup_count, int) and not isinstance(
+                        catchup_count, bool
+                    ):
+                        if catchup_count > 0 and reported_progress:
+                            idle_reconnect_seconds = _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS
+                            delivery_recovery_count += 1
+                            emit_transport_event(
+                                {
+                                    "type": "stream_handoff_delivery_recovered",
+                                    "topic_id": normalized_topic,
+                                    "attempt": reconnect_count,
+                                    "catchup_count": catchup_count,
+                                    "last_offset": last_server_offset,
+                                }
+                            )
+                        elif catchup_count <= 0:
+                            idle_reconnect_seconds = min(
+                                _FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS,
+                                max(
+                                    _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS,
+                                    idle_reconnect_seconds * 2.0,
+                                ),
+                            )
             if event_type == "raw_ws_done":
                 segment_done_count += 1
-            if on_event is not None:
-                on_event(event)
+            emit_transport_event(event)
 
         while True:
             reconnect_requested = False
@@ -1144,6 +1275,8 @@ class WKLightweightTransport:
                 nonlocal deadline_expired
                 nonlocal reconnect_requested
                 nonlocal reconnect_reason
+                nonlocal server_quiet_emitted
+                nonlocal server_stalled_emitted
                 if should_stop is not None:
                     try:
                         if bool(should_stop()):
@@ -1164,6 +1297,42 @@ class WKLightweightTransport:
                         state["finish_reason"] = "conversation_turn_complete"
                         return True
                 now = time.monotonic()
+                silent_for = server_idle_seconds(now)
+                offset_age = (
+                    max(0.0, time.time() - last_server_wallclock_at)
+                    if last_server_wallclock_at is not None
+                    else None
+                )
+                if (
+                    not server_quiet_emitted
+                    and silent_for >= _FOLLOW_TOPIC_SERVER_QUIET_SECONDS
+                ):
+                    server_quiet_emitted = True
+                    emit_transport_event(
+                        {
+                            "type": "stream_handoff_server_quiet",
+                            "topic_id": normalized_topic,
+                            "server_idle_seconds": silent_for,
+                            "last_offset": last_server_offset,
+                            "last_offset_age_seconds": offset_age,
+                            "reconnect_count": reconnect_count,
+                        }
+                    )
+                if (
+                    not server_stalled_emitted
+                    and silent_for >= _FOLLOW_TOPIC_SERVER_STALL_SECONDS
+                ):
+                    server_stalled_emitted = True
+                    emit_transport_event(
+                        {
+                            "type": "stream_handoff_server_stalled",
+                            "topic_id": normalized_topic,
+                            "server_idle_seconds": silent_for,
+                            "last_offset": last_server_offset,
+                            "last_offset_age_seconds": offset_age,
+                            "reconnect_count": reconnect_count,
+                        }
+                    )
                 if now >= deadline:
                     deadline_expired = True
                     return True
@@ -1219,6 +1388,8 @@ class WKLightweightTransport:
                         "topic_id": normalized_topic,
                         "reason": reconnect_reason or "transport",
                         "attempt": reconnect_count,
+                        "server_idle_seconds": server_idle_seconds(),
+                        "last_offset": last_server_offset,
                     }
                 )
             backoff_index = min(
@@ -1261,6 +1432,11 @@ class WKLightweightTransport:
             "reconnect_count": reconnect_count,
             "reconnect_reason": reconnect_reason,
             "idle_reconnect_seconds": idle_reconnect_seconds,
+            "server_idle_seconds": server_idle_seconds(),
+            "server_quiet_observed": server_quiet_emitted,
+            "server_stalled_observed": server_stalled_emitted,
+            "last_server_offset": last_server_offset,
+            "delivery_recovery_count": delivery_recovery_count,
             "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
         }
 

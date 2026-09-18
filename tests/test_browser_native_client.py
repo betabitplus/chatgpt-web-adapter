@@ -320,6 +320,13 @@ def test_split_submit_defers_exact_topic_and_await_final_never_polls_canonical(
             assert on_transport_event is not None
             on_transport_event(
                 {
+                    "type": "stream_handoff_server_stalled",
+                    "topic_id": turn.stream_topic_id,
+                    "server_idle_seconds": 305.0,
+                }
+            )
+            on_transport_event(
+                {
                     "type": "raw_ws_event",
                     "parsed": {
                         "message": {
@@ -381,6 +388,11 @@ def test_split_submit_defers_exact_topic_and_await_final_never_polls_canonical(
 
     assert provider.follow_calls == 1
     assert provider.observe_calls == 0
+    assert any(
+        event.get("type") == "stream_handoff_server_stalled"
+        and event.get("server_idle_seconds") == 305.0
+        for event in delivered
+    )
     assert response.text == "deferred final"
     assert response.conversation.message_id == "assistant-deferred"
     assert response.request.observed_model == "gpt-5-6-thinking"

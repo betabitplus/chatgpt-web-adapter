@@ -395,6 +395,101 @@ def test_lightweight_follow_topic_empty_idle_recovery_backs_off_next_lease(
     assert result["idle_reconnect_seconds"] == pytest.approx(0.002)
 
 
+def test_lightweight_follow_topic_reports_quiet_and_stalled_server(
+    monkeypatch,
+) -> None:
+    stale_offset = f"{int((time.time() - 0.010) * 1000)}-0"
+    resumed_offset = f"{int(time.time() * 1000)}-0"
+
+    class SilentThenTerminalSource(_SourceClient):
+        def wk_transport_stream_topic(
+            self,
+            topic_id: str,
+            *,
+            websocket_url: str,
+            state: dict,
+            on_event=None,
+            on_token=None,
+            should_stop=None,
+            stop_on_done=True,
+        ) -> None:
+            self.stream_calls.append((topic_id, websocket_url))
+            assert should_stop is not None
+            if len(self.stream_calls) == 1:
+                if on_event is not None:
+                    on_event(
+                        {
+                            "type": "stream_handoff_ws_subscribed",
+                            "topic_id": topic_id,
+                            "recovered": True,
+                            "catchup_count": 0,
+                            "last_offset": stale_offset,
+                        }
+                    )
+                time.sleep(0.006)
+                assert should_stop() is True
+                return
+            state["message_id"] = "assistant-1"
+            state["finish_reason"] = "stop"
+            if on_event is not None:
+                on_event(
+                    {
+                        "type": "raw_ws_done",
+                        "topic_id": topic_id,
+                        "offset": resumed_offset,
+                    }
+                )
+
+    source = SilentThenTerminalSource()
+    transport, _ = _transport(source)
+    curl = _CurlRequests(
+        [[_Response(200, {"websocket_url": "wss://example.invalid/celsius"})]]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS",
+        0.001,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS",
+        0.002,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_SERVER_QUIET_SECONDS",
+        0.002,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_SERVER_STALL_SECONDS",
+        0.004,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS",
+        (0.0,),
+    )
+    events = []
+
+    result = transport.follow_topic(
+        conversation_id="conversation-1",
+        topic_id="conversation-turn-turn-1",
+        timeout=30,
+        on_event=events.append,
+    )
+
+    event_types = [event["type"] for event in events]
+    assert "stream_handoff_server_quiet" in event_types
+    assert "stream_handoff_server_stalled" in event_types
+    assert "stream_handoff_server_resumed" in event_types
+    stalled = next(
+        event
+        for event in events
+        if event["type"] == "stream_handoff_server_stalled"
+    )
+    assert stalled["server_idle_seconds"] >= 0.004
+    assert stalled["last_offset"] == stale_offset
+    assert result["reconnect_count"] == 1
+    assert result["last_server_offset"] == resumed_offset
+
+
 def test_lightweight_follow_topic_reconnects_after_transport_error(
     monkeypatch,
 ) -> None:

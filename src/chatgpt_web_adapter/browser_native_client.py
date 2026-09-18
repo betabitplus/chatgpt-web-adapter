@@ -608,6 +608,25 @@ def _clone_stream_message(message: dict[str, Any]) -> dict[str, Any]:
     return cloned
 
 
+_STREAM_HEALTH_EVENT_TYPES = frozenset(
+    {
+        "stream_handoff_ws_reconnecting",
+        "stream_handoff_delivery_recovered",
+        "stream_handoff_server_quiet",
+        "stream_handoff_server_stalled",
+        "stream_handoff_server_resumed",
+    }
+)
+
+
+def _is_stream_health_event(event: Any) -> bool:
+    return (
+        isinstance(event, dict)
+        and isinstance(event.get("type"), str)
+        and event.get("type") in _STREAM_HEALTH_EVENT_TYPES
+    )
+
+
 class CanonicalTopicStreamNormalizer:
     """Normalize Celsius topic frames into the same live events gptty already renders."""
 
@@ -1596,6 +1615,12 @@ def submit_browser_native(
 
     def handle_transport_event(event: dict[str, Any]) -> None:
         nonlocal transport_sequence
+        if _is_stream_health_event(event):
+            _emit_revision_safe_event(
+                self,
+                on_event,
+                {**event, "submission_id": submission_id},
+            )
         topic_normalizer.answer_message_id = stream_state.message_id
         topic_normalizer.answer_text = stream_state.text
         normalized_events = topic_normalizer.feed_transport_event(event)
@@ -1888,6 +1913,12 @@ def await_browser_native_final(
 
         def handle_deferred_transport_event(event: dict[str, Any]) -> None:
             nonlocal deferred_sequence
+            if _is_stream_health_event(event):
+                _emit_revision_safe_event(
+                    self,
+                    submission.on_event,
+                    {**event, "submission_id": submission.submission_id},
+                )
             topic_normalizer.answer_message_id = submission.stream_state.message_id
             topic_normalizer.answer_text = submission.stream_state.text
             for normalized in topic_normalizer.feed_transport_event(event):

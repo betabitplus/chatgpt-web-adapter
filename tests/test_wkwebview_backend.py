@@ -3204,6 +3204,26 @@ def test_wkwebview_observer_uses_conservative_canonical_poll_interval(
     assert captured["request"]["poll_interval"] == 15.0
 
 
+def test_wk_turn_broker_multiplexes_concurrent_normal_writes_request_locally() -> None:
+    root = (
+        Path(__file__).resolve().parents[1]
+        / "src/chatgpt_web_adapter/wkwebview_helper"
+    )
+    helper = (root / "WKChatGPTAuthority.m").read_text(encoding="utf-8")
+    shell = (root / "minimal_security_shell.js").read_text(encoding="utf-8")
+
+    assert "__cwaRequestId: requestId" in shell
+    assert "__cwaExpectedProfile: profile" in shell
+    assert "__cwaExpectedParentMessageId: parentMessageId" in shell
+    assert "__cwaProxyProtectedWrite: proxyProtectedWrite" in shell
+    assert "__cwaRestoreSubmitFetchObserver" not in shell
+    assert "(init&&init.__cwaRequestId)" in helper
+    assert "(init&&init.__cwaExpectedProfile)" in helper
+    assert "(init&&init.__cwaExpectedParentMessageId)" in helper
+    assert "init.__cwaProxyProtectedWrite===true" in helper
+    assert "concurrentNormalPages" not in helper
+
+
 def test_wkwebview_helper_observer_backs_off_after_429_without_stream_polling() -> None:
     source = (
         Path(__file__).resolve().parents[1]

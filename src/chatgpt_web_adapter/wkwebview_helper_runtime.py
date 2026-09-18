@@ -25,7 +25,7 @@ _EVENT_PREFIX = "WK_EVENT "
 
 _ObserverResult = TypeVar("_ObserverResult")
 _MINIMUM_MACOS = (12, 0)
-_PRE_SUBMIT_TIMEOUT_SECONDS = 12.0
+_PRE_SUBMIT_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass

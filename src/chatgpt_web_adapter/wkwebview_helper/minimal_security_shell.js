@@ -8,9 +8,9 @@
 
   const runMinimalSecurityShell = (config = null) => {
   const requestConfig = config && typeof config === "object" ? config : null;
-  if (requestConfig && Object.prototype.hasOwnProperty.call(requestConfig, "proxy_protected_write")) {
-    window.__CWA_PROXY_PROTECTED_WRITE__ = requestConfig.proxy_protected_write === true;
-  }
+  const proxyProtectedWrite = requestConfig
+    ? requestConfig.proxy_protected_write === true
+    : window.__CWA_PROXY_PROTECTED_WRITE__ === true;
   const requestId = typeof requestConfig?.request_id === "string" ? requestConfig.request_id : "";
   const pageBaseURL = document.baseURI || location.href;
   const tagged = (body) => requestId ? {...body, request_id: requestId} : body;
@@ -1426,7 +1426,7 @@
     const useOfficialConversationTransport =
       conversationId
       && !temporary
-      && window.__CWA_PROXY_PROTECTED_WRITE__ !== true
+      && !proxyProtectedWrite
       && typeof officialConversationTransport === "function";
     const writeHeaders = {
       ...requestHeaders(accessToken, deviceId, "/backend-api/f/conversation"),
@@ -1457,8 +1457,7 @@
     }
 
     setStage("write");
-    if (window.__CWA_PROXY_PROTECTED_WRITE__ === true) {
-      if (requestId) window.__CWA_BROKER_REQUEST_ID__ = requestId;
+    if (proxyProtectedWrite) {
       const installSubmitObserver = window.__cwaRearmSubmitFetchObserver;
       if (typeof installSubmitObserver !== "function" || installSubmitObserver() !== true) {
         throw new Error("MINIMAL_PROXY_SUBMIT_OBSERVER_INSTALL_FAILED");
@@ -1574,7 +1573,7 @@
     postSubmit({
       phase: "request",
       temporary_mode: temporary,
-      endpoint: `shell_preflight:proxy=${window.__CWA_PROXY_PROTECTED_WRITE__ === true ? "1" : "0"}:wrapper=${window.fetch?.__cwaIncludesSubmitObserver === true ? "1" : "0"}`,
+      endpoint: `shell_preflight:proxy=${proxyProtectedWrite ? "1" : "0"}:wrapper=${window.fetch?.__cwaIncludesSubmitObserver === true ? "1" : "0"}`,
     });
     const writePromise = window.fetch("/backend-api/f/conversation", {
       method: "POST",
@@ -1582,16 +1581,11 @@
       headers: writeHeaders,
       body: JSON.stringify(writePayload),
       __cwaDirectObserve: true,
+      __cwaRequestId: requestId,
+      __cwaExpectedProfile: profile,
+      __cwaExpectedParentMessageId: parentMessageId,
+      __cwaProxyProtectedWrite: proxyProtectedWrite,
     });
-    if (requestId && window.__CWA_BROKER_REQUEST_ID__ === requestId) {
-      window.__CWA_BROKER_REQUEST_ID__ = "";
-    }
-    if (
-      window.__CWA_DEFER_SUBMIT_OBSERVER__ === true
-      && typeof window.__cwaRestoreSubmitFetchObserver === "function"
-    ) {
-      try { window.__cwaRestoreSubmitFetchObserver(); } catch (_) {}
-    }
     const writeResponse = await writePromise;
     postSubmit({ phase: "response", status: writeResponse.status });
     postStream({ phase: "started", status: writeResponse.status, ok: writeResponse.ok === true });

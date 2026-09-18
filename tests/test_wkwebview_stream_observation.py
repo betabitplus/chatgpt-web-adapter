@@ -310,7 +310,7 @@ def test_minimal_security_prepare_matches_verified_continuation_dispatch() -> No
     assert 'if (conversationId && !temporary) {' in shell
     assert 'const conduitToken = await conduitPromise;' in shell
     assert 'const useOfficialConversationTransport =' in shell
-    assert 'conversationId\n      && !temporary\n      && window.__CWA_PROXY_PROTECTED_WRITE__ !== true\n      && typeof officialConversationTransport === "function"' in shell
+    assert 'conversationId\n      && !temporary\n      && !proxyProtectedWrite\n      && typeof officialConversationTransport === "function"' in shell
     assert 'sharedConversationInitializationPromise = Promise.resolve(Object.freeze({' in shell
     assert 'sharedModelCatalogPromises.set("temporary", Promise.resolve(modelsPayload));' in shell
     assert 'postStream({ phase: "handoff_released" });' in shell
@@ -378,10 +378,12 @@ def test_minimal_security_protected_write_observes_response_directly() -> None:
     assert "window.__CWA_DEFER_SUBMIT_OBSERVER__===true?true:install()" in native_source
     assert "window.__cwaRestoreSubmitFetchObserver" in native_source
     assert '@"proxy_protected_write": @(entry.proxyProtectedWrite)' in native_source
-    assert 'Object.prototype.hasOwnProperty.call(requestConfig, "proxy_protected_write")' in shell
-    assert "window.__CWA_PROXY_PROTECTED_WRITE__ = requestConfig.proxy_protected_write === true;" in shell
+    assert "const proxyProtectedWrite = requestConfig" in shell
+    assert "requestConfig.proxy_protected_write === true" in shell
+    assert "__cwaProxyProtectedWrite: proxyProtectedWrite" in shell
+    assert "__cwaRequestId: requestId" in shell
     assert "MINIMAL_PROXY_SUBMIT_OBSERVER_INSTALL_FAILED" in shell
-    assert "window.__cwaRestoreSubmitFetchObserver" in shell
+    assert "window.__cwaRestoreSubmitFetchObserver" not in shell
     assert "const observeProtectedWriteResponse =" in shell
     assert "const observeDirectWriteResponse = async (response) =>" in shell
     assert "observedResponse = response.clone()" in shell

@@ -504,6 +504,40 @@ class WKWebViewTurnProvider:
             "saved_at": float(saved_at),
         }
 
+    def probe_stream_status(
+        self,
+        conversation_id: str,
+        *,
+        turn_trace_id: str | None = None,
+        timeout: float = 3.0,
+    ) -> str | None:
+        """Return an independent backend lifecycle status when available.
+
+        This is intentionally a one-shot read for reconciliation boundaries such
+        as initial resume. It must not be used as normal-path polling.
+        """
+        transport = self._lightweight_transport
+        if not self._lightweight_path_enabled() or transport is None:
+            return None
+        reader = getattr(transport, "read_stream_status", None)
+        if not callable(reader):
+            return None
+        try:
+            status = reader(
+                ConversationRef(conversation_id).conversation_id,
+                turn_trace_id=(
+                    turn_trace_id.strip()
+                    if isinstance(turn_trace_id, str) and turn_trace_id.strip()
+                    else None
+                ),
+                timeout=max(0.1, float(timeout)),
+            )
+        except (RequestError, RuntimeError, OSError, ValueError):
+            return None
+        if not isinstance(status, str) or not status.strip():
+            return None
+        return status.strip().upper()
+
     def begin_active_turn(self, conversation_id: str) -> None:
         baseline_current_node = self._cached_current_node(conversation_id)
         if baseline_current_node is None:

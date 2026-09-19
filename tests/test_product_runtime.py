@@ -454,6 +454,166 @@ def test_runtime_follow_snapshot_reuses_one_canonical_payload(monkeypatch) -> No
     assert result["current_turn_event_ids"] == ["m2"]
 
 
+def test_runtime_initial_resume_terminal_probe_overrides_stale_canonical(
+    monkeypatch,
+) -> None:
+    provider = _Provider()
+    probes = []
+
+    def probe(_conversation_id, *, turn_trace_id=None, timeout):
+        probes.append((_conversation_id, turn_trace_id, timeout))
+        return "COMPLETE"
+
+    provider.probe_stream_status = probe
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    payload = {"current_node": "tool-1", "mapping": {}}
+    status = SimpleNamespace(
+        status="tool_running",
+        finish_reason=None,
+        pending_approval=False,
+    )
+    monkeypatch.setattr(runtime, "get_conversation_payload", lambda _ref: payload)
+    monkeypatch.setattr(product_runtime, "get_status", lambda _reader, _ref: status)
+    monkeypatch.setattr(product_runtime, "get_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(product_runtime, "_canonical_intermediate_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        product_runtime,
+        "_canonical_stream_identity",
+        lambda _payload: ("conversation-turn-current", "turn-current"),
+    )
+    monkeypatch.setattr(product_runtime, "_canonical_stream_answer_seed", lambda *_args, **_kwargs: (None, ""))
+
+    snapshot = runtime.conversation_follow_snapshot(
+        "conversation-1",
+        emitted_message_ids=(),
+        verify_terminal_status=True,
+        terminal_probe_timeout=1.5,
+    )
+
+    assert probes == [("conversation-1", "turn-current", 1.5)]
+    assert snapshot["status"].status == "completed"
+    assert snapshot["status"].finish_reason == "stop"
+    assert snapshot["backend_stream_status"] == "COMPLETE"
+    assert snapshot["backend_stream_status_checked"] is True
+    assert snapshot["backend_terminal_status_proven"] is True
+    assert snapshot["canonical_status_overridden"] is True
+    assert snapshot["canonical_status_before_override"] == "tool_running"
+    assert snapshot["canonical_terminal_text_missing"] is True
+    assert snapshot["active_stream_registry"] is False
+
+
+def test_runtime_initial_resume_active_registry_blocks_stale_terminal_override(
+    monkeypatch,
+) -> None:
+    provider = _Provider()
+    probes = []
+
+    def probe(_conversation_id, *, turn_trace_id=None, timeout):
+        probes.append((_conversation_id, turn_trace_id, timeout))
+        return "COMPLETE"
+
+    provider.probe_stream_status = probe
+    provider.active_stream_info = lambda _conversation_id: {
+        "topic_id": "conversation-turn-live",
+        "state": "streaming",
+        "turn_exchange_id": "turn-live",
+        "pid": 123,
+    }
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    payload = {"current_node": "tool-live", "mapping": {}}
+    status = SimpleNamespace(
+        status="tool_running",
+        finish_reason=None,
+        pending_approval=False,
+    )
+    monkeypatch.setattr(runtime, "get_conversation_payload", lambda _ref: payload)
+    monkeypatch.setattr(product_runtime, "get_status", lambda _reader, _ref: status)
+    monkeypatch.setattr(product_runtime, "get_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(product_runtime, "_canonical_intermediate_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        product_runtime,
+        "_canonical_stream_identity",
+        lambda _payload: ("conversation-turn-live", "turn-live"),
+    )
+    monkeypatch.setattr(product_runtime, "_canonical_stream_answer_seed", lambda *_args, **_kwargs: (None, ""))
+
+    snapshot = runtime.conversation_follow_snapshot(
+        "conversation-1",
+        verify_terminal_status=True,
+    )
+
+    assert probes == []
+    assert snapshot["status"].status == "running"
+    assert snapshot["active_stream_registry"] is True
+    assert snapshot["backend_stream_status_checked"] is False
+    assert snapshot["backend_stream_status_skip_reason"] == "active_stream_registry"
+    assert "canonical_status_overridden" not in snapshot
+
+
+def test_runtime_initial_resume_nonterminal_probe_keeps_canonical_unfinished(
+    monkeypatch,
+) -> None:
+    provider = _Provider()
+    provider.probe_stream_status = lambda _conversation_id, *, turn_trace_id=None, timeout: "IS_STREAMING"
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    payload = {"current_node": "tool-1", "mapping": {}}
+    status = SimpleNamespace(
+        status="tool_running",
+        finish_reason=None,
+        pending_approval=False,
+    )
+    monkeypatch.setattr(runtime, "get_conversation_payload", lambda _ref: payload)
+    monkeypatch.setattr(product_runtime, "get_status", lambda _reader, _ref: status)
+    monkeypatch.setattr(product_runtime, "get_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(product_runtime, "_canonical_intermediate_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(product_runtime, "_canonical_stream_identity", lambda _payload: (None, None))
+    monkeypatch.setattr(product_runtime, "_canonical_stream_answer_seed", lambda *_args, **_kwargs: (None, ""))
+
+    snapshot = runtime.conversation_follow_snapshot(
+        "conversation-1",
+        verify_terminal_status=True,
+    )
+
+    assert snapshot["status"].status == "tool_running"
+    assert snapshot["backend_stream_status"] == "IS_STREAMING"
+    assert snapshot["backend_stream_status_checked"] is True
+    assert "backend_terminal_status_proven" not in snapshot
+    assert "canonical_status_overridden" not in snapshot
+
+
+def test_runtime_initial_resume_probe_failure_preserves_canonical_snapshot(
+    monkeypatch,
+) -> None:
+    provider = _Provider()
+
+    def failed_probe(_conversation_id, *, turn_trace_id=None, timeout):
+        raise RequestError("STREAM_STATUS_FAILED", request_stage="test")
+
+    provider.probe_stream_status = failed_probe
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    payload = {"current_node": "tool-1", "mapping": {}}
+    status = SimpleNamespace(
+        status="tool_running",
+        finish_reason=None,
+        pending_approval=False,
+    )
+    monkeypatch.setattr(runtime, "get_conversation_payload", lambda _ref: payload)
+    monkeypatch.setattr(product_runtime, "get_status", lambda _reader, _ref: status)
+    monkeypatch.setattr(product_runtime, "get_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(product_runtime, "_canonical_intermediate_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(product_runtime, "_canonical_stream_identity", lambda _payload: (None, None))
+    monkeypatch.setattr(product_runtime, "_canonical_stream_answer_seed", lambda *_args, **_kwargs: (None, ""))
+
+    snapshot = runtime.conversation_follow_snapshot(
+        "conversation-1",
+        verify_terminal_status=True,
+    )
+
+    assert snapshot["status"].status == "tool_running"
+    assert "backend_stream_status_checked" not in snapshot
+    assert "canonical_status_overridden" not in snapshot
+
+
 def test_runtime_topic_follow_streams_events_then_finalizes_from_terminal(
     monkeypatch,
 ) -> None:

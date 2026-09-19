@@ -59,6 +59,15 @@ from .types import (
 ProductConversationModeUnavailableError = _core.ProductConversationModeUnavailableError
 ProductRichInputUnavailableError = _core.ProductRichInputUnavailableError
 
+_FOLLOW_UNFINISHED_STATUSES = {
+    "running",
+    "streaming",
+    "tool_running",
+    "tool_calling",
+    "user_last_message",
+}
+_TERMINAL_STREAM_STATUSES = {"COMPLETE", "IS_STOP_REQUESTED"}
+
 # Keep historical internal helpers import-compatible while making the public runtime
 # class and assembly functions explicit in this module.
 _assemble_default_write_transport = _core._assemble_default_write_transport
@@ -333,6 +342,98 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             "active_stream_registry": active_stream is not None,
         }
 
+    def _verify_initial_follow_terminal_status(
+        self,
+        ref: ConversationRef,
+        snapshot: dict[str, Any],
+        *,
+        emitted_message_ids: Sequence[str],
+        limit: int | None,
+        probe_timeout: float,
+    ) -> dict[str, Any]:
+        status = snapshot.get("status")
+        canonical_status = getattr(status, "status", None)
+        if canonical_status not in _FOLLOW_UNFINISHED_STATUSES:
+            return snapshot
+        # A live local registry is stronger evidence of a newer in-flight turn
+        # than the conversation-scoped stream_status endpoint. Never let a stale
+        # COMPLETE from the previous turn suppress an actively registered turn.
+        if snapshot.get("active_stream_registry") is True:
+            snapshot["backend_stream_status_checked"] = False
+            snapshot["backend_stream_status_skip_reason"] = "active_stream_registry"
+            return snapshot
+
+        provider = getattr(self.write_transport, "provider", None)
+        probe = getattr(provider, "probe_stream_status", None)
+        if not callable(probe):
+            return snapshot
+        try:
+            backend_status = probe(
+                ref.conversation_id,
+                turn_trace_id=(
+                    snapshot.get("turn_exchange_id")
+                    if isinstance(snapshot.get("turn_exchange_id"), str)
+                    else None
+                ),
+                timeout=max(0.1, float(probe_timeout)),
+            )
+        except Exception:
+            # Initial resume verification is advisory. A failed independent probe
+            # must never make an otherwise readable canonical conversation fail.
+            backend_status = None
+        if not isinstance(backend_status, str) or not backend_status.strip():
+            return snapshot
+
+        normalized_backend_status = backend_status.strip().upper()
+        snapshot["backend_stream_status"] = normalized_backend_status
+        snapshot["backend_stream_status_checked"] = True
+        if normalized_backend_status not in _TERMINAL_STREAM_STATUSES:
+            return snapshot
+
+        topic_id = snapshot.get("stream_topic_id")
+        shared_final_reader = getattr(provider, "wait_for_shared_final_payload", None)
+        if (
+            callable(shared_final_reader)
+            and isinstance(topic_id, str)
+            and topic_id.strip()
+            and not topic_id.startswith("cwa-local-pending:")
+        ):
+            try:
+                candidate = shared_final_reader(
+                    ref.conversation_id,
+                    topic_id=topic_id.strip(),
+                    timeout=0.0,
+                )
+            except Exception:
+                candidate = None
+            if isinstance(candidate, dict):
+                recovered = self._follow_snapshot_from_payload(
+                    ref,
+                    candidate,
+                    emitted_message_ids=emitted_message_ids,
+                    limit=limit,
+                )
+                recovered["backend_stream_status"] = normalized_backend_status
+                recovered["backend_stream_status_checked"] = True
+                recovered["backend_terminal_status_proven"] = True
+                recovered["canonical_status_overridden"] = True
+                recovered["canonical_status_before_override"] = canonical_status
+                recovered["canonical_terminal_text_missing"] = False
+                recovered["shared_final_cache"] = True
+                return recovered
+
+        status.status = "completed"
+        status.finish_reason = status.finish_reason or "stop"
+        status.pending_approval = False
+        snapshot["backend_terminal_status_proven"] = True
+        snapshot["canonical_status_overridden"] = True
+        snapshot["canonical_status_before_override"] = canonical_status
+        snapshot["canonical_terminal_text_missing"] = not bool(
+            str(snapshot.get("stream_answer_text") or "").strip()
+        )
+        snapshot["active_stream_registry"] = False
+        return snapshot
+
     @staticmethod
     def _follow_snapshot_from_stream_terminal(
         normalizer: CanonicalTopicStreamNormalizer,
@@ -417,6 +518,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
         *,
         emitted_message_ids: Sequence[str] = (),
         limit: int | None = 128,
+        verify_terminal_status: bool = False,
+        terminal_probe_timeout: float = 3.0,
     ) -> dict[str, Any]:
         ref = ConversationRef.from_any(conversation)
         canonical_cache_age_seconds: float | None = None
@@ -489,7 +592,7 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                     else None
                 )
 
-        return self._follow_snapshot_from_payload(
+        snapshot = self._follow_snapshot_from_payload(
             ref,
             payload,
             emitted_message_ids=emitted_message_ids,
@@ -497,6 +600,15 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             canonical_cache_age_seconds=canonical_cache_age_seconds,
             active_stream=active_stream,
         )
+        if verify_terminal_status:
+            snapshot = self._verify_initial_follow_terminal_status(
+                ref,
+                snapshot,
+                emitted_message_ids=emitted_message_ids,
+                limit=limit,
+                probe_timeout=terminal_probe_timeout,
+            )
+        return snapshot
 
     @staticmethod
     def _relay_pending_canonical_payload(

@@ -96,6 +96,35 @@ def _final_canonical_for_prompt(prompt: str, *, assistant_text: str = "done") ->
     }
 
 
+def test_wkwebview_probe_stream_status_is_one_shot_and_fail_soft(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    calls = []
+
+    class Transport:
+        def read_stream_status(self, conversation_id, *, turn_trace_id, timeout):
+            calls.append((conversation_id, turn_trace_id, timeout))
+            return "complete"
+
+    provider._lightweight_transport = Transport()
+    monkeypatch.setattr(provider, "_lightweight_path_enabled", lambda: True)
+
+    assert (
+        provider.probe_stream_status(
+            "conversation-1",
+            turn_trace_id="turn-current",
+            timeout=1.25,
+        )
+        == "COMPLETE"
+    )
+    assert calls == [("conversation-1", "turn-current", 1.25)]
+
+    def failed_status(*_args, **_kwargs):
+        raise RequestError("STREAM_STATUS_FAILED", request_stage="test")
+
+    provider._lightweight_transport.read_stream_status = failed_status
+    assert provider.probe_stream_status("conversation-1", timeout=1.25) is None
+
+
 def test_wkwebview_completed_turn_confirmation_rejects_stale_or_nonfinal() -> None:
     provider = WKWebViewTurnProvider()
     stale = _final_canonical_for_prompt("previous")

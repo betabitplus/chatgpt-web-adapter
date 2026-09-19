@@ -625,6 +625,7 @@ _STREAM_HEALTH_EVENT_TYPES = frozenset(
         "stream_handoff_delivery_recovered",
         "stream_handoff_server_quiet",
         "stream_handoff_server_stalled",
+        "stream_handoff_terminal_status",
         "stream_handoff_server_resumed",
     }
 )

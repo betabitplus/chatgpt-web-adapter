@@ -749,6 +749,11 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             isinstance(follow_result, dict)
             and follow_result.get("external_completion_observed") is True
         )
+        terminal_stream_status = (
+            follow_result.get("terminal_stream_status")
+            if isinstance(follow_result, dict)
+            else None
+        )
         completed = normalizer.turn_completed or external_completion_observed
         if not completed:
             cancelled = False
@@ -786,6 +791,16 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             final_snapshot["stream_completed"] = True
             final_snapshot["stream_topic_id"] = actual_topic_id
             return final_snapshot
+
+        if terminal_stream_status in {"IS_STOP_REQUESTED", "COMPLETE"}:
+            terminal_snapshot = self._follow_snapshot_from_stream_terminal(
+                normalizer,
+                topic_id=actual_topic_id,
+                follow_result=follow_result if isinstance(follow_result, dict) else None,
+            )
+            terminal_snapshot["stream_terminal_status"] = terminal_stream_status
+            terminal_snapshot["stream_terminal_status_proven"] = True
+            return terminal_snapshot
 
         # A passive topic terminal proves lifecycle completion, but not that every
         # text patch was observed or reconstructed losslessly. This matters most

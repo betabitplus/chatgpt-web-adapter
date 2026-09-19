@@ -35,6 +35,13 @@ def test_stream_subscription_is_forwarded_as_health_diagnostic() -> None:
             "last_offset": "1000-0",
         }
     )
+    assert _is_stream_health_event(
+        {
+            "type": "stream_handoff_terminal_status",
+            "stream_status": "COMPLETE",
+            "last_offset": "1000-0",
+        }
+    )
 
 
 def test_passive_terminal_stop_check_waits_then_stops_and_cancel_is_immediate() -> None:

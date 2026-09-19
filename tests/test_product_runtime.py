@@ -914,6 +914,102 @@ def test_runtime_topic_follow_external_completion_reconciles_canonical_final_onc
     assert result["messages"][-1].text == "canonical final after lost topic"
 
 
+def test_runtime_stream_status_terminal_skips_stale_canonical_reconcile(
+    monkeypatch,
+) -> None:
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    topic_id = "conversation-turn-turn-stream-status-complete"
+    canonical_reads: list[str] = []
+
+    provider.follow_stream_topic = lambda **_kwargs: {
+        "topic_id": topic_id,
+        "external_completion_observed": True,
+        "terminal_stream_status": "COMPLETE",
+        "stream_finality_proven": False,
+        "completed": True,
+        "finish_reason": "conversation_turn_complete",
+    }
+    provider.wait_for_shared_final_payload = lambda *args, **kwargs: None
+
+    def fail_if_canonical_read_runs(conversation):
+        canonical_reads.append(conversation.conversation_id)
+        raise AssertionError(
+            "terminal stream_status proof must not wait on stale canonical state"
+        )
+
+    monkeypatch.setattr(
+        runtime,
+        "get_conversation_payload",
+        fail_if_canonical_read_runs,
+    )
+
+    result = runtime.conversation_follow_stream(
+        "conversation-1",
+        topic_id=topic_id,
+    )
+
+    assert canonical_reads == []
+    assert result["stream_completed"] is True
+    assert result["stream_terminal_snapshot"] is True
+    assert result["stream_terminal_status"] == "COMPLETE"
+    assert result["stream_terminal_status_proven"] is True
+    assert result["status"].status == "completed"
+
+
+def test_runtime_external_completion_overrides_stale_unfinished_canonical(
+    monkeypatch,
+) -> None:
+    provider = _Provider()
+    runtime = ChatGPTProductRuntime(_Client(), provider=provider)
+    topic_id = "conversation-turn-turn-orphaned"
+    stale_payload = {
+        "current_node": "assistant-stale",
+        "mapping": {
+            "assistant-stale": {
+                "id": "assistant-stale",
+                "parent": "user-1",
+                "children": [],
+                "message": {
+                    "id": "assistant-stale",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "in_progress",
+                    "end_turn": False,
+                    "content": {"content_type": "text", "parts": ["partial"]},
+                    "metadata": {
+                        "stream_topic_id": topic_id,
+                        "turn_exchange_id": "turn-orphaned",
+                    },
+                },
+            }
+        },
+    }
+
+    provider.follow_stream_topic = lambda **_kwargs: {
+        "topic_id": topic_id,
+        "external_completion_observed": True,
+        "stream_finality_proven": False,
+        "completed": True,
+        "finish_reason": "conversation_turn_complete",
+    }
+    provider.wait_for_shared_final_payload = lambda *args, **kwargs: None
+    monkeypatch.setattr(
+        runtime,
+        "get_conversation_payload",
+        lambda conversation: stale_payload,
+    )
+
+    result = runtime.conversation_follow_stream(
+        "conversation-1",
+        topic_id=topic_id,
+    )
+
+    assert result["stream_completed"] is True
+    assert result["stream_terminal_snapshot"] is True
+    assert result["status"].status == "completed"
+
+
 def test_runtime_topic_follow_terminal_stream_falls_back_when_canonical_unavailable(
     monkeypatch,
 ) -> None:

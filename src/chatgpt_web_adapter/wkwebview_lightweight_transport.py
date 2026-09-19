@@ -290,15 +290,15 @@ class WKLightweightTransport:
             )
         return payload
 
-    def wait_for_stop_status(
+    def read_stream_status(
         self,
         conversation_id: str,
         *,
         turn_trace_id: str | None,
         timeout: float,
     ) -> str | None:
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        if deadline <= time.monotonic():
+        total_timeout = max(0.0, float(timeout))
+        if total_timeout <= 0:
             return None
         try:
             headers = self.source_client.wk_transport_headers(
@@ -319,28 +319,43 @@ class WKLightweightTransport:
             f"{conversation_id}/stream_status"
         )
         with curl_requests.Session(impersonate="safari") as session:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None
-                try:
-                    response = session.get(
-                        url,
-                        headers=headers,
-                        timeout=min(5.0, max(1.0, remaining)),
-                    )
-                except curl_requests.RequestsError:
-                    return None
-                if response.status_code != 200:
-                    return None
-                try:
-                    payload = response.json()
-                except (TypeError, ValueError):
-                    return None
-                status = payload.get("status") if isinstance(payload, dict) else None
-                if status in {"IS_STOP_REQUESTED", "COMPLETE"}:
-                    return str(status)
-                time.sleep(min(1.0, max(0.05, remaining)))
+            try:
+                response = session.get(
+                    url,
+                    headers=headers,
+                    timeout=min(5.0, max(1.0, total_timeout)),
+                )
+            except curl_requests.RequestsError:
+                return None
+            if response.status_code != 200:
+                return None
+            try:
+                payload = response.json()
+            except (TypeError, ValueError):
+                return None
+            status = payload.get("status") if isinstance(payload, dict) else None
+            return str(status) if isinstance(status, str) and status else None
+
+    def wait_for_stop_status(
+        self,
+        conversation_id: str,
+        *,
+        turn_trace_id: str | None,
+        timeout: float,
+    ) -> str | None:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            status = self.read_stream_status(
+                conversation_id,
+                turn_trace_id=turn_trace_id,
+                timeout=min(5.0, max(0.1, remaining)),
+            )
+            if status in {"IS_STOP_REQUESTED", "COMPLETE"}:
+                return status
+            time.sleep(min(1.0, max(0.05, remaining)))
 
     def _upload_generic_file(self, path: Path) -> dict[str, Any]:
         try:
@@ -1331,6 +1346,34 @@ class WKLightweightTransport:
                             "reconnect_count": reconnect_count,
                         }
                     )
+                    # A topic can become orphaned from the canonical conversation:
+                    # no new Celsius offsets, stale canonical status still says
+                    # tool_calling, while the stream backend already reports the
+                    # turn COMPLETE. Probe exactly once per stalled period so the
+                    # passive follow can terminate without normal-path polling.
+                    try:
+                        stream_status = self.read_stream_status(
+                            conversation_id,
+                            turn_trace_id=None,
+                            timeout=min(2.0, max(0.1, deadline - now)),
+                        )
+                    except RequestError:
+                        stream_status = None
+                    if stream_status in {"IS_STOP_REQUESTED", "COMPLETE"}:
+                        external_completion_observed = True
+                        state["stream_terminal_observed"] = True
+                        state["terminal_stream_status"] = stream_status
+                        state["finish_reason"] = "conversation_turn_complete"
+                        emit_transport_event(
+                            {
+                                "type": "stream_handoff_terminal_status",
+                                "topic_id": normalized_topic,
+                                "stream_status": stream_status,
+                                "server_idle_seconds": silent_for,
+                                "last_offset": last_server_offset,
+                            }
+                        )
+                        return True
                 if now >= deadline:
                     deadline_expired = True
                     return True
@@ -1424,6 +1467,7 @@ class WKLightweightTransport:
             "observed_reasoning_effort": state.get("observed_reasoning_effort"),
             "stream_finality_proven": stream_finality_proven,
             "external_completion_observed": external_completion_observed,
+            "terminal_stream_status": state.get("terminal_stream_status"),
             "caller_stop_observed": caller_stop_observed,
             "completed": stream_finality_proven or external_completion_observed,
             "segment_done_count": segment_done_count,

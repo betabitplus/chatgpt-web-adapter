@@ -45,7 +45,7 @@ _CHAT_FILES_URL = "https://chatgpt.com/backend-api/files"
 _ATTACHMENT_UPLOAD_TIMEOUT_SECONDS = 60.0
 _CELSIUS_URL_CACHE_SECONDS = 300.0
 _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS = 12.0
-_FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS = 60.0
+_FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS = 90.0
 _FOLLOW_TOPIC_SERVER_QUIET_SECONDS = 120.0
 _FOLLOW_TOPIC_SERVER_STALL_SECONDS = 300.0
 _FOLLOW_TOPIC_STALLED_STATUS_RECHECK_SECONDS = 60.0
@@ -1164,6 +1164,7 @@ class WKLightweightTransport:
         caller_stop_observed = False
         deadline_expired = False
         reconnect_count = 0
+        transport_reconnect_count = 0
         reconnect_reason: str | None = None
         started = time.monotonic()
         deadline = started + max(1.0, float(timeout))
@@ -1187,6 +1188,7 @@ class WKLightweightTransport:
 
         def relay_event(event: dict[str, Any]) -> None:
             nonlocal segment_done_count, last_topic_activity_at, idle_reconnect_seconds
+            nonlocal transport_reconnect_count
             nonlocal last_server_activity_at, last_server_offset
             nonlocal last_server_wallclock_at, last_terminal_status_probe_at
             nonlocal server_quiet_emitted, server_stalled_emitted
@@ -1243,6 +1245,7 @@ class WKLightweightTransport:
                     last_terminal_status_probe_at = None
 
             if event_type == "stream_handoff_ws_subscribed":
+                transport_reconnect_count = 0
                 reported_offset = event.get("last_offset")
                 normalized_reported_offset = (
                     reported_offset.strip()
@@ -1457,6 +1460,7 @@ class WKLightweightTransport:
 
             reconnect_count += 1
             if reconnect_reason != "topic_idle":
+                transport_reconnect_count += 1
                 self._invalidate_celsius_websocket_url()
             if on_event is not None:
                 on_event(
@@ -1469,16 +1473,24 @@ class WKLightweightTransport:
                         "last_offset": last_server_offset,
                     }
                 )
-            backoff_index = min(
-                reconnect_count - 1,
-                len(_FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS) - 1,
-            )
-            sleep_for = _FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS[backoff_index]
+            if reconnect_reason == "topic_idle":
+                # The idle lease already paces planned zombie-socket checks.
+                # Applying transport-error backoff here delays useful cursor
+                # catch-up (up to 30s late in long turns) without reducing the
+                # number of idle checks.
+                sleep_for = 0.0
+            else:
+                backoff_index = min(
+                    max(0, transport_reconnect_count - 1),
+                    len(_FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS) - 1,
+                )
+                sleep_for = _FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS[backoff_index]
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 caller_stop_observed = True
                 break
-            time.sleep(min(sleep_for, remaining))
+            if sleep_for > 0:
+                time.sleep(min(sleep_for, remaining))
             last_topic_activity_at = time.monotonic()
 
         message_id = state.get("message_id")

@@ -575,6 +575,89 @@ def test_lightweight_follow_topic_stalled_complete_stream_status_terminates(
     assert terminal["last_offset"] == stale_offset
 
 
+def test_lightweight_follow_topic_rechecks_stalled_stream_status_until_complete(
+    monkeypatch,
+) -> None:
+    stale_offset = f"{int((time.time() - 0.010) * 1000)}-0"
+
+    class StalledUntilLateCompleteSource(_SourceClient):
+        def wk_transport_stream_topic(
+            self,
+            topic_id: str,
+            *,
+            websocket_url: str,
+            state: dict,
+            on_event=None,
+            on_token=None,
+            should_stop=None,
+            stop_on_done=True,
+        ) -> None:
+            self.stream_calls.append((topic_id, websocket_url))
+            assert should_stop is not None
+            if on_event is not None:
+                on_event(
+                    {
+                        "type": "stream_handoff_ws_subscribed",
+                        "topic_id": topic_id,
+                        "recovered": True,
+                        "catchup_count": 0,
+                        "last_offset": stale_offset,
+                    }
+                )
+            time.sleep(0.004)
+            assert should_stop() is False
+            time.sleep(0.004)
+            assert should_stop() is True
+
+    source = StalledUntilLateCompleteSource()
+    transport, _ = _transport(source)
+    curl = _CurlRequests(
+        [[_Response(200, {"websocket_url": "wss://example.invalid/celsius"})]]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS",
+        0.100,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_SERVER_QUIET_SECONDS",
+        0.002,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_SERVER_STALL_SECONDS",
+        0.003,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_STALLED_STATUS_RECHECK_SECONDS",
+        0.003,
+    )
+    statuses = iter(["IS_STREAMING", "COMPLETE"])
+    calls: list[str] = []
+
+    def read_status(conversation_id, *, turn_trace_id, timeout):
+        calls.append(conversation_id)
+        return next(statuses)
+
+    monkeypatch.setattr(transport, "read_stream_status", read_status)
+    events: list[dict] = []
+
+    result = transport.follow_topic(
+        conversation_id="conversation-1",
+        topic_id="conversation-turn-turn-1",
+        timeout=30,
+        on_event=events.append,
+    )
+
+    assert calls == ["conversation-1", "conversation-1"]
+    assert result["external_completion_observed"] is True
+    assert result["terminal_stream_status"] == "COMPLETE"
+    assert result["completed"] is True
+    terminal = [
+        event for event in events if event["type"] == "stream_handoff_terminal_status"
+    ]
+    assert [event["stream_status"] for event in terminal] == ["COMPLETE"]
+
+
 def test_lightweight_follow_topic_stalled_nonterminal_status_does_not_false_complete(
     monkeypatch,
 ) -> None:
@@ -1122,6 +1205,97 @@ def test_lightweight_resume_raw_observer_crosses_segment_done_until_turn_stop(mo
     assert result["message_id"] is None
     assert result["finish_reason"] == "stream_terminal"
     assert result["ws_token_events"] == 1
+    assert len(curl.sessions) == 1
+    assert cached == []
+
+
+def test_lightweight_resume_raw_observer_reuses_follow_cursor_recovery_after_silent_idle(
+    monkeypatch,
+) -> None:
+    first_offset = "1789810000000-17"
+    recovered_offset = "1789810001000-0"
+
+    class SilentThenRecoveredSource(_SourceClient):
+        def wk_transport_resume_state(self, resume_token: str, *, conversation_id: str):
+            self.resume_calls.append((resume_token, conversation_id))
+            return "topic-1", {"conversation_id": conversation_id}
+
+        def wk_transport_stream_topic(
+            self,
+            topic_id: str,
+            *,
+            websocket_url: str,
+            state: dict,
+            on_event=None,
+            on_token=None,
+            should_stop=None,
+            stop_on_done=True,
+        ) -> None:
+            self.stream_calls.append((topic_id, websocket_url))
+            assert should_stop is not None
+            if len(self.stream_calls) == 1:
+                state["resume_ws_offset"] = first_offset
+                assert should_stop() is True
+                return
+
+            assert state["resume_ws_offset"] == first_offset
+            if on_event is not None:
+                on_event(
+                    {
+                        "type": "stream_handoff_ws_subscribed",
+                        "topic_id": topic_id,
+                        "recovered": True,
+                        "catchup_count": 1,
+                        "last_offset": recovered_offset,
+                    }
+                )
+            state["message_id"] = "assistant-final"
+            state["finish_reason"] = "end_turn"
+            if on_event is not None:
+                on_event({"type": "raw_ws_done", "topic_id": topic_id})
+            if on_token is not None:
+                on_token("done")
+
+    source = SilentThenRecoveredSource()
+    transport, cached = _transport(source)
+    curl = _CurlRequests(
+        [[_Response(200, {"websocket_url": "wss://example.invalid/celsius"})]]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS",
+        0.0,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS",
+        (0.0,),
+    )
+    raw_events: list[dict] = []
+
+    result = transport.resume_turn(
+        conversation_id="conversation-1",
+        resume_value="resume-secret",
+        timeout=30,
+        relay_text_event=lambda _event: (_ for _ in ()).throw(
+            AssertionError("raw observer mode must not duplicate token-only events")
+        ),
+        on_transport_event=raw_events.append,
+        stream_should_stop=lambda: False,
+        text="prompt",
+        baseline_current_node="node-before",
+    )
+
+    assert result["stream_finality_proven"] is True
+    assert result["message_id"] == "assistant-final"
+    assert result["finish_reason"] == "end_turn"
+    assert result["ws_token_events"] == 1
+    assert source.stream_calls == [
+        ("topic-1", "wss://example.invalid/celsius"),
+        ("topic-1", "wss://example.invalid/celsius"),
+    ]
+    event_types = [event["type"] for event in raw_events]
+    assert "stream_handoff_ws_reconnecting" in event_types
+    assert "stream_handoff_delivery_recovered" in event_types
     assert len(curl.sessions) == 1
     assert cached == []
 

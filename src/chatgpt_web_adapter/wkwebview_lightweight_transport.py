@@ -48,6 +48,7 @@ _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS = 12.0
 _FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS = 60.0
 _FOLLOW_TOPIC_SERVER_QUIET_SECONDS = 120.0
 _FOLLOW_TOPIC_SERVER_STALL_SECONDS = 300.0
+_FOLLOW_TOPIC_STALLED_STATUS_RECHECK_SECONDS = 60.0
 _FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS = (0.25, 1.0, 2.0, 5.0, 10.0, 30.0)
 
 
@@ -1033,10 +1034,6 @@ class WKLightweightTransport:
                 request_stage="wkwebview_curl_ws_second_leg",
             )
 
-        curl_requests, websocket_url = self._resolve_celsius_websocket_url(
-            timeout=timeout
-        )
-
         raw_sequence = 0
         raw_live_observer = callable(on_transport_event) and callable(
             stream_should_stop
@@ -1059,7 +1056,7 @@ class WKLightweightTransport:
                 event["message_id"] = message_id
             relay_text_event(event)
 
-        def should_stop() -> bool:
+        def caller_should_stop() -> bool:
             if self._stop_requested is not None and self._stop_requested(
                 conversation_id
             ):
@@ -1072,6 +1069,11 @@ class WKLightweightTransport:
                         return True
                 except Exception:
                     pass
+            return False
+
+        def should_stop() -> bool:
+            if caller_should_stop():
+                return True
             if passive_completion_check is not None:
                 try:
                     passive_terminal = bool(passive_completion_check())
@@ -1092,6 +1094,28 @@ class WKLightweightTransport:
             stream_kwargs["stop_on_done"] = False
 
         started = time.monotonic()
+        if raw_live_observer:
+            # Interactive own-turn streaming must use the same cursor-based
+            # delivery recovery as attached follow. A Celsius websocket can
+            # remain TCP-connected while silently ceasing to deliver frames;
+            # the previous one-shot path then waited until canonical
+            # reconciliation and dumped retained activity all at once.
+            curl_requests = self._curl_requests()
+            self.follow_topic(
+                conversation_id=conversation_id,
+                topic_id=topic_id,
+                timeout=timeout,
+                on_event=on_transport_event,
+                on_token=on_token,
+                should_stop=caller_should_stop,
+                passive_completion_check=passive_completion_check,
+                _initial_state=state,
+            )
+            return curl_requests, state, raw_sequence, started
+
+        curl_requests, websocket_url = self._resolve_celsius_websocket_url(
+            timeout=timeout
+        )
         try:
             self.source_client.wk_transport_stream_topic(
                 topic_id,
@@ -1123,6 +1147,7 @@ class WKLightweightTransport:
         on_token: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         passive_completion_check: Callable[[], bool] | None = None,
+        _initial_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_topic = topic_id.strip() if isinstance(topic_id, str) else ""
         if not normalized_topic:
@@ -1131,10 +1156,9 @@ class WKLightweightTransport:
                 request_stage="wkwebview_curl_ws_follow",
             )
 
-        state: dict[str, Any] = {
-            "conversation_id": conversation_id,
-            "resume_turn_topic_id": normalized_topic,
-        }
+        state = _initial_state if isinstance(_initial_state, dict) else {}
+        state["conversation_id"] = conversation_id
+        state["resume_turn_topic_id"] = normalized_topic
         segment_done_count = 0
         external_completion_observed = False
         caller_stop_observed = False
@@ -1147,6 +1171,7 @@ class WKLightweightTransport:
         last_server_activity_at = started
         last_server_offset: str | None = None
         last_server_wallclock_at: float | None = None
+        last_terminal_status_probe_at: float | None = None
         server_quiet_emitted = False
         server_stalled_emitted = False
         delivery_recovery_count = 0
@@ -1163,8 +1188,9 @@ class WKLightweightTransport:
         def relay_event(event: dict[str, Any]) -> None:
             nonlocal segment_done_count, last_topic_activity_at, idle_reconnect_seconds
             nonlocal last_server_activity_at, last_server_offset
-            nonlocal last_server_wallclock_at, server_quiet_emitted
-            nonlocal server_stalled_emitted, delivery_recovery_count
+            nonlocal last_server_wallclock_at, last_terminal_status_probe_at
+            nonlocal server_quiet_emitted, server_stalled_emitted
+            nonlocal delivery_recovery_count
             if not isinstance(event, dict):
                 return
             event_type = event.get("type")
@@ -1214,6 +1240,7 @@ class WKLightweightTransport:
                         )
                     server_quiet_emitted = False
                     server_stalled_emitted = False
+                    last_terminal_status_probe_at = None
 
             if event_type == "stream_handoff_ws_subscribed":
                 reported_offset = event.get("last_offset")
@@ -1250,6 +1277,7 @@ class WKLightweightTransport:
                         )
                     server_quiet_emitted = False
                     server_stalled_emitted = False
+                    last_terminal_status_probe_at = None
                 if reconnect_count > 0:
                     catchup_count = event.get("catchup_count")
                     if isinstance(catchup_count, int) and not isinstance(
@@ -1290,6 +1318,7 @@ class WKLightweightTransport:
                 nonlocal reconnect_reason
                 nonlocal server_quiet_emitted
                 nonlocal server_stalled_emitted
+                nonlocal last_terminal_status_probe_at
                 if should_stop is not None:
                     try:
                         if bool(should_stop()):
@@ -1346,11 +1375,18 @@ class WKLightweightTransport:
                             "reconnect_count": reconnect_count,
                         }
                     )
-                    # A topic can become orphaned from the canonical conversation:
-                    # no new Celsius offsets, stale canonical status still says
-                    # tool_calling, while the stream backend already reports the
-                    # turn COMPLETE. Probe exactly once per stalled period so the
-                    # passive follow can terminate without normal-path polling.
+                # A topic can become orphaned from the canonical conversation:
+                # no new Celsius offsets, stale canonical status still says
+                # tool_calling, while the stream backend transitions from
+                # IS_STREAMING to COMPLETE much later. Recheck only while the
+                # server is already in prolonged silence; healthy turns still do
+                # zero stream-status polling.
+                if silent_for >= _FOLLOW_TOPIC_SERVER_STALL_SECONDS and (
+                    last_terminal_status_probe_at is None
+                    or now - last_terminal_status_probe_at
+                    >= _FOLLOW_TOPIC_STALLED_STATUS_RECHECK_SECONDS
+                ):
+                    last_terminal_status_probe_at = now
                     try:
                         stream_status = self.read_stream_status(
                             conversation_id,

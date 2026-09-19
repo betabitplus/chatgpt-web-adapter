@@ -621,6 +621,7 @@ def _clone_stream_message(message: dict[str, Any]) -> dict[str, Any]:
 _STREAM_HEALTH_EVENT_TYPES = frozenset(
     {
         "stream_handoff_ws_reconnecting",
+        "stream_handoff_ws_subscribed",
         "stream_handoff_delivery_recovered",
         "stream_handoff_server_quiet",
         "stream_handoff_server_stalled",
@@ -706,12 +707,10 @@ class CanonicalTopicStreamNormalizer:
         self._process_payload(payload, output)
         source_offset = event.get("offset")
         if isinstance(source_offset, str) and source_offset.strip():
+            normalized_source_offset = source_offset.strip()
             for item in output:
-                if (
-                    item.get("type") == "canonical_intermediate_message"
-                    and item.get("message_kind") == "tool_call"
-                ):
-                    item["source_offset"] = source_offset.strip()
+                if isinstance(item, dict):
+                    item.setdefault("source_offset", normalized_source_offset)
         if self.catchup_remaining > 0:
             self.catchup_remaining -= 1
         return output

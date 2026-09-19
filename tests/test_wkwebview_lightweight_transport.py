@@ -1196,3 +1196,84 @@ def test_lightweight_attachment_invalid_schema_is_actionable(tmp_path) -> None:
         RequestError, match="WKWEBVIEW_ATTACHMENT_UPLOAD_FILE_ID_MISSING"
     ):
         transport.upload_attachments([str(attachment)])
+
+
+def test_lightweight_follow_topic_live_frame_preserves_empty_recovery_backoff(
+    monkeypatch,
+) -> None:
+    current_offset = f"{int(time.time() * 1000)}-0"
+
+    class EmptyRecoveryThenLiveSource(_SourceClient):
+        def wk_transport_stream_topic(
+            self,
+            topic_id: str,
+            *,
+            websocket_url: str,
+            state: dict,
+            on_event=None,
+            on_token=None,
+            should_stop=None,
+            stop_on_done=True,
+        ) -> None:
+            self.stream_calls.append((topic_id, websocket_url))
+            assert should_stop is not None
+            if len(self.stream_calls) == 1:
+                time.sleep(0.040)
+                assert should_stop() is True
+                return
+
+            if on_event is not None:
+                on_event(
+                    {
+                        "type": "stream_handoff_ws_subscribed",
+                        "topic_id": topic_id,
+                        "recovered": True,
+                        "catchup_count": 0,
+                        "last_offset": current_offset,
+                    }
+                )
+                on_event(
+                    {
+                        "type": "raw_ws_event",
+                        "topic_id": topic_id,
+                        "offset": current_offset,
+                        "parsed": {},
+                    }
+                )
+            time.sleep(0.040)
+            # Empty recovery doubled the lease from 30ms to 60ms. A normal
+            # live frame must not immediately collapse it back to 30ms.
+            assert should_stop() is False
+            state["message_id"] = "assistant-1"
+            state["finish_reason"] = "stop"
+            if on_event is not None:
+                on_event({"type": "raw_ws_done", "topic_id": topic_id})
+
+    source = EmptyRecoveryThenLiveSource()
+    transport, _ = _transport(source)
+    curl = _CurlRequests(
+        [[_Response(200, {"websocket_url": "wss://example.invalid/celsius"})]]
+    )
+    monkeypatch.setattr(transport, "_curl_requests", lambda: curl)
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS",
+        0.030,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_IDLE_RECONNECT_MAX_SECONDS",
+        0.120,
+    )
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_lightweight_transport._FOLLOW_TOPIC_RECONNECT_BACKOFF_SECONDS",
+        (0.0,),
+    )
+
+    result = transport.follow_topic(
+        conversation_id="conversation-1",
+        topic_id="conversation-turn-turn-1",
+        timeout=30,
+    )
+
+    assert result["reconnect_count"] == 1
+    assert result["idle_reconnect_seconds"] == pytest.approx(0.060)
+    assert len(source.stream_calls) == 2

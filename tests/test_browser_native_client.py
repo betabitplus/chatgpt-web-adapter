@@ -15,6 +15,7 @@ from chatgpt_web_adapter.browser_native_client import (
     _canonical_intermediate_events,
     _canonical_stream_answer_seed,
     _canonical_stream_identity,
+    _is_stream_health_event,
     _make_passive_terminal_stop_check,
     _wait_for_new_final_assistant,
     await_browser_native_final,
@@ -24,6 +25,16 @@ from chatgpt_web_adapter.browser_native_client import (
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeTurnResult
 from chatgpt_web_adapter.exceptions import ConversationTimeoutError, RequestError
 from chatgpt_web_adapter.types import ChatConversation
+
+
+def test_stream_subscription_is_forwarded_as_health_diagnostic() -> None:
+    assert _is_stream_health_event(
+        {
+            "type": "stream_handoff_ws_subscribed",
+            "catchup_count": 0,
+            "last_offset": "1000-0",
+        }
+    )
 
 
 def test_passive_terminal_stop_check_waits_then_stops_and_cancel_is_immediate() -> None:

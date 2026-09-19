@@ -1200,9 +1200,7 @@ class WKLightweightTransport:
                     server_quiet_emitted = False
                     server_stalled_emitted = False
 
-            if event_type == "raw_ws_event":
-                idle_reconnect_seconds = _FOLLOW_TOPIC_IDLE_RECONNECT_SECONDS
-            elif event_type == "stream_handoff_ws_subscribed":
+            if event_type == "stream_handoff_ws_subscribed":
                 reported_offset = event.get("last_offset")
                 normalized_reported_offset = (
                     reported_offset.strip()

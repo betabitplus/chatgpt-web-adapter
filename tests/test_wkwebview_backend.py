@@ -1620,6 +1620,75 @@ def test_wkwebview_stop_requires_canonical_client_stopped_proof(monkeypatch) -> 
     assert provider.stop_requested_for("conversation-1") is False
 
 
+def test_wkwebview_stop_accepts_terminal_stream_status_when_stop_control_is_gone(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    monkeypatch.setattr(
+        provider,
+        "_run_helper",
+        lambda command, *, timeout: (_ for _ in ()).throw(
+            RequestError(
+                "WKWEBVIEW_STOP_CONTROL_NOT_FOUND",
+                request_stage="wkwebview_stop_generation",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_wait_for_stopped_final_payload",
+        lambda conversation_id, *, timeout: None,
+    )
+    observed: list[tuple[str, str | None, float]] = []
+
+    def stream_status(conversation_id, *, turn_trace_id, timeout):
+        observed.append((conversation_id, turn_trace_id, timeout))
+        return "COMPLETE"
+
+    monkeypatch.setattr(provider, "_wait_for_stream_stop_proof", stream_status)
+
+    result = provider.stop_generation("conversation-1", timeout=5)
+
+    assert result["stopped"] is True
+    assert result["proof"] == "stream_status_after_missing_control"
+    assert result["streamStatus"] == "COMPLETE"
+    assert observed
+    assert provider.stop_requested_for("conversation-1") is True
+
+
+def test_wkwebview_stop_missing_control_still_fails_without_independent_proof(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+    monkeypatch.setattr(
+        provider,
+        "_run_helper",
+        lambda command, *, timeout: (_ for _ in ()).throw(
+            RequestError(
+                "WKWEBVIEW_STOP_CONTROL_NOT_FOUND",
+                request_stage="wkwebview_stop_generation",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_wait_for_stopped_final_payload",
+        lambda conversation_id, *, timeout: None,
+    )
+    monkeypatch.setattr(
+        provider,
+        "_wait_for_stream_stop_proof",
+        lambda conversation_id, *, turn_trace_id, timeout: None,
+    )
+
+    with pytest.raises(RequestError, match="WKWEBVIEW_STOP_CONTROL_NOT_FOUND"):
+        provider.stop_generation("conversation-1", timeout=5)
+
+    assert provider.stop_requested_for("conversation-1") is False
+
+
 def test_wkwebview_stop_accepts_product_stop_control_click_without_canonical_polling(
     monkeypatch,
 ) -> None:

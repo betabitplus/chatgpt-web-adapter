@@ -191,7 +191,56 @@ class WKTurnObserver:
             stop_only=True,
             stop_context=stop_context,
         )
-        payload = provider._run_helper(command, timeout=remaining)
+        try:
+            payload = provider._run_helper(command, timeout=remaining)
+        except RequestError as error:
+            if "WKWEBVIEW_STOP_CONTROL_NOT_FOUND" not in str(error):
+                raise
+
+            # A long-running/tool-heavy turn can become orphaned from the page:
+            # ChatGPT's stream backend is already terminal, while the canonical
+            # conversation snapshot still says tool_calling and the DOM no
+            # longer exposes a Stop button. Treat this as stopped only when a
+            # separate backend/canonical proof confirms the turn is no longer
+            # active; never infer success from the missing control itself.
+            final_payload = provider._wait_for_stopped_final_payload(
+                conversation_id,
+                timeout=0.0,
+            )
+            if final_payload is not None and provider._is_client_stopped_payload(
+                final_payload
+            ):
+                provider._mark_conversation_stopped(conversation_id)
+                provider._clear_stop_context(conversation_id)
+                return {
+                    "ok": True,
+                    "stopped": True,
+                    "conversationId": conversation_id,
+                    "provider": "wkwebview",
+                    "proof": "canonical_client_stopped_after_missing_control",
+                    "streamStatus": None,
+                }
+
+            remaining = max(0.0, timeout - (time.monotonic() - started))
+            stream_status = provider._wait_for_stream_stop_proof(
+                conversation_id,
+                turn_trace_id=stop_context[1] if stop_context is not None else None,
+                timeout=min(2.0, remaining),
+            )
+            if stream_status not in {"IS_STOP_REQUESTED", "COMPLETE"}:
+                raise
+
+            provider._mark_conversation_stopped(conversation_id)
+            provider._clear_stop_context(conversation_id)
+            return {
+                "ok": True,
+                "stopped": True,
+                "conversationId": conversation_id,
+                "provider": "wkwebview",
+                "proof": "stream_status_after_missing_control",
+                "streamStatus": stream_status,
+            }
+
         if payload.get("stop_requested") is not True:
             raise RequestError(
                 "WKWEBVIEW_STOP_REQUEST_NOT_PROVEN",

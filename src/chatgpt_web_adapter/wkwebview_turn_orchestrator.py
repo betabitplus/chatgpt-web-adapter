@@ -553,8 +553,13 @@ class WKTurnOrchestrator:
         if conversation is not None:
             conversation_id = ConversationRef.from_any(conversation).conversation_id
             provider.clear_stop_requested_for(conversation_id)
+            prewrite_taker = getattr(provider, "take_prewrite_payload", None)
             prewrite_peeker = getattr(provider, "peek_prewrite_payload", None)
-            if callable(prewrite_peeker):
+            if callable(prewrite_taker):
+                candidate = prewrite_taker(conversation_id)
+                if isinstance(candidate, dict):
+                    prewrite_payload = candidate
+            if prewrite_payload is None and callable(prewrite_peeker):
                 candidate = prewrite_peeker(conversation_id)
                 if isinstance(candidate, dict):
                     prewrite_payload = candidate
@@ -570,6 +575,10 @@ class WKTurnOrchestrator:
                     conversation_id,
                     timeout=min(15.0, total_timeout),
                 )
+                if callable(prewrite_taker):
+                    handed = prewrite_taker(conversation_id)
+                    if isinstance(handed, dict):
+                        prewrite_payload = handed
                 value = prewrite_payload.get("current_node")
                 baseline_current_node = (
                     value if isinstance(value, str) and value else None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import os
 import queue
@@ -20,6 +21,10 @@ from chatgpt_web_adapter.browser_authority_backend import (
     CHROME_NATIVE_BROWSER_AUTHORITY_BACKEND,
     WKWEBVIEW_BROWSER_AUTHORITY_BACKEND,
     normalize_browser_authority_backend,
+)
+from chatgpt_web_adapter.browser_native_client import (
+    _canonical_intermediate_events,
+    _canonical_prewrite_snapshot,
 )
 from chatgpt_web_adapter.browser_owned_write_runtime import _canonical_commit_snapshot
 from chatgpt_web_adapter.client import ChatGPTWebClient
@@ -237,33 +242,45 @@ def test_wk_shared_final_wait_survives_registry_cleanup_race(
     assert reads >= 3
 
 
-def test_wk_final_canonical_cache_supports_non_destructive_prewrite_peek(
+def test_wk_commit_snapshot_refreshes_full_prewrite_and_reuses_it_for_prepare(
     monkeypatch, tmp_path
 ) -> None:
     provider = WKWebViewTurnProvider(state_dir=tmp_path)
-    payload = _final_canonical_for_prompt("cached")
-    payload["default_model_slug"] = "gpt-5-6-thinking"
-    payload["mapping"]["node-final"]["message"]["id"] = "assistant-final"
-    payload["mapping"]["node-final"]["message"]["metadata"] = {
+
+    stale = _final_canonical_for_prompt("stale")
+    stale["mapping"]["node-final"]["message"]["id"] = "assistant-stale"
+    provider._canonical_state.cache_final_payload("conversation-1", stale)
+
+    fresh = _final_canonical_for_prompt("fresh")
+    fresh["default_model_slug"] = "gpt-5-6-thinking"
+    fresh["mapping"]["node-final"]["message"]["id"] = "assistant-fresh"
+    fresh["mapping"]["node-final"]["message"]["metadata"] = {
         "thinking_effort": "extended"
     }
-    provider._canonical_state.cache_final_payload("conversation-1", payload)
+
+    calls = 0
+
+    def network_read(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return fresh
+
+    monkeypatch.setattr(provider, "_read_conversation_payload_uncached", network_read)
     client = WKWebViewCanonicalClient(SimpleNamespace(), provider)
-
-    def fail_network(*args, **kwargs):
-        raise AssertionError("trusted final payload must avoid canonical network read")
-
-    monkeypatch.setattr(provider, "_read_conversation_payload_uncached", fail_network)
 
     status, commit_payload, _checked_at = _canonical_commit_snapshot(
         client, "conversation-1"
     )
+
+    assert calls == 1
     assert status == "completed"
-    assert commit_payload is not payload
-    assert commit_payload["current_node"] == "assistant-final"
+    assert commit_payload is fresh
+    assert commit_payload["mapping"]["node-final"]["message"]["id"] == "assistant-fresh"
+
+    # The same full snapshot is handed to prepare_turn from the one-shot
+    # in-memory handoff; no second canonical GET is spent.
     prewrite = provider.peek_prewrite_payload("conversation-1")
-    assert isinstance(prewrite, dict)
-    assert prewrite["current_node"] == "assistant-final"
+    assert prewrite == fresh
 
     prepared = provider._turn_orchestrator.prepare_turn(
         conversation="conversation-1",
@@ -273,14 +290,14 @@ def test_wk_final_canonical_cache_supports_non_destructive_prewrite_peek(
         streaming=True,
     )
 
-    assert prepared.baseline_current_node == "assistant-final"
-    assert prepared.minimal_parent_message_id == "assistant-final"
+    assert calls == 1
+    assert prepared.baseline_current_node == "node-final"
+    assert prepared.minimal_parent_message_id == "assistant-fresh"
     assert prepared.minimal_model_slug == "gpt-5-6-thinking"
     assert prepared.minimal_thinking_effort == "extended"
-    assert provider.peek_prewrite_payload("conversation-1") is not None
 
 
-def test_wk_fresh_network_final_seeds_trusted_prewrite_cache(
+def test_wk_regular_final_read_keeps_cursor_without_prewrite_handoff(
     monkeypatch, tmp_path
 ) -> None:
     provider = WKWebViewTurnProvider(state_dir=tmp_path)
@@ -302,15 +319,150 @@ def test_wk_fresh_network_final_seeds_trusted_prewrite_cache(
     prewrite = provider.peek_prewrite_payload("conversation-1")
     assert isinstance(prewrite, dict)
     assert prewrite["current_node"] == "assistant-fresh"
+    assert provider.take_prewrite_payload("conversation-1") is None
 
-    canonical = WKWebViewCanonicalClient(SimpleNamespace(), provider)
+
+def test_full_prewrite_baseline_does_not_replay_historical_tool_events() -> None:
+    full_prewrite = {
+        "current_node": "old-final-node",
+        "mapping": {
+            "old-user-node": {
+                "parent": None,
+                "message": {
+                    "id": "old-user",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["old prompt"]},
+                },
+            },
+            "old-tool-call-node": {
+                "parent": "old-user-node",
+                "message": {
+                    "id": "old-tool-call",
+                    "author": {"role": "assistant"},
+                    "recipient": "api_tool.call_tool",
+                    "status": "finished_successfully",
+                    "content": {
+                        "content_type": "text",
+                        "parts": ['{"action":"search","args":{"query":"old"}}'],
+                    },
+                },
+            },
+            "old-tool-result-node": {
+                "parent": "old-tool-call-node",
+                "message": {
+                    "id": "old-tool-result",
+                    "author": {"role": "tool", "name": "api_tool.call_tool"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "content": {"content_type": "text", "parts": ['{"ok":true}']},
+                },
+            },
+            "old-final-node": {
+                "parent": "old-tool-result-node",
+                "message": {
+                    "id": "old-final",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "content": {"content_type": "text", "parts": ["old answer"]},
+                },
+            },
+        },
+    }
+    cursor_only = {
+        "current_node": "old-final",
+        "mapping": {
+            "old-final": {
+                "parent": None,
+                "message": full_prewrite["mapping"]["old-final-node"]["message"],
+            }
+        },
+    }
+
+    class Client:
+        read_calls = 0
+        peek_calls = 0
+
+        def read_prewrite_canonical_payload(self, conversation_id):
+            assert conversation_id == "conversation-1"
+            self.read_calls += 1
+            return full_prewrite
+
+        def peek_prewrite_canonical_payload(self, conversation_id):
+            assert conversation_id == "conversation-1"
+            self.peek_calls += 1
+            return cursor_only
+
+    client = Client()
     status, commit_payload, _checked_at = _canonical_commit_snapshot(
-        canonical, "conversation-1"
+        client, "conversation-1"
     )
+
     assert status == "completed"
-    assert isinstance(commit_payload, dict)
-    assert commit_payload["current_node"] == "assistant-fresh"
-    assert calls == 1
+    assert commit_payload is full_prewrite
+    assert client.read_calls == 1
+    assert client.peek_calls == 0
+
+    baseline_message_ids, _assistant_ids, _status = _canonical_prewrite_snapshot(
+        SimpleNamespace(),
+        "conversation-1",
+        canonical_payload=commit_payload,
+    )
+    assert {
+        "old-user",
+        "old-tool-call",
+        "old-tool-result",
+        "old-final",
+    } <= baseline_message_ids
+
+    after_submit = copy.deepcopy(full_prewrite)
+    after_submit["mapping"].update(
+        {
+            "new-user-node": {
+                "parent": "old-final-node",
+                "message": {
+                    "id": "new-user",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["new prompt"]},
+                },
+            },
+            "new-tool-call-node": {
+                "parent": "new-user-node",
+                "message": {
+                    "id": "new-tool-call",
+                    "author": {"role": "assistant"},
+                    "recipient": "api_tool.call_tool",
+                    "status": "finished_successfully",
+                    "content": {
+                        "content_type": "text",
+                        "parts": ['{"action":"edit","args":{"path":"new"}}'],
+                    },
+                },
+            },
+            "new-final-node": {
+                "parent": "new-tool-call-node",
+                "message": {
+                    "id": "new-final",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                    "end_turn": True,
+                    "content": {"content_type": "text", "parts": ["new answer"]},
+                },
+            },
+        }
+    )
+    after_submit["current_node"] = "new-final-node"
+
+    events = _canonical_intermediate_events(
+        after_submit,
+        baseline_message_ids=baseline_message_ids,
+        emitted_message_ids=set(baseline_message_ids),
+        submission_id="submission-1",
+    )
+
+    assert [event["message_id"] for event in events] == ["new-tool-call"]
 
 
 def test_browser_authority_backend_selection_is_closed() -> None:

@@ -303,18 +303,13 @@ def _canonical_commit_snapshot(
     conversation: Any,
 ) -> tuple[str | None, dict[str, Any] | None, int]:
     conversation_id = ConversationRef.from_any(conversation).conversation_id
-    prewrite_peeker = getattr(client, "peek_prewrite_canonical_payload", None)
-    if callable(prewrite_peeker):
-        cached_payload = prewrite_peeker(conversation_id)
-        if isinstance(cached_payload, dict):
-            status = _status_from_payload(cached_payload)
-            value = getattr(status, "status", None)
-            return (
-                value if isinstance(value, str) else None,
-                cached_payload,
-                int(time.time() * 1000),
-            )
 
+    # Continuation correctness requires a complete, fresh branch baseline.
+    # A lightweight continuation cursor is sufficient to choose a parent node,
+    # but it is not a conversation snapshot: using it as the baseline causes all
+    # historical tool/reasoning nodes omitted from that cursor to be replayed as
+    # if they belonged to the new turn. Prefer the dedicated fresh prewrite read
+    # whenever the client exposes one.
     prewrite_reader = getattr(client, "read_prewrite_canonical_payload", None)
     reader = prewrite_reader if callable(prewrite_reader) else getattr(
         client, "_get_conversation_payload", None
@@ -329,6 +324,21 @@ def _canonical_commit_snapshot(
                 payload,
                 int(time.time() * 1000),
             )
+
+    # Compatibility fallback for lightweight/custom clients that do not expose
+    # a canonical prewrite reader. WK production clients never rely on this path.
+    prewrite_peeker = getattr(client, "peek_prewrite_canonical_payload", None)
+    if callable(prewrite_peeker):
+        cached_payload = prewrite_peeker(conversation_id)
+        if isinstance(cached_payload, dict):
+            status = _status_from_payload(cached_payload)
+            value = getattr(status, "status", None)
+            return (
+                value if isinstance(value, str) else None,
+                cached_payload,
+                int(time.time() * 1000),
+            )
+
     status = _canonical_status_value(client, conversation)
     return status, None, int(time.time() * 1000)
 

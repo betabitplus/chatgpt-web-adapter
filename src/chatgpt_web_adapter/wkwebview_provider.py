@@ -60,6 +60,7 @@ class WKWebViewTurnProvider:
     _canonical_rate_limit_max_backoff_seconds = 60.0
     _minimal_completion_verify_grace_seconds = 20.0
     _minimal_completion_consistency_delay_seconds = 2.0
+    _prewrite_handoff_cache_max_age_seconds = 2.0
     _shared_heavy_submit_lock_path = (
         Path.home()
         / "Library"
@@ -104,6 +105,10 @@ class WKWebViewTurnProvider:
         self._lightweight_transport: WKLightweightTransport | None = None
         self._attachment_text_lock = threading.Lock()
         self._attachment_text_cache: dict[str, str | None] = {}
+        self._prewrite_handoff_lock = threading.Lock()
+        self._prewrite_handoff_payloads: dict[
+            str, tuple[dict[str, Any], float]
+        ] = {}
         self._turn_observer = WKTurnObserver(self)
         self._turn_orchestrator = WKTurnOrchestrator(self)
         self._temporary_runtime = WKTemporaryTurnRuntime(self)
@@ -630,12 +635,63 @@ class WKWebViewTurnProvider:
             # Cache persistence is best-effort and never changes canonical authority.
             return
 
+    def _cache_prewrite_handoff_payload(
+        self,
+        conversation_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        ref = ConversationRef(conversation_id)
+        with self._prewrite_handoff_lock:
+            self._prewrite_handoff_payloads[ref.conversation_id] = (
+                payload,
+                time.monotonic(),
+            )
+
+    def _prewrite_handoff_payload(
+        self,
+        conversation_id: str,
+        *,
+        consume: bool,
+    ) -> dict[str, Any] | None:
+        ref = ConversationRef(conversation_id)
+        with self._prewrite_handoff_lock:
+            entry = self._prewrite_handoff_payloads.get(ref.conversation_id)
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                return None
+            payload, saved_at = entry
+            age = max(0.0, time.monotonic() - float(saved_at))
+            if age > self._prewrite_handoff_cache_max_age_seconds:
+                self._prewrite_handoff_payloads.pop(ref.conversation_id, None)
+                return None
+            if consume:
+                self._prewrite_handoff_payloads.pop(ref.conversation_id, None)
+            return payload if isinstance(payload, dict) else None
+
     def peek_prewrite_payload(
         self,
         conversation_id: str,
     ) -> dict[str, Any] | None:
         ref = ConversationRef(conversation_id)
+        handoff = self._prewrite_handoff_payload(
+            ref.conversation_id,
+            consume=False,
+        )
+        if isinstance(handoff, dict):
+            return handoff
         return self._canonical_state.prewrite_payload_from_cursor(ref.conversation_id)
+
+    def take_prewrite_payload(
+        self,
+        conversation_id: str,
+    ) -> dict[str, Any] | None:
+        ref = ConversationRef(conversation_id)
+        # prepare_turn may consume only a complete payload explicitly handed off
+        # by the fresh pre-submit read. A cursor-only synthetic payload must never
+        # become the working baseline for a submitted continuation.
+        return self._prewrite_handoff_payload(
+            ref.conversation_id,
+            consume=True,
+        )
 
     def cache_continuation_cursor(
         self,
@@ -1130,19 +1186,47 @@ class WKWebViewTurnProvider:
         *,
         timeout: float = 30.0,
     ) -> dict[str, Any]:
-        previous = bool(
+        ref = ConversationRef(conversation_id)
+        previous_uncoordinated = bool(
             getattr(self._canonical_read_context, "prewrite_uncoordinated", False)
         )
+        previous_force_fresh = bool(
+            getattr(self._canonical_read_context, "prewrite_force_fresh", False)
+        )
         self._canonical_read_context.prewrite_uncoordinated = True
+        self._canonical_read_context.prewrite_force_fresh = True
         try:
-            payload = self.read_conversation_payload(conversation_id, timeout=timeout)
+            # Keep the normal read entry point so tests/custom providers can
+            # override it, but force production WK reads to bypass any stale
+            # in-memory final payload for this pre-submit baseline.
+            payload = self.read_conversation_payload(
+                ref.conversation_id,
+                timeout=float(timeout),
+            )
             self._canonical_state.cache_continuation_cursor_from_payload(
-                ConversationRef(conversation_id).conversation_id,
+                ref.conversation_id,
                 payload,
+            )
+            self._canonical_state.set_current_node(
+                ref.conversation_id,
+                payload.get("current_node"),
+            )
+            # Hand the exact full snapshot to the inner prepare_turn call in
+            # memory. It is consumed once, avoiding both a second canonical GET and
+            # cross-process/disk-cache contamination.
+            self._cache_prewrite_handoff_payload(
+                ref.conversation_id,
+                payload,
+            )
+            self._persist_canonical_payload(
+                ref.conversation_id,
+                payload,
+                min_interval_seconds=0.0,
             )
             return payload
         finally:
-            self._canonical_read_context.prewrite_uncoordinated = previous
+            self._canonical_read_context.prewrite_uncoordinated = previous_uncoordinated
+            self._canonical_read_context.prewrite_force_fresh = previous_force_fresh
 
     def read_conversation_payload(
         self,
@@ -1154,10 +1238,14 @@ class WKWebViewTurnProvider:
         total_timeout = float(timeout)
         if total_timeout <= 0:
             raise ValueError("timeout must be positive")
-        cached_final = self._canonical_state.take_final_payload(ref.conversation_id)
-        if cached_final is not None:
-            self._record_canonical_read_observation("cache")
-            return cached_final
+        force_fresh_prewrite = bool(
+            getattr(self._canonical_read_context, "prewrite_force_fresh", False)
+        )
+        if not force_fresh_prewrite:
+            cached_final = self._canonical_state.take_final_payload(ref.conversation_id)
+            if cached_final is not None:
+                self._record_canonical_read_observation("cache")
+                return cached_final
         parsed = self._read_conversation_payload_uncached(
             ref.conversation_id,
             timeout=total_timeout,
@@ -1166,12 +1254,29 @@ class WKWebViewTurnProvider:
             ),
         )
         if self._canonical_state.payload_is_final(parsed):
-            self._canonical_state.cache_final_payload(ref.conversation_id, parsed)
+            if force_fresh_prewrite:
+                # This final snapshot predates the write we are about to perform.
+                # Keep only continuation identity; seeding the final-payload cache
+                # here could make post-submit reconciliation return the old turn.
+                self._canonical_state.cache_continuation_cursor_from_payload(
+                    ref.conversation_id,
+                    parsed,
+                )
+                self._canonical_state.set_current_node(
+                    ref.conversation_id,
+                    parsed.get("current_node"),
+                )
+            else:
+                self._canonical_state.cache_final_payload(ref.conversation_id, parsed)
         else:
             self._canonical_state.set_current_node(
                 ref.conversation_id, parsed.get("current_node")
             )
-        self._persist_canonical_payload(ref.conversation_id, parsed)
+        self._persist_canonical_payload(
+            ref.conversation_id,
+            parsed,
+            min_interval_seconds=0.0 if force_fresh_prewrite else 30.0,
+        )
         return parsed
 
     def read_catalog_payload(

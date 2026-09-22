@@ -9,7 +9,11 @@ from chatgpt_web_adapter.conversation_send import send_to_conversation
 from chatgpt_web_adapter.diagnostic_metrics import send_with_expanded_metrics
 from chatgpt_web_adapter.exceptions import RequestError
 from chatgpt_web_adapter.prepared_text_send import send_existing_text_prepared
-from chatgpt_web_adapter.types import AttachedConversation, ChatConversation, ChatResponse
+from chatgpt_web_adapter.types import (
+    AttachedConversation,
+    ChatConversation,
+    ChatResponse,
+)
 
 
 class PreparedClient:
@@ -335,7 +339,26 @@ def test_prepared_text_send_preserves_successful_stream_metadata_from_parser_sta
     assert response.conversation.finish_reason == "max_tokens"
     assert response.request.observed_model == "gpt-5-6-thinking"
     assert response.request.observed_reasoning_effort == "extended"
+    assert response.request.terminal_observed is True
+    assert response.request.terminal_source == "stream"
     assert not any(event.get("type") == "raw_sse_event" for event in client.events)
+
+
+def test_prepared_text_send_does_not_invent_terminal_proof() -> None:
+    client = PreparedClient()
+
+    response = send_existing_text_prepared(
+        client,
+        "hello",
+        model="gpt-5-6-thinking",
+        conversation=_conversation(),
+    )
+
+    # Compatibility still exposes the legacy fallback finish reason, but the
+    # explicit terminal proof remains false unless stream/canonical evidence was seen.
+    assert response.conversation.finish_reason == "stop"
+    assert response.request.terminal_observed is False
+    assert response.request.terminal_source is None
 
 
 def test_prepared_text_send_restores_parser_lookup_after_stream() -> None:
@@ -373,6 +396,8 @@ def test_prepared_text_send_polls_when_stream_handoff_has_no_text() -> None:
     assert response.conversation.message_id == "assistant-polled"
     assert response.request.observed_model == "gpt-5-6-thinking"
     assert response.request.observed_reasoning_effort == "standard"
+    assert response.request.terminal_observed is True
+    assert response.request.terminal_source == "canonical_recovery"
     assert tokens == ["recovered"]
 
 

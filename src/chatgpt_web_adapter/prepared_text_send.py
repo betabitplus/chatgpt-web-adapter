@@ -59,6 +59,8 @@ def _copy_safe_stream_diagnostics(source: Any, target: dict[str, Any]) -> None:
         value = source.get(key)
         if isinstance(value, str) and value.strip():
             target[key] = value.strip()
+    if source.get("stream_terminal_observed") is True:
+        target["stream_terminal_observed"] = True
 
 
 def send_existing_text_prepared(
@@ -277,6 +279,8 @@ def send_existing_text_prepared(
         observed_model = stream_diagnostics.get("observed_model")
         observed_reasoning_effort = stream_diagnostics.get("observed_reasoning_effort")
         finish_reason = stream_diagnostics.get("finish_reason")
+        terminal_observed = bool(stream_diagnostics.get("stream_terminal_observed"))
+        terminal_source = "stream" if terminal_observed else None
         handoff_seen = bool(stream_diagnostics.get("handoff_seen"))
 
         effective_conversation_id = observed_conversation_id or conversation_id
@@ -326,6 +330,8 @@ def send_existing_text_prepared(
                 polled_finish_reason = _finish_reason(message)
                 if polled_finish_reason:
                     finish_reason = polled_finish_reason
+                    terminal_observed = True
+                    terminal_source = "canonical_recovery"
                 diagnostics: dict[str, Any] = {}
                 self._capture_message_diagnostics(message, diagnostics)
                 if diagnostics.get("observed_model") is not None:
@@ -376,5 +382,7 @@ def send_existing_text_prepared(
             message_count=len(messages),
             observed_model=observed_model,
             observed_reasoning_effort=observed_reasoning_effort,
+            terminal_observed=terminal_observed,
+            terminal_source=terminal_source,
         ),
     )

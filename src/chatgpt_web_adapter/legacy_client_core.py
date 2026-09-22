@@ -1360,6 +1360,13 @@ class ChatGPTWebClient:
         state["current_message_is_final_text"] = final_text_message
         if not final_text_message:
             return
+        finish_details = metadata.get("finish_details")
+        if isinstance(finish_details, dict):
+            terminal_reason = finish_details.get("type")
+            if isinstance(terminal_reason, str) and terminal_reason.strip():
+                state["finish_reason"] = terminal_reason.strip()
+                state["stream_terminal_observed"] = True
+                return
         terminal_reason = message.get("finish_reason")
         if isinstance(terminal_reason, str) and terminal_reason.strip():
             state["finish_reason"] = terminal_reason.strip()
@@ -2901,6 +2908,7 @@ class ChatGPTWebClient:
         recovered_message_id = state.get("message_id") or state.get("parent_message_id")
         recovered_observed_model = state.get("observed_model")
         recovered_observed_reasoning_effort = state.get("observed_reasoning_effort")
+        stream_terminal_observed = bool(state.get("stream_terminal_observed"))
         allow_global_recovery_fallback = not bool(conversation_id)
         if not ws_handoff_consumed and isinstance(recovered_conversation_id, str) and recovered_conversation_id and (
             not recovered_text or not recovered_message_id
@@ -3000,6 +3008,10 @@ class ChatGPTWebClient:
                     recovered_text = polled_text
                 poll_state: dict[str, Any] = {}
                 self._capture_message_diagnostics(recovered_message, poll_state)
+                if poll_state.get("stream_terminal_observed") is True:
+                    state["stream_terminal_observed"] = True
+                    if poll_state.get("finish_reason"):
+                        state["finish_reason"] = poll_state["finish_reason"]
                 if recovered_observed_model is None:
                     recovered_observed_model = poll_state.get("observed_model")
                 if recovered_observed_reasoning_effort is None:
@@ -3068,6 +3080,14 @@ class ChatGPTWebClient:
                 else None,
                 observed_model=recovered_observed_model,
                 observed_reasoning_effort=recovered_observed_reasoning_effort,
+                terminal_observed=bool(state.get("stream_terminal_observed")),
+                terminal_source=(
+                    "stream"
+                    if stream_terminal_observed
+                    else "canonical_recovery"
+                    if state.get("stream_terminal_observed") is True
+                    else None
+                ),
                 resume_kind=state.get("resume_kind"),
                 resume_token_present=bool(state.get("resume_token")),
                 resume_turn_topic_id=state.get("resume_turn_topic_id"),

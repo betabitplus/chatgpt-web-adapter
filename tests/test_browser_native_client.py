@@ -207,6 +207,8 @@ def test_client_returns_canonical_readback_not_native_body() -> None:
     assert response.conversation.message_id == "new-assistant"
     assert response.request.turn_exchange_id == "turn-1"
     assert response.request.observed_model == "gpt-new"
+    assert response.request.terminal_observed is True
+    assert response.request.terminal_source == "canonical_readback"
     assert response.metrics.backend_status == 200
     assert provider.normal_calls == [("hello", "existing-conversation", 2)]
 
@@ -284,6 +286,8 @@ def test_stream_terminal_finality_skips_canonical_readback(
     assert response.conversation.finish_reason == "stop"
     assert response.request.observed_model == "gpt-5-6-thinking"
     assert response.request.turn_exchange_id == "turn-stream"
+    assert response.request.terminal_observed is True
+    assert response.request.terminal_source == "stream"
 
 
 def test_split_submit_defers_exact_topic_and_await_final_never_polls_canonical(

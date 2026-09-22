@@ -2329,6 +2329,14 @@ def await_browser_native_final(
             conversation_id=turn.conversation_id,
             is_continuation=submission.is_continuation,
             observed_model=final_message.model,
+            terminal_observed=not stopped_by_user and not incomplete_without_terminal,
+            terminal_source=(
+                "stream"
+                if stream_finality_proven
+                else "canonical_readback"
+                if not stopped_by_user and not incomplete_without_terminal
+                else None
+            ),
             turn_exchange_id=observed_turn_exchange_id,
         ),
     )

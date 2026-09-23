@@ -1520,8 +1520,10 @@ def test_wkwebview_streaming_without_resume_uses_stream_terminal_proof(
             "canonical_final_completed": False,
             "canonical_body_base64": "",
             "committed_current_node": "",
-            "stream_ended": False,
+            "stream_ended": True,
             "stream_terminal_observed": True,
+            "terminal_error_code": "conversation_too_large",
+            "terminal_error": "You've reached the maximum length for this conversation.",
             "stream_resume_present": False,
             "stream_resume_handoff_written": False,
         }
@@ -1533,6 +1535,11 @@ def test_wkwebview_streaming_without_resume_uses_stream_terminal_proof(
 
     assert len(calls) == 1
     assert result.passive_observer_armed is False
+    assert result.terminal_error_code == "conversation_too_large"
+    assert (
+        result.terminal_error
+        == "You've reached the maximum length for this conversation."
+    )
     assert events[0]["text"] == "done"
 
 
@@ -2462,7 +2469,7 @@ def test_wkwebview_new_chat_recovers_identity_by_client_message_id(
         read_catalog=lambda *args, **kwargs: {
             "items": [{"id": "conversation-recovered"}],
             "total": 1,
-        }
+        },
     )
     monkeypatch.setattr(
         provider,
@@ -2539,7 +2546,7 @@ def test_wkwebview_identity_recovery_curl_failure_fails_closed_without_wk_fallba
         read_catalog=lambda *args, **kwargs: {
             "items": [{"id": "conversation-unreadable"}],
             "total": 1,
-        }
+        },
     )
     monkeypatch.setattr(
         provider,
@@ -3322,6 +3329,8 @@ def test_wkwebview_identity_recovery_switches_to_passive_topic_after_one_read(
             "stream_finality_proven": True,
             "message_id": "assistant-final",
             "finish_reason": "stop",
+            "terminal_error_code": "conversation_too_large",
+            "terminal_error": "You've reached the maximum length for this conversation.",
         }
 
     monkeypatch.setattr(provider, "_resume_via_curl_ws_topic_second_leg", follow_topic)
@@ -3346,6 +3355,71 @@ def test_wkwebview_identity_recovery_switches_to_passive_topic_after_one_read(
     )
     assert followed["turn_exchange_id"] == "11111111-2222-3333-4444-555555555555"
     assert payload["_cwa_phase_b_transport"] == "curl_cffi_websocket_topic_handoff"
+    assert payload["terminal_error_code"] == "conversation_too_large"
+    assert (
+        payload["terminal_error"]
+        == "You've reached the maximum length for this conversation."
+    )
+
+
+def test_wkwebview_follow_submitted_turn_merges_phase_one_terminal_tail(
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider()
+    monkeypatch.setattr(
+        provider,
+        "_conversation_completion_check",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        provider,
+        "_resume_via_curl_ws_topic_second_leg",
+        lambda **kwargs: {
+            "stream_finality_proven": True,
+            "message_id": "assistant-final",
+            "finish_reason": "stop",
+            "observed_model": "gpt-5-6-thinking",
+            "segment_done_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        provider._helper_runtime,
+        "consume_turn_broker_tail",
+        lambda tail_id, *, timeout: (
+            {
+                "ok": True,
+                "terminal_error_code": "conversation_too_large",
+                "terminal_error": "You've reached the maximum length for this conversation.",
+            }
+            if tail_id == "tail-1"
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        provider,
+        "cache_continuation_cursor",
+        lambda *args, **kwargs: None,
+    )
+    turn = SimpleNamespace(
+        stream_topic_id="conversation-turn-1",
+        conversation_id="conversation-1",
+        stream_completion_sequence=None,
+        turn_exchange_id="turn-1",
+        phase_one_tail_id="tail-1",
+    )
+
+    result = provider.follow_submitted_turn(
+        turn,
+        timeout=10.0,
+        on_transport_event=lambda _event: None,
+        stream_should_stop=lambda: False,
+    )
+
+    assert result["terminal_error_code"] == "conversation_too_large"
+    assert (
+        result["terminal_error"]
+        == "You've reached the maximum length for this conversation."
+    )
 
 
 def test_wkwebview_verified_completion_reuses_canonical_without_second_read(
@@ -3536,7 +3610,7 @@ def test_wkwebview_identity_recovery_retry_uses_bounded_backoff(
         read_catalog=lambda *args, **kwargs: {
             "items": [{"id": "conversation-recovered"}],
             "total": 1,
-        }
+        },
     )
     monkeypatch.setattr(
         provider,
@@ -3677,6 +3751,19 @@ def test_wkwebview_helper_observer_backs_off_after_429_without_stream_polling() 
     assert "phase:'raw'" in source
 
 
+def test_wkwebview_helper_drains_post_final_tail_and_exports_terminal_error() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src/chatgpt_web_adapter/wkwebview_helper/WKChatGPTAuthority.m"
+    ).read_text(encoding="utf-8")
+
+    assert 'parsed[@"error_code"]' in source
+    assert 'parsed[@"error"]' in source
+    assert "while (!delegate.streamEnded && [deadline timeIntervalSinceNow] > 0)" in source
+    assert '@"terminal_error_code":delegate.streamTerminalErrorCode ?: @""' in source
+    assert '@"terminal_error":delegate.streamTerminalError ?: @""' in source
+
+
 def test_wkwebview_observer_does_not_hide_malformed_canonical_payload(
     monkeypatch,
 ) -> None:
@@ -3760,6 +3847,117 @@ def test_turn_broker_pre_submit_watchdog_fails_and_closes_connection(
     assert time.monotonic() - started < 0.5
     assert connection.closed is True
     assert events == [{"type": "pre_submit_timeout", "timeout_seconds": 0.05}]
+
+
+@pytest.mark.parametrize(
+    ("completion_signal", "completion_marker"),
+    [
+        (
+            {
+                "kind": "early_handoff",
+                "conversation_id": "conversation-1",
+                "topic_id": "conversation-turn-1",
+                "turn_exchange_id": "turn-1",
+            },
+            "_cwa_early_handoff_observed",
+        ),
+        (True, "_cwa_external_completion_observed"),
+    ],
+)
+def test_turn_broker_external_completion_keeps_protected_tail_alive(
+    monkeypatch,
+    tmp_path,
+    completion_signal,
+    completion_marker,
+) -> None:
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.envelopes: queue.Queue[dict[str, Any]] = queue.Queue()
+            self.closed = False
+            self.envelopes.put(
+                {
+                    "type": "event",
+                    "event": {
+                        "type": "submit_request_observed",
+                        "temporary_mode": False,
+                    },
+                }
+            )
+
+        def recv_envelope(self, timeout: float):
+            try:
+                return self.envelopes.get(timeout=timeout)
+            except queue.Empty:
+                return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FakeConnection()
+
+    class FakeBrokerClient:
+        def __init__(self, helper_binary: Path) -> None:
+            self.helper_binary = helper_binary
+
+        def start_turn(self, request: dict[str, Any], *, timeout: float):
+            assert request == {"minimal_conversation_id": "conversation-1"}
+            assert timeout == 1.0
+            return connection
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_helper_runtime.WKSystemTurnBrokerClient",
+        FakeBrokerClient,
+    )
+    runtime = WKWebViewHelperRuntime(tmp_path, build_timeout=1)
+    invocation = SimpleNamespace(request={"minimal_conversation_id": "conversation-1"})
+
+    payload = runtime._run_streaming_via_turn_broker(
+        invocation,
+        timeout=1.0,
+        on_text_event=lambda _event: None,
+        on_lifecycle_event=None,
+        on_transport_event=None,
+        on_submit_started=None,
+        external_completion_check=lambda: completion_signal,
+    )
+
+    tail_id = payload.get("_cwa_turn_broker_tail_id")
+    assert isinstance(tail_id, str) and tail_id
+    assert payload[completion_marker] is True
+    assert connection.closed is False
+
+    connection.envelopes.put(
+        {
+            "type": "event",
+            "event": {
+                "type": "raw_ws_event",
+                "parsed": {
+                    "error_code": "conversation_too_large",
+                    "error": "You've reached the maximum length for this conversation.",
+                },
+            },
+        }
+    )
+    connection.envelopes.put(
+        {
+            "type": "result",
+            "result": {
+                "ok": True,
+                "terminal_error_code": "conversation_too_large",
+                "terminal_error": "You've reached the maximum length for this conversation.",
+            },
+        }
+    )
+
+    tail = runtime.consume_turn_broker_tail(tail_id, timeout=1.0)
+
+    assert tail is not None
+    assert tail["terminal_error_code"] == "conversation_too_large"
+    assert (
+        tail["terminal_error"]
+        == "You've reached the maximum length for this conversation."
+    )
+    assert connection.closed is True
 
 
 def test_turn_broker_client_disconnect_cancels_native_request_promptly() -> None:

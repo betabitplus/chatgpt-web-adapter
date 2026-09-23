@@ -529,7 +529,13 @@ async function executeOfficialPageTurn({ tabId, text, timeoutMs }) {
       diagnostics,
       finalUrl: finalTab.url || "",
       conversationId: safeMetadata.conversationId || urlConversationId,
-      turnExchangeId: safeMetadata.turnExchangeId
+      turnExchangeId: safeMetadata.turnExchangeId,
+      terminalErrorCode: typeof safeMetadata.terminalErrorCode === "string"
+        ? safeMetadata.terminalErrorCode
+        : null,
+      terminalError: typeof safeMetadata.terminalError === "string"
+        ? safeMetadata.terminalError
+        : null
     };
   } finally {
     if (eventListener) chrome.debugger.onEvent.removeListener(eventListener);
@@ -583,6 +589,8 @@ async function executeNativeTurn(message) {
     responseStatus: result.diagnostics.responseStatus,
     responseMimeType: result.diagnostics.responseMimeType,
     finalUrl: result.finalUrl,
+    terminalErrorCode: result.terminalErrorCode,
+    terminalError: result.terminalError,
     tabId: tab.id,
     tabWasActive: result.diagnostics.tabWasActive,
     elapsedMs: result.diagnostics.elapsedMs,

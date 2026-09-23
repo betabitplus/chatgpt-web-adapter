@@ -144,13 +144,14 @@ def test_read_domain_is_explicit_and_excludes_write_and_observation() -> None:
     assert "service_worker_ui_liveness.js" not in source
 
 
-def test_observation_domain_keeps_connector_turn_wrapper_before_liveness() -> None:
+def test_observation_domain_layers_terminal_outcome_before_connector_and_liveness() -> None:
     source = _source(OBSERVATION)
+    terminal_outcome = 'importScripts("service_worker_terminal_outcome.js");'
     connector = 'importScripts("service_worker_connector_support_pr10_0.js");'
     liveness = 'importScripts("service_worker_ui_liveness.js");'
 
-    assert source.index(connector) < source.index(liveness)
-    assert len(_active_imports(source)) == 2
+    assert source.index(terminal_outcome) < source.index(connector) < source.index(liveness)
+    assert len(_active_imports(source)) == 3
 
     support = _source(CONNECTOR_SUPPORT)
     assert "service_worker_ui_liveness.js" not in support

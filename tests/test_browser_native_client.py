@@ -250,7 +250,16 @@ def test_stream_terminal_finality_skips_canonical_readback(
                 stream_message_id="assistant-stream",
                 stream_finish_reason="stop",
                 stream_model_slug="gpt-5-6-thinking",
+                phase_one_tail_id="tail-1",
             )
+
+        def consume_submitted_turn_tail(self, turn, *, timeout):
+            assert turn.phase_one_tail_id == "tail-1"
+            assert timeout <= 2.0
+            return {
+                "terminal_error_code": "conversation_too_large",
+                "terminal_error": "You've reached the maximum length for this conversation.",
+            }
 
     provider = Provider()
     client = _client(provider)
@@ -288,6 +297,11 @@ def test_stream_terminal_finality_skips_canonical_readback(
     assert response.request.turn_exchange_id == "turn-stream"
     assert response.request.terminal_observed is True
     assert response.request.terminal_source == "stream"
+    assert response.request.terminal_error_code == "conversation_too_large"
+    assert (
+        response.request.terminal_error
+        == "You've reached the maximum length for this conversation."
+    )
 
 
 def test_split_submit_defers_exact_topic_and_await_final_never_polls_canonical(
@@ -369,6 +383,8 @@ def test_split_submit_defers_exact_topic_and_await_final_never_polls_canonical(
                 "finish_reason": "stop",
                 "observed_model": "gpt-5-6-thinking",
                 "segment_done_count": 1,
+                "terminal_error_code": "conversation_too_large",
+                "terminal_error": "You've reached the maximum length for this conversation.",
             }
 
         def observe_turn(self, **kwargs):
@@ -418,7 +434,11 @@ def test_split_submit_defers_exact_topic_and_await_final_never_polls_canonical(
     assert response.text == "deferred final"
     assert response.conversation.message_id == "assistant-deferred"
     assert response.request.observed_model == "gpt-5-6-thinking"
-
+    assert response.request.terminal_error_code == "conversation_too_large"
+    assert (
+        response.request.terminal_error
+        == "You've reached the maximum length for this conversation."
+    )
 
 
 def test_split_submit_external_completion_reconciles_full_canonical_final(
@@ -794,14 +814,7 @@ def test_split_submit_stop_cancels_topic_without_canonical_readback(
     assert readback[-1]["stopped_by_user"] is True
 
 
-def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "chatgpt_web_adapter.browser_native_client._PASSIVE_TERMINAL_SETTLE_SECONDS",
-        0.0,
-    )
-
+def test_active_streaming_send_waits_for_whole_turn_terminal() -> None:
     class Provider(FakeProvider):
         revision_safe_streaming_supported = True
 
@@ -866,6 +879,13 @@ def test_active_streaming_send_forwards_raw_reasoning_until_canonical_end_turn(
                             }
                         }
                     },
+                }
+            )
+            assert stream_should_stop() is False
+            on_transport_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {"type": "message_stream_complete"},
                 }
             )
             assert stream_should_stop() is True
@@ -1702,6 +1722,93 @@ def test_canonical_stream_identity_prefers_explicit_stream_topic_id() -> None:
     }
 
     assert _canonical_stream_identity(payload) == ("custom-topic", "turn-1")
+
+
+def test_topic_stream_normalizer_waits_for_whole_turn_terminal_after_final() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+    final_event = {
+        "type": "raw_ws_event",
+        "parsed": {
+            "v": {
+                "message": {
+                    "id": "assistant-final",
+                    "author": {"role": "assistant"},
+                    "recipient": "all",
+                    "content": {"content_type": "text", "parts": ["done"]},
+                    "end_turn": True,
+                    "metadata": {"turn_exchange_id": "turn-1"},
+                }
+            }
+        },
+    }
+
+    normalizer.feed_transport_event(final_event)
+    assert normalizer.turn_completed is True
+    assert normalizer.whole_turn_terminal_seen is False
+
+    normalizer.feed_transport_event({"type": "raw_ws_done"})
+    assert normalizer.segment_kind is None
+    assert normalizer.whole_turn_terminal_seen is False
+
+    normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {"type": "message_stream_complete"},
+        }
+    )
+    assert normalizer.whole_turn_terminal_seen is True
+
+    error_normalizer = CanonicalTopicStreamNormalizer()
+    error_normalizer.feed_transport_event(final_event)
+    error_normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "message": None,
+                "error_code": "conversation_too_large",
+                "error": "You've reached the maximum length for this conversation.",
+            },
+        }
+    )
+    assert error_normalizer.whole_turn_terminal_seen is True
+
+
+def test_post_final_stop_waits_for_whole_turn_marker_or_bounded_fallback() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+    now = [10.0]
+    should_stop = _make_passive_terminal_stop_check(
+        lambda: normalizer.turn_completed,
+        settled=lambda: normalizer.whole_turn_terminal_seen,
+        settle_seconds=5.0,
+        monotonic=lambda: now[0],
+    )
+    normalizer.turn_completed = True
+
+    assert should_stop() is False
+    normalizer.segment_kind = None
+    now[0] = 12.0
+    assert should_stop() is False
+
+    normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {"type": "message_stream_complete"},
+        }
+    )
+    assert should_stop() is True
+
+    fallback = CanonicalTopicStreamNormalizer()
+    fallback.turn_completed = True
+    now[0] = 20.0
+    fallback_stop = _make_passive_terminal_stop_check(
+        lambda: fallback.turn_completed,
+        settled=lambda: fallback.whole_turn_terminal_seen,
+        settle_seconds=5.0,
+        monotonic=lambda: now[0],
+    )
+    assert fallback_stop() is False
+    now[0] = 25.0
+    assert fallback_stop() is True
 
 
 def test_topic_stream_normalizer_replays_only_new_answer_delta_and_live_tool() -> None:

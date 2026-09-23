@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -49,6 +50,8 @@ class WKWebViewHelperRuntime:
         self.state_dir = Path(state_dir).expanduser()
         self.build_timeout = float(build_timeout)
         self._build_lock = threading.Lock()
+        self._turn_broker_tail_lock = threading.Lock()
+        self._turn_broker_tails: dict[str, queue.Queue[dict[str, Any]]] = {}
 
     @property
     def helper_root(self) -> Path:
@@ -420,6 +423,7 @@ class WKWebViewHelperRuntime:
         submit_request_seen = False
         submit_temporary_mode_observed = False
         payload: dict[str, Any] | None = None
+        connection_detached = False
         try:
             while time.monotonic() < deadline:
                 envelope = connection.recv_envelope(0.05)
@@ -503,6 +507,17 @@ class WKWebViewHelperRuntime:
                         ),
                     )
                     if candidate is not None:
+                        if (
+                            candidate.get("_cwa_early_handoff_observed") is True
+                            or candidate.get("_cwa_external_completion_observed")
+                            is True
+                        ):
+                            candidate["_cwa_turn_broker_tail_id"] = (
+                                self._detach_turn_broker_tail(
+                                    connection, deadline=deadline
+                                )
+                            )
+                            connection_detached = True
                         payload = candidate
                         break
 
@@ -525,7 +540,8 @@ class WKWebViewHelperRuntime:
                         request_stage="wkwebview_authority_turn",
                     )
         finally:
-            connection.close()
+            if not connection_detached:
+                connection.close()
 
         if payload is None:
             raise RequestError(
@@ -547,6 +563,109 @@ class WKWebViewHelperRuntime:
                 request_stage="wkwebview_authority_turn",
             )
         return payload
+
+    def _detach_turn_broker_tail(
+        self,
+        connection: Any,
+        *,
+        deadline: float,
+    ) -> str:
+        """Keep the original protected POST observer alive after an early WS handoff."""
+
+        tail_id = uuid.uuid4().hex
+        outcomes: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        with self._turn_broker_tail_lock:
+            self._turn_broker_tails[tail_id] = outcomes
+
+        def drain() -> None:
+            outcome: dict[str, Any] = {}
+            terminal_error_code: str | None = None
+            terminal_error: str | None = None
+            try:
+                while time.monotonic() < deadline:
+                    envelope = connection.recv_envelope(0.05)
+                    if not isinstance(envelope, dict):
+                        continue
+                    kind = envelope.get("type")
+                    if kind == "event":
+                        event = envelope.get("event")
+                        if (
+                            not isinstance(event, dict)
+                            or event.get("type") != "raw_ws_event"
+                        ):
+                            continue
+                        parsed = event.get("parsed")
+                        if not isinstance(parsed, dict):
+                            continue
+                        code = parsed.get("error_code")
+                        detail = parsed.get("error")
+                        if isinstance(code, str) and code.strip():
+                            terminal_error_code = code.strip()[:128]
+                        if isinstance(detail, str) and detail.strip():
+                            terminal_error = detail.strip()[:1000]
+                        continue
+                    if kind == "result":
+                        candidate = envelope.get("result")
+                        if isinstance(candidate, dict):
+                            outcome = dict(candidate)
+                        break
+                    if kind == "error":
+                        outcome = {
+                            "ok": False,
+                            "_cwa_tail_error": str(
+                                envelope.get("error")
+                                or "WKWEBVIEW_TURN_BROKER_TAIL_FAILED"
+                            ),
+                        }
+                        break
+                if not outcome:
+                    outcome = {
+                        "ok": False,
+                        "_cwa_tail_error": "WKWEBVIEW_TURN_BROKER_TAIL_TIMEOUT",
+                    }
+            except Exception as error:
+                outcome = {
+                    "ok": False,
+                    "_cwa_tail_error": f"{type(error).__name__}:{error}",
+                }
+            finally:
+                if terminal_error_code and not outcome.get("terminal_error_code"):
+                    outcome["terminal_error_code"] = terminal_error_code
+                if terminal_error and not outcome.get("terminal_error"):
+                    outcome["terminal_error"] = terminal_error
+                connection.close()
+                try:
+                    outcomes.put_nowait(outcome)
+                except queue.Full:
+                    pass
+
+        threading.Thread(
+            target=drain,
+            name=f"cwa-wk-turn-tail-{tail_id[:8]}",
+            daemon=True,
+        ).start()
+        return tail_id
+
+    def consume_turn_broker_tail(
+        self,
+        tail_id: str | None,
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        normalized = tail_id.strip() if isinstance(tail_id, str) else ""
+        if not normalized:
+            return None
+        with self._turn_broker_tail_lock:
+            outcomes = self._turn_broker_tails.get(normalized)
+        if outcomes is None:
+            return None
+        try:
+            outcome = outcomes.get(timeout=max(0.0, float(timeout)))
+        except queue.Empty:
+            return None
+        with self._turn_broker_tail_lock:
+            self._turn_broker_tails.pop(normalized, None)
+        return outcome
 
     def run_streaming(
         self,

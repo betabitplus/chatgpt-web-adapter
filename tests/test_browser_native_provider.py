@@ -11,7 +11,7 @@ from chatgpt_web_adapter.browser_native_protocol import (
 from chatgpt_web_adapter.browser_native_provider import BrowserNativeTurnProvider
 
 
-def _round_trip(tmp_path, invoke):
+def _round_trip(tmp_path, invoke, response_extra=None):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
@@ -51,6 +51,7 @@ def _round_trip(tmp_path, invoke):
                     "elapsedMs": 1234,
                     "runtimeReloaded": True,
                     "runtimeReloadMs": 321,
+                    **(response_extra or {}),
                 },
             )
         listener.close()
@@ -78,6 +79,20 @@ def test_provider_round_trip_uses_loopback_token_and_safe_result(tmp_path) -> No
     assert result.tab_was_active is False
     assert result.runtime_reloaded is True
     assert result.runtime_reload_ms == 321
+
+
+def test_provider_preserves_terminal_server_error_metadata(tmp_path) -> None:
+    _, _, result = _round_trip(
+        tmp_path,
+        lambda provider: provider.send_text("hello", timeout=2),
+        response_extra={
+            "terminalErrorCode": "conversation_too_large",
+            "terminalError": "You've reached the maximum length for this conversation.",
+        },
+    )
+
+    assert result.terminal_error_code == "conversation_too_large"
+    assert result.terminal_error == "You've reached the maximum length for this conversation."
 
 
 def test_provider_serializes_fresh_canonical_completion_recovery_evidence(

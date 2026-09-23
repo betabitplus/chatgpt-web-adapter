@@ -951,6 +951,42 @@ class WKWebViewTurnProvider:
                 topic_id=normalized_topic,
             )
 
+    def _consume_phase_one_tail(
+        self,
+        tail_id: str | None,
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        consume = getattr(self._helper_runtime, "consume_turn_broker_tail", None)
+        if not callable(consume):
+            return None
+        return consume(tail_id, timeout=max(0.0, float(timeout)))
+
+    def consume_submitted_turn_tail(
+        self,
+        turn: BrowserNativeTurnResult,
+        *,
+        timeout: float,
+    ) -> dict[str, Any] | None:
+        return self._consume_phase_one_tail(
+            turn.phase_one_tail_id,
+            timeout=timeout,
+        )
+
+    @staticmethod
+    def _merge_terminal_tail(
+        target: dict[str, Any],
+        tail: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(tail, dict):
+            return
+        code = tail.get("terminal_error_code")
+        detail = tail.get("terminal_error")
+        if isinstance(code, str) and code.strip():
+            target["terminal_error_code"] = code.strip()[:128]
+        if isinstance(detail, str) and detail.strip():
+            target["terminal_error"] = detail.strip()[:1000]
+
     @staticmethod
     def _decode_helper_json(
         payload: dict[str, Any],
@@ -2243,6 +2279,14 @@ class WKWebViewTurnProvider:
                     else None
                 ),
             )
+            phase_one_tail = self._consume_phase_one_tail(
+                payload.get("_cwa_turn_broker_tail_id"),
+                timeout=min(
+                    2.0,
+                    max(0.0, total_timeout - (time.monotonic() - started)),
+                ),
+            )
+            self._merge_terminal_tail(payload, phase_one_tail)
             return self._turn_orchestrator.build_turn_result(
                 payload,
                 phase_one=phase_one,
@@ -2397,6 +2441,11 @@ class WKWebViewTurnProvider:
                 stream_should_stop=stream_should_stop,
                 passive_completion_check=completion_check,
             )
+            phase_one_tail = self._consume_phase_one_tail(
+                turn.phase_one_tail_id,
+                timeout=min(2.0, max(0.0, float(timeout))),
+            )
+            self._merge_terminal_tail(result, phase_one_tail)
             message_id = result.get("message_id")
             completed = result.get("stream_finality_proven") is True or (
                 isinstance(result.get("segment_done_count"), int)

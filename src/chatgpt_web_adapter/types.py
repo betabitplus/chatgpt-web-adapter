@@ -675,6 +675,8 @@ class ChatRequestDiagnostics:
     observed_reasoning_effort: str | None = None
     terminal_observed: bool = False
     terminal_source: str | None = None
+    terminal_error_code: str | None = None
+    terminal_error: str | None = None
     resume_kind: str | None = None
     resume_token_present: bool = False
     resume_turn_topic_id: str | None = None
@@ -708,6 +710,8 @@ class ChatRequestDiagnostics:
         self.observed_reasoning_effort = _optional_str(self.observed_reasoning_effort)
         self.terminal_observed = bool(self.terminal_observed)
         self.terminal_source = _optional_str(self.terminal_source)
+        self.terminal_error_code = _optional_str(self.terminal_error_code)
+        self.terminal_error = _optional_str(self.terminal_error)
         self.resume_kind = _optional_str(self.resume_kind)
         self.resume_token_present = bool(self.resume_token_present)
         self.resume_turn_topic_id = _optional_str(self.resume_turn_topic_id)
@@ -749,6 +753,8 @@ class ChatRequestDiagnostics:
             observed_reasoning_effort=payload.get("observed_reasoning_effort"),
             terminal_observed=payload.get("terminal_observed", False),
             terminal_source=payload.get("terminal_source"),
+            terminal_error_code=payload.get("terminal_error_code"),
+            terminal_error=payload.get("terminal_error"),
             resume_kind=payload.get("resume_kind"),
             resume_token_present=payload.get("resume_token_present", False),
             resume_turn_topic_id=payload.get("resume_turn_topic_id"),
@@ -784,6 +790,8 @@ class ChatRequestDiagnostics:
             "observed_reasoning_effort": self.observed_reasoning_effort,
             "terminal_observed": self.terminal_observed,
             "terminal_source": self.terminal_source,
+            "terminal_error_code": self.terminal_error_code,
+            "terminal_error": self.terminal_error,
             "resume_kind": self.resume_kind,
             "resume_token_present": self.resume_token_present,
             "resume_turn_topic_id": self.resume_turn_topic_id,

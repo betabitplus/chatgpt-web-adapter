@@ -227,6 +227,8 @@ static NSString *ConversationIdFromURL(NSString *urlString) {
 @property(nonatomic, strong) NSString *streamTurnTraceId;
 @property(nonatomic, strong) NSString *streamClientMessageId;
 @property(nonatomic, strong) NSString *streamAssistantMessageId;
+@property(nonatomic, strong) NSString *streamTerminalErrorCode;
+@property(nonatomic, strong) NSString *streamTerminalError;
 @property(nonatomic, copy) NSString *brokerRequestId;
 @end
 
@@ -310,6 +312,22 @@ completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler {
                     if (completedConversationId.length > 0) {
                         self.streamConversationId = completedConversationId;
                     }
+                }
+                NSString *terminalErrorCode = [parsed[@"error_code"] isKindOfClass:[NSString class]]
+                    ? parsed[@"error_code"]
+                    : nil;
+                NSString *terminalError = [parsed[@"error"] isKindOfClass:[NSString class]]
+                    ? parsed[@"error"]
+                    : nil;
+                if (terminalErrorCode.length > 0) {
+                    self.streamTerminalErrorCode = terminalErrorCode.length > 128
+                        ? [terminalErrorCode substringToIndex:128]
+                        : terminalErrorCode;
+                }
+                if (terminalError.length > 0) {
+                    self.streamTerminalError = terminalError.length > 1000
+                        ? [terminalError substringToIndex:1000]
+                        : terminalError;
                 }
                 PrintEventForRequest(@{@"type":@"raw_ws_event",@"parsed":parsed}, self.brokerRequestId);
             }
@@ -3258,6 +3276,22 @@ int main(int argc, const char *argv[]) {
             return 21;
         }
 
+        // Assistant end_turn or a topic handoff proves enough to let Python start
+        // phase B, but neither proves the protected POST tail is empty. ChatGPT can
+        // emit a conversation-level terminal error after the final assistant
+        // message and before [DONE]. The broker may already have returned the
+        // early handoff to Python, so keep this helper alive in parallel and drain
+        // the already-open protected response to its natural terminal event.
+        if (
+            (streamTerminalCommitFence || topicHandoffCommitFence)
+            && delegate.streamStarted
+            && !delegate.streamEnded
+        ) {
+            while (!delegate.streamEnded && [deadline timeIntervalSinceNow] > 0) {
+                RunLoopFor(0.05);
+            }
+        }
+
         if (
             observeStream
             && streamObserveUntilEnd
@@ -3314,6 +3348,8 @@ int main(int argc, const char *argv[]) {
             @"stream_started":@(delegate.streamStarted),
             @"stream_ended":@(delegate.streamEnded),
             @"stream_terminal_observed":@(delegate.streamTerminalObserved),
+            @"terminal_error_code":delegate.streamTerminalErrorCode ?: @"",
+            @"terminal_error":delegate.streamTerminalError ?: @"",
             @"stream_resume_present":@(delegate.streamResumeToken.length > 0),
             @"stream_resume_handoff_written":@(resumeHandoffWritten),
             @"stream_handoff_observed":@(delegate.streamHandoffObserved),

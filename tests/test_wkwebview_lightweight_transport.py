@@ -21,7 +21,9 @@ def test_production_client_exposes_wk_lightweight_source_contract() -> None:
 
 
 class _Response:
-    def __init__(self, status_code: int, payload: dict, *, content: bytes = b"") -> None:
+    def __init__(
+        self, status_code: int, payload: dict, *, content: bytes = b""
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
         self.content = content
@@ -491,9 +493,7 @@ def test_lightweight_follow_topic_reports_quiet_and_stalled_server(
     assert "stream_handoff_server_stalled" in event_types
     assert "stream_handoff_server_resumed" in event_types
     stalled = next(
-        event
-        for event in events
-        if event["type"] == "stream_handoff_server_stalled"
+        event for event in events if event["type"] == "stream_handoff_server_stalled"
     )
     assert stalled["server_idle_seconds"] >= 0.004
     assert stalled["last_offset"] == stale_offset
@@ -573,9 +573,7 @@ def test_lightweight_follow_topic_stalled_complete_stream_status_terminates(
     assert result["completed"] is True
     assert result["reconnect_count"] == 0
     terminal = next(
-        event
-        for event in events
-        if event["type"] == "stream_handoff_terminal_status"
+        event for event in events if event["type"] == "stream_handoff_terminal_status"
     )
     assert terminal["stream_status"] == "COMPLETE"
     assert terminal["last_offset"] == stale_offset
@@ -953,7 +951,9 @@ def test_lightweight_follow_topic_accepts_revision_safe_passive_terminal(
     def on_event(event: dict) -> None:
         nonlocal terminal
         parsed = event.get("parsed")
-        message = parsed.get("v", {}).get("message") if isinstance(parsed, dict) else None
+        message = (
+            parsed.get("v", {}).get("message") if isinstance(parsed, dict) else None
+        )
         if isinstance(message, dict) and message.get("end_turn") is True:
             terminal = True
 
@@ -1191,7 +1191,9 @@ def test_ws_parser_captures_terminal_evidence_without_canonical_reconcile() -> N
     assert non_answer_state.get("stream_terminal_observed") is not True
 
 
-def test_lightweight_resume_raw_observer_crosses_segment_done_until_turn_stop(monkeypatch) -> None:
+def test_lightweight_resume_raw_observer_crosses_segment_done_until_turn_stop(
+    monkeypatch,
+) -> None:
     class RawSource(_SourceClient):
         def wk_transport_resume_state(self, resume_token: str, *, conversation_id: str):
             self.resume_calls.append((resume_token, conversation_id))
@@ -1231,6 +1233,20 @@ def test_lightweight_resume_raw_observer_crosses_segment_done_until_turn_stop(mo
                     },
                 }
             )
+            on_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "message": None,
+                        # Exact historical live shape: the Celsius terminal frame
+                        # supplied only error text and no error_code.
+                        "error": (
+                            "You've reached the maximum length for this conversation, "
+                            "but you can keep talking by starting a new chat."
+                        ),
+                    },
+                }
+            )
             assert should_stop() is True
             if on_token is not None:
                 on_token("done")
@@ -1252,7 +1268,9 @@ def test_lightweight_resume_raw_observer_crosses_segment_done_until_turn_stop(mo
         nonlocal turn_completed
         raw_events.append(event)
         parsed = event.get("parsed")
-        message = parsed.get("v", {}).get("message") if isinstance(parsed, dict) else None
+        message = (
+            parsed.get("v", {}).get("message") if isinstance(parsed, dict) else None
+        )
         if isinstance(message, dict) and message.get("end_turn") is True:
             turn_completed = True
 
@@ -1270,9 +1288,18 @@ def test_lightweight_resume_raw_observer_crosses_segment_done_until_turn_stop(mo
     )
 
     assert source.stop_on_done is False
-    assert [event["type"] for event in raw_events] == ["raw_ws_done", "raw_ws_event"]
+    assert [event["type"] for event in raw_events] == [
+        "raw_ws_done",
+        "raw_ws_event",
+        "raw_ws_event",
+    ]
     assert result["canonical_completed"] is False
     assert result["stream_finality_proven"] is True
+    assert result["terminal_error_code"] is None
+    assert result["terminal_error"] == (
+        "You've reached the maximum length for this conversation, "
+        "but you can keep talking by starting a new chat."
+    )
     assert result["message_id"] is None
     assert result["finish_reason"] == "stream_terminal"
     assert result["ws_token_events"] == 1
@@ -1371,7 +1398,9 @@ def test_lightweight_resume_raw_observer_reuses_follow_cursor_recovery_after_sil
     assert cached == []
 
 
-def test_lightweight_resume_canonical_reconcile_uses_bounded_backoff(monkeypatch) -> None:
+def test_lightweight_resume_canonical_reconcile_uses_bounded_backoff(
+    monkeypatch,
+) -> None:
     source = _SourceClient()
     transport, cached = _transport(source)
     final_payload = {"current_node": "node-final", "mapping": {"node-final": {}}}

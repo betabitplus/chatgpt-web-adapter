@@ -60,6 +60,9 @@ class BrowserNativeTurnResult:
     stream_message_id: str | None = None
     stream_finish_reason: str | None = None
     stream_model_slug: str | None = None
+    terminal_error_code: str | None = None
+    terminal_error: str | None = None
+    phase_one_tail_id: str | None = None
     stream_topic_id: str | None = None
     stream_resume_value: str | None = None
     stream_completion_sequence: int | None = None
@@ -490,6 +493,12 @@ class BrowserNativeTurnProvider:
             foreground_activation_observed=self._optional_bool(
                 response, "foregroundActivationObserved"
             ),
+            terminal_error_code=response.get("terminalErrorCode")
+            if isinstance(response.get("terminalErrorCode"), str)
+            else None,
+            terminal_error=response.get("terminalError")
+            if isinstance(response.get("terminalError"), str)
+            else None,
             browser_authority_lease_id=response_lease_id
             if isinstance(response_lease_id, str)
             else None,

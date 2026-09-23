@@ -1204,6 +1204,16 @@ class WKLightweightTransport:
             }:
                 last_topic_activity_at = now
 
+            if event_type == "raw_ws_event":
+                parsed = event.get("parsed")
+                if isinstance(parsed, dict):
+                    terminal_error_code = parsed.get("error_code")
+                    terminal_error = parsed.get("error")
+                    if isinstance(terminal_error_code, str) and terminal_error_code.strip():
+                        state["terminal_error_code"] = terminal_error_code.strip()[:128]
+                    if isinstance(terminal_error, str) and terminal_error.strip():
+                        state["terminal_error"] = terminal_error.strip()[:1000]
+
             if event_type in {"raw_ws_event", "raw_ws_done"}:
                 offset = event.get("offset")
                 normalized_offset = (
@@ -1513,6 +1523,8 @@ class WKLightweightTransport:
             "finish_reason": finish_reason,
             "observed_model": state.get("observed_model"),
             "observed_reasoning_effort": state.get("observed_reasoning_effort"),
+            "terminal_error_code": state.get("terminal_error_code"),
+            "terminal_error": state.get("terminal_error"),
             "stream_finality_proven": stream_finality_proven,
             "external_completion_observed": external_completion_observed,
             "terminal_stream_status": state.get("terminal_stream_status"),
@@ -1617,6 +1629,8 @@ class WKLightweightTransport:
                 "finish_reason": finish_reason,
                 "observed_model": observed_model,
                 "observed_reasoning_effort": observed_effort,
+                "terminal_error_code": state.get("terminal_error_code"),
+                "terminal_error": state.get("terminal_error"),
                 "ws_token_events": raw_sequence,
             }
         legacy_terminal = (
@@ -1649,6 +1663,8 @@ class WKLightweightTransport:
                 "finish_reason": finish_reason.strip(),
                 "observed_model": observed_model,
                 "observed_reasoning_effort": observed_effort,
+                "terminal_error_code": state.get("terminal_error_code"),
+                "terminal_error": state.get("terminal_error"),
                 "ws_token_events": raw_sequence,
                 "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
             }

@@ -62,6 +62,7 @@ _CANONICAL_RATE_LIMIT_BACKOFF_SECONDS = 15.0
 _PASSIVE_FINAL_RECONCILE_RETRY_SECONDS = 5.0
 _PASSIVE_FINAL_RECONCILE_SETTLE_SECONDS = 4.0
 _PASSIVE_TERMINAL_SETTLE_SECONDS = 1.5
+_POST_FINAL_TERMINAL_TAIL_SECONDS = 5.0
 _PASSIVE_STREAM_ENDED_RECONCILE_SECONDS = 5.0
 _PREWRITE_CANONICAL_COMPLETION_MAX_AGE_MS = 5_000
 _CANONICAL_INTERMEDIATE_MAX_TEXT_CHARS = 6_000
@@ -676,6 +677,7 @@ class CanonicalTopicStreamNormalizer:
         self.pending_thinking: dict[str, dict[str, Any]] = {}
         self.catchup_remaining = 0
         self.turn_completed = False
+        self.whole_turn_terminal_seen = False
         self.segment_kind: str | None = None
 
     def feed_transport_event(self, event: Any) -> list[dict[str, Any]]:
@@ -704,6 +706,11 @@ class CanonicalTopicStreamNormalizer:
         payload = event.get("parsed")
         if not isinstance(payload, dict):
             return []
+        terminal_error_code = payload.get("error_code")
+        if payload.get("type") == "message_stream_complete" or (
+            isinstance(terminal_error_code, str) and bool(terminal_error_code.strip())
+        ):
+            self.whole_turn_terminal_seen = True
         output: list[dict[str, Any]] = []
         self._process_payload(payload, output)
         source_offset = event.get("offset")
@@ -1668,7 +1675,8 @@ def submit_browser_native(
 
     stream_should_stop = _make_passive_terminal_stop_check(
         lambda: topic_normalizer.turn_completed,
-        settled=lambda: topic_normalizer.segment_kind is None,
+        settled=lambda: topic_normalizer.whole_turn_terminal_seen,
+        settle_seconds=_POST_FINAL_TERMINAL_TAIL_SECONDS,
     )
 
     def handle_write_identity(event: dict[str, Any]) -> None:
@@ -1901,6 +1909,8 @@ def await_browser_native_final(
         stream_message_id = submission.stream_state.message_id
     stream_finish_reason = getattr(turn, "stream_finish_reason", None)
     stream_model_slug = getattr(turn, "stream_model_slug", None)
+    terminal_error_code = getattr(turn, "terminal_error_code", None)
+    terminal_error = getattr(turn, "terminal_error", None)
     stream_finality_proven = (
         bool(getattr(turn, "stream_finality_proven", False))
         and submission.stream_state.observation_count > 0
@@ -1974,7 +1984,8 @@ def await_browser_native_final(
         deferred_should_stop = _make_passive_terminal_stop_check(
             lambda: topic_normalizer.turn_completed,
             cancelled=provider_stop_requested,
-            settled=lambda: topic_normalizer.segment_kind is None,
+            settled=lambda: topic_normalizer.whole_turn_terminal_seen,
+            settle_seconds=_POST_FINAL_TERMINAL_TAIL_SECONDS,
         )
         deferred_result = follow_submitted_turn(
             turn,
@@ -2020,6 +2031,26 @@ def await_browser_native_final(
         )
         if isinstance(candidate_model, str) and candidate_model.strip():
             stream_model_slug = candidate_model.strip()
+        candidate_terminal_error_code = (
+            deferred_result.get("terminal_error_code")
+            if isinstance(deferred_result, dict)
+            else None
+        )
+        candidate_terminal_error = (
+            deferred_result.get("terminal_error")
+            if isinstance(deferred_result, dict)
+            else None
+        )
+        if (
+            isinstance(candidate_terminal_error_code, str)
+            and candidate_terminal_error_code.strip()
+        ):
+            terminal_error_code = candidate_terminal_error_code.strip()
+        if (
+            isinstance(candidate_terminal_error, str)
+            and candidate_terminal_error.strip()
+        ):
+            terminal_error = candidate_terminal_error.strip()
         normalizer_finality_proven = bool(
             topic_normalizer.turn_completed and topic_normalizer.segment_kind is None
         )
@@ -2282,6 +2313,32 @@ def await_browser_native_final(
             canonical_payload = None
             canonical_payload_read_count = None
 
+    consume_submitted_turn_tail = getattr(
+        provider,
+        "consume_submitted_turn_tail",
+        None,
+    )
+    if (
+        callable(consume_submitted_turn_tail)
+        and isinstance(getattr(turn, "phase_one_tail_id", None), str)
+        and bool(getattr(turn, "phase_one_tail_id", "").strip())
+    ):
+        tail_remaining = max(
+            0.0,
+            submission.timeout - (time.monotonic() - submission.started_monotonic),
+        )
+        terminal_tail = consume_submitted_turn_tail(
+            turn,
+            timeout=min(2.0, tail_remaining),
+        )
+        if isinstance(terminal_tail, dict):
+            tail_code = terminal_tail.get("terminal_error_code")
+            tail_error = terminal_tail.get("terminal_error")
+            if isinstance(tail_code, str) and tail_code.strip():
+                terminal_error_code = tail_code.strip()
+            if isinstance(tail_error, str) and tail_error.strip():
+                terminal_error = tail_error.strip()
+
     stopped_by_user = stopped_by_user or provider_stop_requested()
     result_finish_reason = "stopped" if stopped_by_user else final_message.finish_reason
 
@@ -2337,6 +2394,8 @@ def await_browser_native_final(
                 if not stopped_by_user and not incomplete_without_terminal
                 else None
             ),
+            terminal_error_code=terminal_error_code,
+            terminal_error=terminal_error,
             turn_exchange_id=observed_turn_exchange_id,
         ),
     )

@@ -1006,6 +1006,12 @@ class WKTurnOrchestrator:
             stream_message_id = resume_payload.get("message_id")
             stream_finish_reason = resume_payload.get("finish_reason")
             stream_model_slug = resume_payload.get("observed_model")
+            terminal_error_code = resume_payload.get("terminal_error_code")
+            terminal_error = resume_payload.get("terminal_error")
+            if isinstance(terminal_error_code, str) and terminal_error_code.strip():
+                payload["terminal_error_code"] = terminal_error_code.strip()[:128]
+            if isinstance(terminal_error, str) and terminal_error.strip():
+                payload["terminal_error"] = terminal_error.strip()[:1000]
             stream_finality_proven = (
                 resume_payload.get("stream_finality_proven") is True
             )
@@ -1179,6 +1185,24 @@ class WKTurnOrchestrator:
             stream_model_slug=(
                 payload.get("_cwa_stream_model_slug")
                 if isinstance(payload.get("_cwa_stream_model_slug"), str)
+                else None
+            ),
+            terminal_error_code=(
+                payload.get("terminal_error_code")
+                if isinstance(payload.get("terminal_error_code"), str)
+                and payload.get("terminal_error_code").strip()
+                else None
+            ),
+            terminal_error=(
+                payload.get("terminal_error")
+                if isinstance(payload.get("terminal_error"), str)
+                and payload.get("terminal_error").strip()
+                else None
+            ),
+            phase_one_tail_id=(
+                payload.get("_cwa_turn_broker_tail_id")
+                if isinstance(payload.get("_cwa_turn_broker_tail_id"), str)
+                and payload.get("_cwa_turn_broker_tail_id").strip()
                 else None
             ),
             stream_topic_id=(

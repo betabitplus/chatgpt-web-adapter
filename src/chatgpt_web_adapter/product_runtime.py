@@ -153,6 +153,20 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             )
         return helper(conversation, timeout=timeout)
 
+    def conversation_ui_state(
+        self,
+        conversation: Any,
+        *,
+        timeout: float = 8.0,
+    ) -> dict[str, Any] | None:
+        ref = ConversationRef.from_any(conversation)
+        provider = getattr(self.write_transport, "provider", None)
+        inspect = getattr(provider, "conversation_ui_state", None)
+        if not callable(inspect):
+            return None
+        result = inspect(ref, timeout=timeout)
+        return dict(result) if isinstance(result, dict) else None
+
     def list_conversations(self) -> list[dict[str, Any]]:
         helper = getattr(self.canonical, "list_conversations", None)
         if not callable(helper):

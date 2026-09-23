@@ -669,6 +669,23 @@ static NSString *ReadinessScript(void) {
             sendResolver];
 }
 
+static NSString *ConversationUIStateScript(void) {
+    return @"(()=>{"
+            "const body=(document.body&&document.body.innerText)||'';"
+            "const tail=body.slice(-7000);"
+            "const buttons=[...document.querySelectorAll('button')].map(b=>String(b.innerText||b.getAttribute('aria-label')||'').trim()).filter(Boolean).slice(-40);"
+            "const text=(tail+'\\n'+buttons.join('\\n')).toLowerCase();"
+            "let code=null,scope=null,status=null,detail=null;"
+            "if(/maximum length for this conversation|reached the maximum length|достигли максимальной длины этого обсуждения|максимальной длины этого обсуждения/.test(text)){code='conversation_too_large';scope='chat';status='limit-reached';detail='This conversation reached its maximum length; start a new chat to continue.';}"
+            "else if(/message delivery timed out|delivery timed out|время доставки сообщения истекло/.test(text)){code='delivery_timeout';scope='turn';status='delivery-timeout';detail='ChatGPT reports that delivery of the last turn timed out; the web UI may offer Retry.';}"
+            "else if(/something went wrong|there was an error generating|что-то пошло не так|произошла ошибка при создании ответа/.test(text)){code='response_error';scope='turn';status='abnormal';detail='ChatGPT web UI reports an error for the last turn; Retry may be available.';}"
+            "else if(/unable to load conversation|conversation not found|не удалось загрузить (чат|беседу|обсуждение)|чат не найден|беседа не найдена/.test(text)){code='conversation_unavailable';scope='chat';status='unavailable';detail='ChatGPT web UI cannot load this conversation.';}"
+            "else if(/unusual activity|verify you are human|just a moment|подтвердите, что вы человек|необычная активность/.test(text)){code='access_challenge';scope='session';status='blocked';detail='ChatGPT web UI is blocked by an access or verification challenge.';}"
+            "const nodes=[...document.querySelectorAll('[data-message-id]')];const latestMessageId=nodes.length?(nodes[nodes.length-1].getAttribute('data-message-id')||null):null;"
+            "return JSON.stringify({code,scope,status,detail,latestMessageId,hasRetry:buttons.some(x=>/^(retry|try again|повторить|попробовать снова)$/i.test(x)),hasStartNewChat:buttons.some(x=>/start new chat|начать новый чат/i.test(x))});"
+            "})()";
+}
+
 static NSString *ComposerDiagnosticsScript(void) {
     NSString *resolver = ComposerResolverSource();
     return [NSString stringWithFormat:
@@ -2477,6 +2494,8 @@ int main(int argc, const char *argv[]) {
         BOOL observeOnly = observeConversation.length > 0;
         NSString *domObserveConversation = RequestString(request, @"dom_observe_conversation", ArgValue(args, @"--dom-observe-conversation", @""));
         BOOL domObserveOnly = domObserveConversation.length > 0;
+        NSString *uiStateConversation = RequestString(request, @"ui_state_conversation", ArgValue(args, @"--ui-state-conversation", @""));
+        BOOL uiStateOnly = uiStateConversation.length > 0;
         NSTimeInterval observerPollInterval = RequestDouble(request, @"poll_interval", [ArgValue(args, @"--poll-interval", @"1.0") doubleValue]);
         NSString *catalog = [RequestString(request, @"catalog", ArgValue(args, @"--catalog", @"")) lowercaseString];
         BOOL catalogOnly = catalog.length > 0;
@@ -2495,7 +2514,7 @@ int main(int argc, const char *argv[]) {
         BOOL streamObserveUntilResumeToken = RequestBool(request, @"stream_observe_until_resume_token", HasArg(args, @"--observe-stream-until-resume-token"));
         BOOL minimalSecurityShell = RequestBool(request, @"minimal_security_shell", HasArg(args, @"--minimal-security-shell"));
         BOOL readOnly = canonicalOnly || catalogOnly || observeOnly || resumeOnly || stopOnly;
-        NSInteger operationModeCount = (canonicalOnly ? 1 : 0) + (catalogOnly ? 1 : 0) + (observeOnly ? 1 : 0) + (resumeOnly ? 1 : 0) + (domObserveOnly ? 1 : 0) + (stopOnly ? 1 : 0);
+        NSInteger operationModeCount = (canonicalOnly ? 1 : 0) + (catalogOnly ? 1 : 0) + (observeOnly ? 1 : 0) + (resumeOnly ? 1 : 0) + (domObserveOnly ? 1 : 0) + (uiStateOnly ? 1 : 0) + (stopOnly ? 1 : 0);
         if (operationModeCount > 1) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_READ_MODE_CONFLICT"});
             return 18;
@@ -2514,14 +2533,15 @@ int main(int argc, const char *argv[]) {
             urlString = @"https://chatgpt.com/robots.txt";
         }
         if (domObserveOnly) urlString = [@"https://chatgpt.com/c/" stringByAppendingString:domObserveConversation];
+        if (uiStateOnly) urlString = [@"https://chatgpt.com/c/" stringByAppendingString:uiStateConversation];
         if (timeout <= 0) timeout = 150;
         if (observerPollInterval <= 0) observerPollInterval = 1.0;
-        if (!stopOnly && !readOnly && !domObserveOnly && prompt == nil) {
+        if (!stopOnly && !readOnly && !domObserveOnly && !uiStateOnly && prompt == nil) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_PROMPT_BASE64_INVALID"});
             return 2;
         }
         if (minimalSecurityShell && (
-            readOnly || domObserveOnly || attachments.count > 0
+            readOnly || domObserveOnly || uiStateOnly || attachments.count > 0
             || !observeSubmit || !observeStream || !streamObserveUntilResumeToken
         )) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_MINIMAL_SECURITY_MODE_UNSUPPORTED"});
@@ -2971,9 +2991,13 @@ int main(int argc, const char *argv[]) {
                 }
                 if (stopOnly) {
                     if ([snapshot[@"stop"] boolValue]) break;
-                } else if (domObserveOnly) {
+                } else if (domObserveOnly || uiStateOnly) {
                     NSString *latestMessageId = [snapshot[@"latestMessageId"] isKindOfClass:[NSString class]] ? snapshot[@"latestMessageId"] : nil;
-                    if (latestMessageId.length > 0 || [snapshot[@"stop"] boolValue]) break;
+                    if (
+                        latestMessageId.length > 0
+                        || [snapshot[@"stop"] boolValue]
+                        || [snapshot[@"composer"] boolValue]
+                    ) break;
                 } else {
                     BOOL parentReady = YES;
                     if (expectedCurrentNode.length > 0) {
@@ -2988,6 +3012,26 @@ int main(int argc, const char *argv[]) {
                 }
             }
             EvaluateSync(webView, ScrollBottomScript(), 0.5, nil);
+        }
+
+        if (uiStateOnly) {
+            RunLoopFor(MIN(0.6, MAX(0.0, [deadline timeIntervalSinceNow])));
+            NSDictionary *uiState = ParseJSONResult(
+                EvaluateSync(webView, ConversationUIStateScript(), 1.5, nil)
+            );
+            if (uiState == nil) {
+                PrintResult(@{
+                    @"ok":@NO,
+                    @"error":@"WKWEBVIEW_UI_STATE_INSPECTION_FAILED",
+                    @"conversation_id":uiStateConversation
+                });
+                return 41;
+            }
+            NSMutableDictionary *result = [uiState mutableCopy];
+            result[@"ok"] = @YES;
+            result[@"conversation_id"] = uiStateConversation;
+            PrintResult(result);
+            return 0;
         }
 
         if (domObserveOnly) {

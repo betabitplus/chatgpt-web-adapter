@@ -101,6 +101,49 @@ def _final_canonical_for_prompt(prompt: str, *, assistant_text: str = "done") ->
     }
 
 
+def test_wkwebview_conversation_ui_state_is_one_shot_read_only(monkeypatch) -> None:
+    provider = WKWebViewTurnProvider()
+    calls = []
+
+    monkeypatch.setattr(provider, "_ensure_helper", lambda: Path("/tmp/wk-helper"))
+
+    def run_helper(invocation, *, timeout):
+        calls.append((invocation, timeout))
+        return {
+            "ok": True,
+            "conversation_id": "conversation-1",
+            "code": "response_error",
+            "scope": "turn",
+            "status": "abnormal",
+            "detail": "ChatGPT web UI reports an error for the last turn; Retry may be available.",
+            "latestMessageId": "assistant-1",
+            "hasRetry": True,
+            "hasStartNewChat": False,
+        }
+
+    monkeypatch.setattr(provider, "_run_helper", run_helper)
+
+    result = provider.conversation_ui_state("conversation-1", timeout=9.0)
+
+    invocation, timeout = calls[0]
+    assert timeout == 9.0
+    assert invocation.request == {
+        "ui_state_conversation": "conversation-1",
+        "timeout": 9.0,
+    }
+    assert result == {
+        "conversation_id": "conversation-1",
+        "code": "response_error",
+        "scope": "turn",
+        "status": "abnormal",
+        "detail": "ChatGPT web UI reports an error for the last turn; Retry may be available.",
+        "latest_message_id": "assistant-1",
+        "has_retry": True,
+        "has_start_new_chat": False,
+        "source": "web-ui",
+    }
+
+
 def test_wkwebview_probe_stream_status_is_one_shot_and_fail_soft(monkeypatch) -> None:
     provider = WKWebViewTurnProvider()
     calls = []
@@ -1899,10 +1942,16 @@ def test_wkwebview_stop_accepts_product_stop_control_click_without_canonical_pol
     )
 
     def fail_if_network_stop_proof_runs(*args, **kwargs):
-        raise AssertionError("product Stop control click is already explicit stop proof")
+        raise AssertionError(
+            "product Stop control click is already explicit stop proof"
+        )
 
-    monkeypatch.setattr(provider, "_wait_for_stream_stop_proof", fail_if_network_stop_proof_runs)
-    monkeypatch.setattr(provider, "_wait_for_canonical_stop_proof", fail_if_network_stop_proof_runs)
+    monkeypatch.setattr(
+        provider, "_wait_for_stream_stop_proof", fail_if_network_stop_proof_runs
+    )
+    monkeypatch.setattr(
+        provider, "_wait_for_canonical_stop_proof", fail_if_network_stop_proof_runs
+    )
 
     result = provider.stop_generation("conversation-1", timeout=5)
 
@@ -3178,27 +3227,41 @@ def test_minimal_security_shell_request_client_is_optional_for_continuation() ->
     ).read_text(encoding="utf-8")
 
     shared_init = source[
-        source.index("const loadSharedConversationInitialization = async () => {"):
-        source.index("const loadSharedModelCatalog = async", source.index("const loadSharedConversationInitialization = async () => {"))
+        source.index(
+            "const loadSharedConversationInitialization = async () => {"
+        ) : source.index(
+            "const loadSharedModelCatalog = async",
+            source.index("const loadSharedConversationInitialization = async () => {"),
+        )
     ]
     assert "let officialApiClient = null;" in shared_init
     assert "const loadedApiClient = await loadOfficialApiClient();" in shared_init
     assert "catch (_)" in shared_init
     assert "officialApiClient = null;" in shared_init
-    assert "officialConversationTransport: runtime.officialConversationTransport" in shared_init
+    assert (
+        "officialConversationTransport: runtime.officialConversationTransport"
+        in shared_init
+    )
 
     prepare_start = source.index("const prepareConversation = async ({")
     prepare_end = source.index("let lastBrokerResumeToken", prepare_start)
     prepare = source[prepare_start:prepare_end]
-    fallback_start = prepare.index("const firstToken = await runPrepare({", prepare.index("if (officialApiClient)"))
+    fallback_start = prepare.index(
+        "const firstToken = await runPrepare({", prepare.index("if (officialApiClient)")
+    )
     fallback = prepare[fallback_start:]
     second_start = fallback.index("const secondPromise = runPrepare({")
-    submit_ready = fallback.index('if (typeof onSubmitReady === "function") onSubmitReady();')
+    submit_ready = fallback.index(
+        'if (typeof onSubmitReady === "function") onSubmitReady();'
+    )
     await_second = fallback.index("const secondToken = await secondPromise;")
     assert second_start < submit_ready < await_second
 
     entrypoint = source.rsplit("  (async () => {", 1)[1]
-    assert "onSubmitReady: conversationId && !temporary ? resolveSubmitReady : null" in entrypoint
+    assert (
+        "onSubmitReady: conversationId && !temporary ? resolveSubmitReady : null"
+        in entrypoint
+    )
 
 
 def test_wkwebview_status_does_not_hide_programming_errors(monkeypatch) -> None:
@@ -3334,7 +3397,9 @@ def test_wkwebview_identity_recovery_switches_to_passive_topic_after_one_read(
         }
 
     monkeypatch.setattr(provider, "_resume_via_curl_ws_topic_second_leg", follow_topic)
-    monkeypatch.setattr(provider, "cache_continuation_cursor", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        provider, "cache_continuation_cursor", lambda *args, **kwargs: None
+    )
 
     passive = provider._turn_orchestrator.resume_after_phase_one(
         payload,
@@ -3345,7 +3410,7 @@ def test_wkwebview_identity_recovery_switches_to_passive_topic_after_one_read(
         total_timeout=30,
         started=time.monotonic(),
         streaming=True,
-        make_stream_relay=lambda: (lambda _event: None),
+        make_stream_relay=lambda: lambda _event: None,
     )
 
     assert passive is False
@@ -3464,7 +3529,6 @@ def test_wkwebview_verified_completion_reuses_canonical_without_second_read(
     assert result["_cwa_identity_recovery_kind"] == "passive_completion"
     assert result["stream_terminal_observed"] is True
     assert result["_cwa_stream_finality_proven"] is True
-
 
 
 def test_wkwebview_completion_check_captures_baseline_before_observer_start() -> None:
@@ -3712,8 +3776,7 @@ def test_wkwebview_observer_uses_conservative_canonical_poll_interval(
 
 def test_wk_turn_broker_multiplexes_concurrent_normal_writes_request_locally() -> None:
     root = (
-        Path(__file__).resolve().parents[1]
-        / "src/chatgpt_web_adapter/wkwebview_helper"
+        Path(__file__).resolve().parents[1] / "src/chatgpt_web_adapter/wkwebview_helper"
     )
     helper = (root / "WKChatGPTAuthority.m").read_text(encoding="utf-8")
     shell = (root / "minimal_security_shell.js").read_text(encoding="utf-8")
@@ -3759,7 +3822,9 @@ def test_wkwebview_helper_drains_post_final_tail_and_exports_terminal_error() ->
 
     assert 'parsed[@"error_code"]' in source
     assert 'parsed[@"error"]' in source
-    assert "while (!delegate.streamEnded && [deadline timeIntervalSinceNow] > 0)" in source
+    assert (
+        "while (!delegate.streamEnded && [deadline timeIntervalSinceNow] > 0)" in source
+    )
     assert '@"terminal_error_code":delegate.streamTerminalErrorCode ?: @""' in source
     assert '@"terminal_error":delegate.streamTerminalError ?: @""' in source
 
@@ -4056,7 +4121,9 @@ def test_lightweight_phase_one_does_not_use_global_heavy_submit_gate() -> None:
             return True
 
         def _heavy_submit_gate(self, timeout: float):
-            raise AssertionError("lightweight phase one must not enter global heavy submit gate")
+            raise AssertionError(
+                "lightweight phase one must not enter global heavy submit gate"
+            )
 
         def _run_helper_streaming(
             self,

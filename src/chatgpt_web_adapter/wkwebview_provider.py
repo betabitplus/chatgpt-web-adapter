@@ -1571,6 +1571,37 @@ class WKWebViewTurnProvider:
             request=request,
         )
 
+    def conversation_ui_state(
+        self,
+        conversation: str | ConversationRef,
+        *,
+        timeout: float = 8.0,
+    ) -> dict[str, Any]:
+        ref = ConversationRef.from_any(conversation)
+        bounded_timeout = max(2.0, min(float(timeout), 20.0))
+        binary = self._ensure_helper()
+        payload = self._run_helper(
+            _WKHelperInvocation(
+                command=[str(binary), "--timeout", f"{bounded_timeout:.3f}"],
+                request={
+                    "ui_state_conversation": ref.conversation_id,
+                    "timeout": bounded_timeout,
+                },
+            ),
+            timeout=bounded_timeout,
+        )
+        return {
+            "conversation_id": ref.conversation_id,
+            "code": payload.get("code"),
+            "scope": payload.get("scope"),
+            "status": payload.get("status"),
+            "detail": payload.get("detail"),
+            "latest_message_id": payload.get("latestMessageId"),
+            "has_retry": payload.get("hasRetry") is True,
+            "has_start_new_chat": payload.get("hasStartNewChat") is True,
+            "source": "web-ui",
+        }
+
     def _run_helper(
         self,
         invocation: list[str] | _WKHelperInvocation,

@@ -2683,6 +2683,9 @@ def test_canonical_intermediate_events_emit_completed_blocks_and_redact_sensitiv
     ]
     assert events[0]["text"] == "Reading files…"
     assert events[1]["label"] == "Reading README…"
+    assert events[1]["tool_call_id"] == "m-call"
+    assert events[2]["tool_call_id"] == "m-call"
+    assert events[2]["parent_message_id"] == "m-call"
     assert events[1]["source_time_ms"] == 1789764263550
     assert sensitive_value not in events[1]["text"]
     assert "[REDACTED]" in events[1]["text"]
@@ -3608,3 +3611,58 @@ def test_passive_observer_stream_start_failure_falls_back_to_bounded_canonical_r
         and "PASSIVE_OBSERVER_STREAM_NOT_OBSERVED" in event.get("reason", "")
         for event in delivered
     )
+
+
+def test_topic_stream_normalizer_preserves_explicit_tool_call_identity() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+    output = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "result-explicit",
+                        "author": {"role": "tool", "name": "api_tool.call_tool"},
+                        "recipient": "all",
+                        "channel": "commentary",
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["ok"]},
+                        "metadata": {
+                            "tool_call_id": "call-exact-1",
+                            "turn_exchange_id": "turn-1",
+                        },
+                    }
+                }
+            },
+        }
+    )
+    result = next(
+        event for event in output if event.get("message_kind") == "tool_result"
+    )
+    assert result["tool_call_id"] == "call-exact-1"
+
+
+def test_topic_stream_normalizer_does_not_invent_tool_call_identity() -> None:
+    normalizer = CanonicalTopicStreamNormalizer()
+    output = normalizer.feed_transport_event(
+        {
+            "type": "raw_ws_event",
+            "parsed": {
+                "v": {
+                    "message": {
+                        "id": "result-no-id",
+                        "author": {"role": "tool", "name": "api_tool.call_tool"},
+                        "recipient": "all",
+                        "channel": "commentary",
+                        "status": "finished_successfully",
+                        "content": {"content_type": "text", "parts": ["ok"]},
+                        "metadata": {"turn_exchange_id": "turn-1"},
+                    }
+                }
+            },
+        }
+    )
+    result = next(
+        event for event in output if event.get("message_kind") == "tool_result"
+    )
+    assert "tool_call_id" not in result

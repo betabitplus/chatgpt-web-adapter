@@ -232,6 +232,63 @@ def _node_turn_exchange_id(node: dict[str, Any]) -> str | None:
     return None
 
 
+def _explicit_tool_call_id(
+    message: dict[str, Any], metadata: dict[str, Any]
+) -> str | None:
+    """Return only an explicitly declared tool-call identity.
+
+    Do not treat generic parent/message ids as tool identities here: raw stream
+    envelopes are not guaranteed to make that relationship semantic. Canonical
+    conversation graphs are handled separately where parentage can be proven.
+    """
+    for container in (metadata, message):
+        for key in (
+            "tool_call_id",
+            "toolCallId",
+            "call_id",
+            "callId",
+            "invocation_id",
+            "invocationId",
+        ):
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _message_identity_from_node(node_id: str, node: dict[str, Any]) -> str:
+    message = node.get("message")
+    if isinstance(message, dict):
+        value = message.get("id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return node_id
+
+
+def _canonical_parent_tool_call_id(
+    node: dict[str, Any],
+    branch_by_id: dict[str, dict[str, Any]],
+) -> str | None:
+    """Resolve a result to its exact parent call only when the graph proves it."""
+    parent = node.get("parent")
+    if not isinstance(parent, str) or not parent.strip():
+        return None
+    parent_id = parent.strip()
+    parent_node = branch_by_id.get(parent_id)
+    if not isinstance(parent_node, dict):
+        return None
+    parent_message = parent_node.get("message")
+    if not isinstance(parent_message, dict):
+        return None
+    author = parent_message.get("author")
+    if not isinstance(author, dict) or author.get("role") != "assistant":
+        return None
+    recipient = parent_message.get("recipient")
+    if not isinstance(recipient, str) or recipient.strip() in {"", "all"}:
+        return None
+    return _message_identity_from_node(parent_id, parent_node)
+
+
 def _redact_intermediate_value(value: Any, *, depth: int = 0) -> Any:
     if depth > 8:
         return "[TRUNCATED]"
@@ -362,7 +419,9 @@ def _canonical_intermediate_events(
 ) -> list[dict[str, Any]]:
     current_node = payload.get("current_node")
     events: list[dict[str, Any]] = []
-    for node_id, node in _current_branch_nodes(payload):
+    branch = _current_branch_nodes(payload)
+    branch_by_id = {node_id: node for node_id, node in branch}
+    for node_id, node in branch:
         raw_message = node.get("message")
         if not isinstance(raw_message, dict):
             continue
@@ -467,6 +526,22 @@ def _canonical_intermediate_events(
             if isinstance(tool_name, str) and tool_name.strip()
             else None,
         }
+        if kind == "tool_call":
+            event["tool_call_id"] = message_id
+        elif kind == "tool_result":
+            tool_call_id = (
+                _canonical_parent_tool_call_id(node, branch_by_id)
+                or _explicit_tool_call_id(raw_message, metadata)
+            )
+            if tool_call_id is not None:
+                event["tool_call_id"] = tool_call_id
+            parent = node.get("parent")
+            if isinstance(parent, str) and parent.strip():
+                parent_node = branch_by_id.get(parent.strip())
+                if isinstance(parent_node, dict):
+                    event["parent_message_id"] = _message_identity_from_node(
+                        parent.strip(), parent_node
+                    )
         if kind == "tool_call":
             create_time = raw_message.get("create_time")
             if (
@@ -957,6 +1032,7 @@ class CanonicalTopicStreamNormalizer:
                     "text": _sanitize_intermediate_text(extract_message_text(message)),
                     "label": label or "Using tool...",
                     "tool_name": recipient,
+                    "tool_call_id": message_id,
                 }
             )
             return
@@ -975,16 +1051,18 @@ class CanonicalTopicStreamNormalizer:
                 if isinstance(raw_name, str) and raw_name.strip()
                 else recipient
             )
-            output.append(
-                {
-                    "type": "canonical_intermediate_message",
-                    "message_id": message_id,
-                    "message_kind": "tool_result",
-                    "text": _sanitize_intermediate_text(extract_message_text(message)),
-                    "label": metadata.get("tool_invoked_message"),
-                    "tool_name": tool_name,
-                }
-            )
+            result_event = {
+                "type": "canonical_intermediate_message",
+                "message_id": message_id,
+                "message_kind": "tool_result",
+                "text": _sanitize_intermediate_text(extract_message_text(message)),
+                "label": metadata.get("tool_invoked_message"),
+                "tool_name": tool_name,
+            }
+            tool_call_id = _explicit_tool_call_id(message, metadata)
+            if tool_call_id is not None:
+                result_event["tool_call_id"] = tool_call_id
+            output.append(result_event)
             return
 
         if content_type == "tether_browsing_display":

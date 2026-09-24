@@ -6,6 +6,7 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+- security: serialize auth read-modify-write across processes with a shared kernel-backed file lock, clamp POSIX auth and lock files to owner-only permissions, and make doctor fail on unsafe auth ownership/mode
 ## 0.3.1 - 2026-09-11
 
 - macOS WKWebView authority: harden the self-contained macOS 12+ backend around a globally serialized minimal WebKit protected-write phase, browser-issued resume fencing, lightweight curl/WebSocket continuation, and canonical finality without retaining the full ChatGPT SPA

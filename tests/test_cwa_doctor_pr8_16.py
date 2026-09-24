@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 import chatgpt_web_adapter.cli_v02 as cli
 import chatgpt_web_adapter.doctor as doctor
@@ -201,8 +204,54 @@ def test_auth_checks_never_export_token_or_cookie_values(monkeypatch, tmp_path: 
 
     assert "access_token" not in payload.lower() or "access_token_present" in payload
     assert "session_cookie_present" in payload
+    assert "auth.file_permissions" in payload
     assert "secret-token-value" not in payload
     assert "cookie-value" not in payload
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership/mode checks do not apply")
+def test_auth_file_permissions_check_accepts_owner_only_file(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}\n", encoding="utf-8")
+    auth_file.chmod(0o600)
+
+    check = doctor._auth_file_permissions_check(auth_file)
+
+    assert check.status is DoctorCheckStatus.PASS
+    assert check.evidence["mode"] == "0600"
+    assert check.evidence["owner_matches"] is True
+    assert check.evidence["owner_only"] is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership/mode checks do not apply")
+def test_auth_file_permissions_check_rejects_group_or_other_access(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}\n", encoding="utf-8")
+    auth_file.chmod(0o644)
+
+    check = doctor._auth_file_permissions_check(auth_file)
+
+    assert check.status is DoctorCheckStatus.FAIL
+    assert check.required is True
+    assert check.evidence["mode"] == "0644"
+    assert "chmod 600" in (check.remediation or "")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership/mode checks do not apply")
+def test_auth_file_permissions_check_rejects_unexpected_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}\n", encoding="utf-8")
+    auth_file.chmod(0o600)
+    actual_uid = auth_file.stat().st_uid
+    monkeypatch.setattr(doctor.os, "getuid", lambda: actual_uid + 1)
+
+    check = doctor._auth_file_permissions_check(auth_file)
+
+    assert check.status is DoctorCheckStatus.FAIL
+    assert check.evidence["owner_matches"] is False
 
 
 def test_install_checks_validate_packaged_extension_and_host(monkeypatch, tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import re
+import stat
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -179,6 +180,55 @@ def _safe_error(error: BaseException) -> dict[str, str]:
     return {"type": type(error).__name__, "message": str(error)}
 
 
+def _auth_file_permissions_check(path: Path) -> DoctorCheck:
+    if os.name == "nt":
+        return _skip(
+            "auth.file_permissions",
+            "auth",
+            "POSIX authorization-file permissions do not apply on Windows",
+        )
+
+    try:
+        info = path.stat()
+    except OSError as error:
+        return _fail(
+            "auth.file_permissions",
+            "auth",
+            "Authorization-file permissions could not be inspected",
+            evidence=_safe_error(error),
+            remediation="Repair the authorization file or run `cwa auth login --force`.",
+        )
+
+    mode = stat.S_IMODE(info.st_mode)
+    current_uid = os.getuid()
+    owner_matches = info.st_uid == current_uid
+    owner_only = (mode & 0o077) == 0
+    evidence = {
+        "mode": f"{mode:04o}",
+        "owner_uid": info.st_uid,
+        "current_uid": current_uid,
+        "owner_matches": owner_matches,
+        "owner_only": owner_only,
+    }
+    if owner_matches and owner_only:
+        return _pass(
+            "auth.file_permissions",
+            "auth",
+            "Authorization file is restricted to its owner",
+            evidence=evidence,
+        )
+
+    return _fail(
+        "auth.file_permissions",
+        "auth",
+        "Authorization file permissions are unsafe",
+        evidence=evidence,
+        remediation=(
+            f"Restrict the authorization file to its owner (for example: chmod 600 {path})."
+        ),
+    )
+
+
 def _environment_checks() -> list[DoctorCheck]:
     checks: list[DoctorCheck] = []
     version = tuple(sys.version_info[:3])
@@ -314,6 +364,8 @@ def _auth_checks(
             )
         )
         return checks
+
+    checks.append(_auth_file_permissions_check(status.auth_file))
 
     if status.access_token_present or status.session_cookie_present:
         checks.append(

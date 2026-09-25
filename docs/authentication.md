@@ -11,7 +11,7 @@ Install the browser extra required by the legacy interactive login flow, and add
 python -m pip install "chatgpt-web-adapter[browser,secret-store]"
 ```
 
-`secret-store` installs the mature Python `keyring` abstraction (macOS Keychain, Windows Credential Manager, and supported Linux Secret Service backends). CWA still supports an explicit owner-only file fallback for portable/headless environments.
+`secret-store` installs the mature Python `keyring` abstraction. CWA accepts only OS-backed secure providers (macOS Keychain, Windows Credential Manager, and supported Linux Secret Service/KWallet-style backends); plaintext/null alternatives such as `keyrings.alt` are treated as unavailable, so `auto` falls back to the owner-only file backend instead of mislabeling plaintext as an OS credential store. CWA still supports that explicit file fallback for portable/headless environments.
 
 ## First Login
 
@@ -101,7 +101,7 @@ chatgpt-web-adapter auth migrate --auth-file auth_data.json --backend keyring
 chatgpt-web-adapter auth migrate --auth-file auth_data.json --backend file
 ```
 
-Migration never deletes the last usable credential set before the target copy exists. `auth migrate --backend file` writes the private file first and then deletes the OS-store item; a deletion failure is reported instead of being hidden.
+Migration never deletes the last usable credential set before the target copy exists. `auth migrate --backend file` writes the private file first and then deletes the OS-store item; a deletion failure is reported instead of being hidden. If an OS-store write succeeded but the non-secret metadata pointer was lost or could not be written, status/login can still discover the deterministic keyring entry and `auth migrate --backend keyring` recreates the metadata pointer without copying the secret back to plaintext.
 
 Remove reusable local authorization with:
 

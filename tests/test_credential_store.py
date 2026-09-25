@@ -286,3 +286,99 @@ def test_file_migration_delete_failure_keeps_both_usable_copies(
     assert (credential_store.CREDENTIAL_STORE_SERVICE, account) in fake.values
     fake.fail_delete = False
     assert load_auth_data(path).accessToken == sensitive
+
+
+def _backend(module: str, name: str = "Keyring", *, children=None):
+    cls = type(name, (), {"priority": 1})
+    cls.__module__ = module
+    backend = cls()
+    if children is not None:
+        backend.backends = list(children)
+    return backend
+
+
+def test_secure_backend_policy_accepts_os_stores_and_rejects_plaintext() -> None:
+    secure = _backend("keyring.backends.macOS")
+    insecure = _backend("keyrings.alt.file", "PlaintextKeyring")
+    unknown = _backend("thirdparty.keyring")
+    secure_chain = _backend(
+        "keyring.backends.chainer",
+        "ChainerBackend",
+        children=[secure, insecure],
+    )
+    insecure_chain = _backend(
+        "keyring.backends.chainer",
+        "ChainerBackend",
+        children=[insecure, secure],
+    )
+
+    assert credential_store._keyring_backend_is_secure(secure) is True
+    assert credential_store._keyring_backend_is_secure(insecure) is False
+    assert credential_store._keyring_backend_is_secure(unknown) is False
+    assert credential_store._keyring_backend_is_secure(secure_chain) is True
+    assert credential_store._keyring_backend_is_secure(insecure_chain) is False
+
+
+def test_keyring_only_recovery_state_is_usable_and_migration_repairs_metadata(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    fake = FakeKeyring()
+    _install_fake(monkeypatch, fake)
+    path = tmp_path / "auth.json"
+    account = credential_store.credential_account(path)
+    sensitive = _token("orphan-recovery")
+    fake.values[(credential_store.CREDENTIAL_STORE_SERVICE, account)] = json.dumps(
+        {
+            "access" + "Token": sensitive,
+            "cookies": {},
+            "browserCookies": [],
+            "headers": {},
+        }
+    )
+
+    status = get_auth_status(path)
+
+    assert status.file_exists is False
+    assert status.credential_backend == "keyring"
+    assert status.credential_metadata_present is False
+    assert status.access_token_present is True
+    assert load_auth_data(path).accessToken == sensitive
+
+    migrate_auth_data(path, backend="keyring")
+
+    metadata_text = path.read_text(encoding="utf-8")
+    assert sensitive not in metadata_text
+    assert json.loads(metadata_text)[credential_store.CREDENTIAL_STORE_MARKER][
+        "backend"
+    ] == "keyring"
+    repaired = get_auth_status(path)
+    assert repaired.file_exists is True
+    assert repaired.credential_metadata_present is True
+
+
+def test_metadata_write_failure_keeps_keyring_copy_recoverable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import chatgpt_web_adapter.auth_store as auth_store
+
+    fake = FakeKeyring()
+    _install_fake(monkeypatch, fake)
+    path = tmp_path / "auth.json"
+    sensitive = _token("metadata-failure")
+    original_write = auth_store._atomic_write_json
+
+    def fail_metadata(*_args, **_kwargs):
+        raise OSError("metadata write failed")
+
+    monkeypatch.setattr(auth_store, "_atomic_write_json", fail_metadata)
+    with pytest.raises(OSError, match="metadata write failed"):
+        persist_auth_data(AuthData(accessToken=sensitive), path)
+    assert not path.exists()
+    assert load_auth_data(path).accessToken == sensitive
+
+    monkeypatch.setattr(auth_store, "_atomic_write_json", original_write)
+    migrate_auth_data(path, backend="keyring")
+    assert path.is_file()
+    assert sensitive not in path.read_text(encoding="utf-8")

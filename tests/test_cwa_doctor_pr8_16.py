@@ -489,3 +489,54 @@ def test_auth_credential_store_check_warns_for_secure_file_fallback() -> None:
     assert check.status is DoctorCheckStatus.WARN
     assert check.required is False
     assert "secret-store" in (check.remediation or "")
+
+
+def test_auth_checks_accept_keyring_only_recovery_state_without_metadata(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    auth_file = tmp_path / "auth.json"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    monkeypatch.setattr(
+        doctor,
+        "get_auth_status",
+        lambda *args, **kwargs: SimpleNamespace(
+            auth_file=auth_file,
+            file_exists=False,
+            access_token_present=True,
+            access_token_expires_at=None,
+            access_token_needs_refresh=False,
+            session_cookie_present=True,
+            session_expires_at=None,
+            browser_cookie_count=1,
+            browser_profile_dir=profile,
+            browser_profile_exists=True,
+            credential_backend="keyring",
+            keyring_available=True,
+            keyring_backend="keyring.backends.macOS.Keyring",
+            credential_metadata_present=False,
+        ),
+    )
+
+    checks = doctor._auth_checks(auth_file, profile_dir=profile)
+    by_id = {check.id: check for check in checks}
+
+    assert by_id["auth.file"].status is DoctorCheckStatus.WARN
+    assert "metadata is missing" in by_id["auth.file"].summary
+    assert by_id["auth.credential_store"].status is DoctorCheckStatus.PASS
+    assert by_id["auth.material"].status is DoctorCheckStatus.PASS
+    assert "auth.file_permissions" not in by_id
+
+
+def test_auth_store_check_rejects_non_os_keyring_backend() -> None:
+    check = doctor._auth_credential_store_check(
+        SimpleNamespace(
+            credential_backend="file",
+            keyring_available=False,
+            keyring_backend="keyrings.alt.file.PlaintextKeyring",
+        )
+    )
+
+    assert check.status is DoctorCheckStatus.WARN
+    assert "not an accepted OS-backed secure store" in (check.remediation or "")

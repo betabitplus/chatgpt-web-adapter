@@ -43,7 +43,7 @@ class _KeyringProvider:
         except Exception:
             return False, None
         name = f"{type(backend).__module__}.{type(backend).__name__}"
-        return priority > 0, name
+        return priority > 0 and _keyring_backend_is_secure(backend), name
 
     def get(self, service: str, account: str) -> str | None:
         module = self._module()
@@ -79,6 +79,38 @@ class _KeyringProvider:
 
 
 _KEYRING_PROVIDER = _KeyringProvider()
+
+_SECURE_KEYRING_MODULE_PREFIXES = (
+    "keyring.backends.macOS",
+    "keyring.backends.Windows",
+    "keyring.backends.SecretService",
+    "keyring.backends.kwallet",
+    "keyring.backends.libsecret",
+)
+
+
+def _keyring_backend_is_secure(backend: Any) -> bool:
+    """Accept only OS-backed keyring providers, never plaintext/null fallbacks."""
+
+    module = str(type(backend).__module__)
+    name = str(type(backend).__name__)
+    lowered = f"{module}.{name}".lower()
+    if (
+        module.startswith("keyrings.alt")
+        or "plaintext" in lowered
+        or ".fail." in lowered
+        or ".null." in lowered
+    ):
+        return False
+    if module.startswith(_SECURE_KEYRING_MODULE_PREFIXES):
+        return True
+    if module.startswith("keyring.backends.chainer"):
+        try:
+            children = list(getattr(backend, "backends", ()) or ())
+        except Exception:
+            return False
+        return bool(children) and _keyring_backend_is_secure(children[0])
+    return False
 
 
 def normalize_credential_store(value: str | None = None) -> str:

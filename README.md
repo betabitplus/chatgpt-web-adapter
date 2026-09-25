@@ -110,7 +110,7 @@ chatgpt-web-adapter auth migrate --auth-file auth_data.json --backend keyring
 chatgpt-web-adapter auth logout --auth-file auth_data.json
 ```
 
-Reusable authorization prefers the OS credential store when the optional `secret-store` extra provides a working `keyring` backend; `auth_data.json` then contains only non-secret backend metadata/expiry hints. Without that backend, CWA keeps the existing owner-only (`0600` on POSIX) file fallback. Set `--credential-store file` on login/refresh for an explicit portable fallback, or migrate later with `auth migrate`. Never commit or share a secret-bearing fallback file or browser profile. See [docs/authentication.md](docs/authentication.md) and [SECURITY.md](SECURITY.md).
+Reusable authorization prefers the OS credential store when the optional `secret-store` extra provides a recognized OS-backed secure `keyring` provider; plaintext/null keyring fallbacks are rejected. `auth_data.json` then contains only non-secret backend metadata/expiry hints. Without a secure OS backend, CWA keeps the existing owner-only (`0600` on POSIX) file fallback. Set `--credential-store file` on login/refresh for an explicit portable fallback, or migrate later with `auth migrate`. Never commit or share a secret-bearing fallback file or browser profile. See [docs/authentication.md](docs/authentication.md) and [SECURITY.md](SECURITY.md).
 
 ### Install the browser-owned bridge
 

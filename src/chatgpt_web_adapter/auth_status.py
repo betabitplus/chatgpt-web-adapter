@@ -25,12 +25,18 @@ class AuthStatus:
     access_token_needs_refresh: bool
     session_cookie_present: bool
     session_expires_at: Any = None
+    cookies_present: bool = False
     browser_cookie_count: int = 0
+    headers_present: bool = False
+    proof_token_present: bool = False
+    turnstile_token_present: bool = False
     browser_profile_dir: Path | None = None
     browser_profile_exists: bool = False
     credential_backend: str = "file"
     keyring_available: bool = False
     keyring_backend: str | None = None
+    credential_metadata_present: bool = False
+    captured_at: str | None = None
 
 
 def get_auth_status(
@@ -54,12 +60,18 @@ def get_auth_status(
             access_token_needs_refresh=True,
             session_cookie_present=False,
             session_expires_at=None,
+            cookies_present=False,
             browser_cookie_count=0,
+            headers_present=False,
+            proof_token_present=False,
+            turnstile_token_present=False,
             browser_profile_dir=profile,
             browser_profile_exists=profile.is_dir(),
             credential_backend=store_info.backend,
             keyring_available=store_info.keyring_available,
             keyring_backend=store_info.keyring_backend,
+            credential_metadata_present=store_info.metadata_present,
+            captured_at=None,
         )
     auth = AuthData.from_mapping(payload)
     has_session = any(
@@ -78,10 +90,20 @@ def get_auth_status(
         access_token_needs_refresh=auth_needs_refresh(auth.accessToken),
         session_cookie_present=has_session,
         session_expires_at=auth.expires,
+        cookies_present=bool(auth.cookies),
         browser_cookie_count=len(auth.browserCookies),
+        headers_present=bool(auth.headers),
+        proof_token_present=auth.proof_token is not None,
+        turnstile_token_present=bool(auth.turnstile_token),
         browser_profile_dir=profile,
         browser_profile_exists=profile.is_dir(),
         credential_backend=store_info.backend,
         keyring_available=store_info.keyring_available,
         keyring_backend=store_info.keyring_backend,
+        credential_metadata_present=store_info.metadata_present,
+        captured_at=(
+            str(payload.get("timestamp"))
+            if isinstance(payload.get("timestamp"), str)
+            else None
+        ),
     )

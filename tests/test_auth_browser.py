@@ -178,3 +178,72 @@ def test_valid_session_payload_rejects_incomplete_auth(payload) -> None:
 
 def test_session_expiry_timestamp_parses_chatgpt_iso_value() -> None:
     assert auth_browser._session_expiry_timestamp("2030-01-01T00:00:00.000Z") == 1893456000
+
+
+def test_browser_login_reuses_keyring_auth_even_when_metadata_file_is_missing(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    auth_file = tmp_path / "auth.json"
+    browser = FakeBrowser()
+    started_urls = []
+    commands = []
+
+    monkeypatch.setattr(
+        auth_browser,
+        "load_auth_data",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            cookies={CHATGPT_SESSION_COOKIE: "keyring-session"},
+            browserCookies=[],
+            expires="2030-01-01T00:00:00.000Z",
+        ),
+    )
+
+    async def start(**kwargs):
+        return browser
+
+    async def browser_get(url):
+        started_urls.append(url)
+        return browser.page
+
+    async def page_send(command):
+        commands.append(command)
+        if command == "get-all-cookies":
+            return [
+                SimpleNamespace(
+                    domain=".chatgpt.com",
+                    name=CHATGPT_SESSION_COOKIE,
+                    value="browser-session-cookie",
+                )
+            ]
+        return None
+
+    browser.get = browser_get
+    browser.page.send = page_send
+    fake_network = SimpleNamespace(
+        CookieParam=lambda **kwargs: kwargs,
+        set_cookies=lambda cookies: ("set-cookies", cookies),
+        delete_cookies=lambda name, **kwargs: ("delete-cookie", name),
+        get_all_cookies=lambda: "get-all-cookies",
+        TimeSinceEpoch=float,
+    )
+    monkeypatch.setattr(
+        auth_browser,
+        "_import_zendriver",
+        lambda: SimpleNamespace(
+            start=start,
+            cdp=SimpleNamespace(network=fake_network),
+        ),
+    )
+
+    auth_browser.browser_login(
+        auth_file,
+        profile_dir=tmp_path / "profile",
+        timeout=1,
+        persist=False,
+    )
+
+    assert not auth_file.exists()
+    assert started_urls == ["about:blank"]
+    seed_command = next(command for command in commands if command[0] == "set-cookies")
+    assert seed_command[1][0]["value"] == "keyring-session"

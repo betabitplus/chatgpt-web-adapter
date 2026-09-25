@@ -275,6 +275,7 @@ def _run_auth(args: argparse.Namespace) -> int:
                     "credential_backend": status.credential_backend,
                     "keyring_available": status.keyring_available,
                     "keyring_backend": status.keyring_backend,
+                    "credential_metadata_present": status.credential_metadata_present,
                     "access_token_present": status.access_token_present,
                     "access_token_expires_at": (
                         status.access_token_expires_at.isoformat()
@@ -291,7 +292,7 @@ def _run_auth(args: argparse.Namespace) -> int:
                 indent=2,
             )
         )
-        return 0 if status.file_exists else 1
+        return 0 if (status.access_token_present or status.session_cookie_present) else 1
     if args.auth_command == "refresh":
         auth = load_auth_data(args.auth_file, allow_expired_session_refresh=True)
         client = ChatGPTWebClient(

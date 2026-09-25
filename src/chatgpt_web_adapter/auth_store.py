@@ -170,6 +170,11 @@ def migrate_auth_data(
             if backend == store_info.backend:
                 if backend == "file":
                     _atomic_write_json(path, payload)
+                else:
+                    _atomic_write_json(
+                        path,
+                        keyring_metadata(store_info.account, payload),
+                    )
                 return path
             if backend == "keyring":
                 if not store_info.keyring_available:

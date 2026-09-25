@@ -161,7 +161,7 @@ async def _browser_login_async(
         seed_cookies: dict[str, str] = {}
         seed_browser_cookies: list[dict[str, Any]] = []
         seed_expires: float | None = None
-        if reuse_existing_auth and auth_file.is_file():
+        if reuse_existing_auth:
             try:
                 seed_auth = load_auth_data(
                     auth_file, allow_expired_session_refresh=True

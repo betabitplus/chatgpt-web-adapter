@@ -196,13 +196,23 @@ def _auth_credential_store_check(status: Any) -> DoctorCheck:
             "Reusable authorization is stored in the OS credential store",
             evidence=evidence,
         )
-    remediation = (
-        "Install `chatgpt-web-adapter[secret-store]` and run "
-        "`cwa auth migrate --backend keyring`."
-        if not keyring_available
-        else "Run `cwa auth migrate --backend keyring` to move reusable authorization "
-        "into the OS credential store."
-    )
+    if not keyring_available and keyring_backend:
+        remediation = (
+            "The configured keyring backend is not an accepted OS-backed secure store. "
+            "Use macOS Keychain, Windows Credential Manager, or Linux Secret Service, "
+            "then run `cwa auth migrate --backend keyring`; otherwise keep the explicit "
+            "owner-only file fallback."
+        )
+    elif not keyring_available:
+        remediation = (
+            "Install `chatgpt-web-adapter[secret-store]` and run "
+            "`cwa auth migrate --backend keyring`."
+        )
+    else:
+        remediation = (
+            "Run `cwa auth migrate --backend keyring` to move reusable authorization "
+            "into the OS credential store."
+        )
     return _warn(
         "auth.credential_store",
         "auth",
@@ -362,6 +372,9 @@ def _auth_checks(
         "credential_backend": getattr(status, "credential_backend", "file"),
         "keyring_available": bool(getattr(status, "keyring_available", False)),
         "keyring_backend": getattr(status, "keyring_backend", None),
+        "credential_metadata_present": bool(
+            getattr(status, "credential_metadata_present", False)
+        ),
         "access_token_present": status.access_token_present,
         "access_token_expires_at": (
             status.access_token_expires_at.isoformat()
@@ -379,13 +392,34 @@ def _auth_checks(
         "browser_profile_exists": status.browser_profile_exists,
     }
     checks: list[DoctorCheck] = []
+    usable_material = bool(status.access_token_present or status.session_cookie_present)
     if status.file_exists:
         checks.append(
             _pass(
                 "auth.file",
                 "auth",
-                "Authorization file exists",
-                evidence={"auth_file": evidence["auth_file"]},
+                "Authorization metadata/file exists",
+                evidence={
+                    "auth_file": evidence["auth_file"],
+                    "credential_metadata_present": evidence["credential_metadata_present"],
+                },
+            )
+        )
+        checks.append(_auth_file_permissions_check(status.auth_file))
+    elif status.credential_backend == "keyring" and usable_material:
+        checks.append(
+            _warn(
+                "auth.file",
+                "auth",
+                "OS credential-store authorization is usable but metadata is missing",
+                evidence={
+                    "auth_file": evidence["auth_file"],
+                    "credential_metadata_present": False,
+                },
+                remediation=(
+                    "Run `cwa auth migrate --backend keyring` to recreate the local "
+                    "non-secret metadata pointer."
+                ),
             )
         )
     else:
@@ -393,14 +427,13 @@ def _auth_checks(
             _fail(
                 "auth.file",
                 "auth",
-                "Authorization file is missing",
+                "Authorization metadata/file is missing",
                 evidence={"auth_file": evidence["auth_file"]},
                 remediation="Run `cwa auth login`.",
             )
         )
         return checks
 
-    checks.append(_auth_file_permissions_check(status.auth_file))
     checks.append(_auth_credential_store_check(status))
 
     if status.access_token_present or status.session_cookie_present:

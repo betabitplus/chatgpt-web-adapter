@@ -140,3 +140,41 @@ def test_auth_logout_cli_delegates_to_store(tmp_path, monkeypatch, capsys) -> No
     assert result == 0
     assert calls == [auth_file]
     assert json.loads(capsys.readouterr().out) == {"removed": True}
+
+
+def test_auth_status_cli_treats_keyring_only_recovery_state_as_usable(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    auth_file = tmp_path / "auth.json"
+    profile = tmp_path / "profile"
+    monkeypatch.setattr(
+        cli,
+        "get_auth_status",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            auth_file=auth_file,
+            file_exists=False,
+            credential_backend="keyring",
+            keyring_available=True,
+            keyring_backend="keyring.backends.macOS.Keyring",
+            credential_metadata_present=False,
+            access_token_present=True,
+            access_token_expires_at=None,
+            access_token_needs_refresh=False,
+            session_cookie_present=True,
+            session_expires_at=None,
+            browser_cookie_count=1,
+            browser_profile_dir=profile,
+            browser_profile_exists=False,
+        ),
+    )
+
+    result = cli.main(["auth", "status", "--auth-file", str(auth_file)])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 0
+    assert payload["file_exists"] is False
+    assert payload["credential_backend"] == "keyring"
+    assert payload["credential_metadata_present"] is False
+    assert payload["access_token_present"] is True

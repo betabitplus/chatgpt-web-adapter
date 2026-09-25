@@ -13,6 +13,23 @@ function _cwaCommittedStopConversationId(value) {
     : null;
 }
 
+function _cwaStopConversationIdentityVerified(
+  requestedConversationId,
+  committedConversationId,
+  finalConversationId,
+  resolvedConversationId
+) {
+  const routeConversationId = finalConversationId || committedConversationId;
+  if (!routeConversationId || !resolvedConversationId) return false;
+  if (requestedConversationId !== null) {
+    return (
+      routeConversationId === requestedConversationId &&
+      resolvedConversationId === requestedConversationId
+    );
+  }
+  return resolvedConversationId === routeConversationId;
+}
+
 async function _cwaClickStopControl(tabId) {
   try {
     return await chrome.tabs.sendMessage(tabId, { type: "cwa_stop_generation" });
@@ -97,14 +114,26 @@ async function _cwaExecuteStopGeneration(message) {
       const finalConversationId = _cwaCommittedStopConversationId(
         conversationIdFromUrl(finalTab.url || "")
       );
-      const resolvedConversationId = requestedConversationId || finalConversationId || committedConversationId;
-      _cwaCompletePassiveObserverForStop(storedId, resolvedConversationId);
+      const resolvedConversationId =
+        finalConversationId || committedConversationId || requestedConversationId;
+      const conversationIdentityVerified = _cwaStopConversationIdentityVerified(
+        requestedConversationId,
+        committedConversationId,
+        finalConversationId,
+        resolvedConversationId
+      );
+      _cwaCompletePassiveObserverForStop(
+        storedId,
+        conversationIdentityVerified ? resolvedConversationId : null
+      );
       return {
         ok: true,
         stopped: true,
-        reason: null,
+        reason: conversationIdentityVerified ? null : "conversation_route_unresolved",
         conversationId: resolvedConversationId,
         tabId: storedId,
+        proof: "browser_stop_control",
+        conversationIdentityVerified,
       };
     }
     if (typeof result?.reason === "string" && result.reason) {
@@ -116,20 +145,41 @@ async function _cwaExecuteStopGeneration(message) {
   // Honor the explicit Stop intent even if ChatGPT never committed a normal route.
   // Never expose the internal WEB:* route to callers.
   const finalAttempt = await _cwaClickStopControl(storedId);
+  let finalConversationId = null;
+  if (finalAttempt?.stopped === true) {
+    try {
+      const finalTab = await chrome.tabs.get(storedId);
+      finalConversationId = _cwaCommittedStopConversationId(
+        conversationIdFromUrl(finalTab.url || "")
+      );
+    } catch {}
+  }
+  const resolvedConversationId =
+    finalConversationId || committedConversationId || requestedConversationId;
+  const conversationIdentityVerified = finalAttempt?.stopped === true
+    ? _cwaStopConversationIdentityVerified(
+        requestedConversationId,
+        committedConversationId,
+        finalConversationId,
+        resolvedConversationId
+      )
+    : false;
   if (finalAttempt?.stopped === true) {
     _cwaCompletePassiveObserverForStop(
       storedId,
-      requestedConversationId || committedConversationId
+      conversationIdentityVerified ? resolvedConversationId : null
     );
   }
   return {
     ok: true,
     stopped: finalAttempt?.stopped === true,
     reason: finalAttempt?.stopped === true
-      ? (committedConversationId ? null : "conversation_route_unresolved")
+      ? (conversationIdentityVerified ? null : "conversation_route_unresolved")
       : (typeof finalAttempt?.reason === "string" && finalAttempt.reason ? finalAttempt.reason : lastReason),
-    conversationId: requestedConversationId || committedConversationId,
+    conversationId: resolvedConversationId,
     tabId: storedId,
+    proof: finalAttempt?.stopped === true ? "browser_stop_control" : null,
+    conversationIdentityVerified,
   };
 }
 

@@ -1883,6 +1883,7 @@ def test_wkwebview_stop_accepts_terminal_stream_status_when_stop_control_is_gone
 
     assert result["stopped"] is True
     assert result["proof"] == "stream_status_after_missing_control"
+    assert result["conversationIdentityVerified"] is True
     assert result["streamStatus"] == "COMPLETE"
     assert observed
     assert provider.stop_requested_for("conversation-1") is True
@@ -1957,6 +1958,7 @@ def test_wkwebview_stop_accepts_product_stop_control_click_without_canonical_pol
 
     assert result["stopped"] is True
     assert result["proof"] == "browser_stop_control"
+    assert result["conversationIdentityVerified"] is True
     assert provider.stop_requested_for("conversation-1") is True
 
 
@@ -2015,6 +2017,7 @@ def test_wkwebview_stop_uses_worker_stopped_final_without_second_canonical_reade
 
     assert result["stopped"] is True
     assert result["conversationId"] == "conversation-1"
+    assert result["conversationIdentityVerified"] is True
     assert provider.stop_requested_for("conversation-1") is True
 
 

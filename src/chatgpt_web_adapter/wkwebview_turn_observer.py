@@ -218,6 +218,7 @@ class WKTurnObserver:
                     "conversationId": conversation_id,
                     "provider": "wkwebview",
                     "proof": "canonical_client_stopped_after_missing_control",
+                    "conversationIdentityVerified": True,
                     "streamStatus": None,
                 }
 
@@ -238,6 +239,7 @@ class WKTurnObserver:
                 "conversationId": conversation_id,
                 "provider": "wkwebview",
                 "proof": "stream_status_after_missing_control",
+                "conversationIdentityVerified": True,
                 "streamStatus": stream_status,
             }
 
@@ -293,5 +295,6 @@ class WKTurnObserver:
             "conversationId": conversation_id,
             "provider": "wkwebview",
             "proof": proof_kind,
+            "conversationIdentityVerified": True,
             "streamStatus": stream_status,
         }

@@ -277,6 +277,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
         *,
         emitted_message_ids: Sequence[str],
         limit: int | None,
+        snapshot_provenance: str,
+        canonical_read_fresh: bool,
         canonical_cache_age_seconds: float | None = None,
         active_stream: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -353,6 +355,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             "stream_answer_text": answer_text,
             "canonical_cache_stale": canonical_cache_age_seconds is not None,
             "canonical_cache_age_seconds": canonical_cache_age_seconds,
+            "snapshot_provenance": snapshot_provenance,
+            "canonical_read_fresh": canonical_read_fresh,
             "active_stream_registry": active_stream is not None,
         }
 
@@ -426,6 +430,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                     candidate,
                     emitted_message_ids=emitted_message_ids,
                     limit=limit,
+                    snapshot_provenance="shared-final-cache",
+                    canonical_read_fresh=False,
                 )
                 recovered["backend_stream_status"] = normalized_backend_status
                 recovered["backend_stream_status_checked"] = True
@@ -520,6 +526,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             "stream_answer_text": normalizer.answer_text,
             "canonical_cache_stale": False,
             "canonical_cache_age_seconds": None,
+            "snapshot_provenance": "stream-terminal",
+            "canonical_read_fresh": False,
             "active_stream_registry": False,
             "stream_completed": True,
             "shared_final_cache": False,
@@ -576,6 +584,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
         )
         if use_cached_active_snapshot:
             payload = cached[0]
+            snapshot_provenance = "canonical-cache"
+            canonical_read_fresh = False
             age_value = cached[1]
             canonical_cache_age_seconds = (
                 max(0.0, float(age_value))
@@ -586,6 +596,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
         else:
             try:
                 payload = self.get_conversation_payload(ref)
+                snapshot_provenance = "canonical-read"
+                canonical_read_fresh = True
             except RequestError as error:
                 if error.status_code != 429:
                     raise
@@ -598,6 +610,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                 ):
                     raise
                 payload = cached[0]
+                snapshot_provenance = "canonical-cache"
+                canonical_read_fresh = False
                 age_value = cached[1]
                 canonical_cache_age_seconds = (
                     max(0.0, float(age_value))
@@ -611,6 +625,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
             payload,
             emitted_message_ids=emitted_message_ids,
             limit=limit,
+            snapshot_provenance=snapshot_provenance,
+            canonical_read_fresh=canonical_read_fresh,
             canonical_cache_age_seconds=canonical_cache_age_seconds,
             active_stream=active_stream,
         )
@@ -805,6 +821,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                     local_final_payload,
                     emitted_message_ids=tuple(normalizer.emitted_message_ids),
                     limit=limit,
+                    snapshot_provenance="canonical-cache",
+                    canonical_read_fresh=False,
                 )
                 recovered_snapshot["stream_completed"] = True
                 recovered_snapshot["stream_topic_id"] = actual_topic_id
@@ -860,6 +878,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                         candidate,
                         emitted_message_ids=tuple(normalizer.emitted_message_ids),
                         limit=limit,
+                        snapshot_provenance="shared-final-cache",
+                        canonical_read_fresh=False,
                     )
                     recovered_snapshot["stream_completed"] = True
                     recovered_snapshot["stream_topic_id"] = actual_topic_id
@@ -912,6 +932,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                 shared_final_payload,
                 emitted_message_ids=tuple(normalizer.emitted_message_ids),
                 limit=limit,
+                snapshot_provenance="shared-final-cache",
+                canonical_read_fresh=False,
             )
             final_snapshot["shared_final_cache"] = True
             final_snapshot["stream_completed"] = True
@@ -942,6 +964,8 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
                 terminal_payload,
                 emitted_message_ids=tuple(normalizer.emitted_message_ids),
                 limit=limit,
+                snapshot_provenance="canonical-read",
+                canonical_read_fresh=True,
             )
             terminal_status = terminal_snapshot.get("status")
             if getattr(terminal_status, "status", None) == "completed":

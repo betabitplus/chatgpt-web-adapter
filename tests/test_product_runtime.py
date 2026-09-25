@@ -237,6 +237,8 @@ def test_runtime_follow_snapshot_uses_cached_history_on_429(monkeypatch) -> None
 
     assert snapshot["canonical_cache_stale"] is True
     assert snapshot["canonical_cache_age_seconds"] == 12.75
+    assert snapshot["snapshot_provenance"] == "canonical-cache"
+    assert snapshot["canonical_read_fresh"] is False
     assert len(snapshot["messages"]) == 1
     assert snapshot["messages"][0].text == "cached question"
 
@@ -319,6 +321,8 @@ def test_runtime_full_resume_includes_attachment_only_user_text(monkeypatch) -> 
         limit=None,
     )
 
+    assert snapshot["snapshot_provenance"] == "canonical-read"
+    assert snapshot["canonical_read_fresh"] is True
     assert len(snapshot["messages"]) == 1
     message = snapshot["messages"][0]
     assert message.role == "user"
@@ -725,6 +729,8 @@ def test_runtime_topic_follow_streams_events_then_finalizes_from_terminal(
     assert result["stream_completed"] is True
     assert result["stream_topic_id"] == "conversation-turn-turn-1"
     assert result["stream_terminal_snapshot"] is True
+    assert result["snapshot_provenance"] == "stream-terminal"
+    assert result["canonical_read_fresh"] is False
     assert result["status"].status == "completed"
     assert result["messages"][0].message_id == "assistant-final"
     assert result["messages"][0].text == "done"
@@ -856,6 +862,8 @@ def test_runtime_pending_topic_relays_local_canonical_cache_without_network(
     assert events[1]["delta"] == "done"
     assert result["stream_completed"] is True
     assert result["stream_recovered_from_local_cache"] is True
+    assert result["snapshot_provenance"] == "canonical-cache"
+    assert result["canonical_read_fresh"] is False
     assert result["status"].status == "completed"
 
 
@@ -926,6 +934,8 @@ def test_runtime_topic_follow_uses_shared_final_without_canonical_read(
 
     assert result["stream_completed"] is True
     assert result["shared_final_cache"] is True
+    assert result["snapshot_provenance"] == "shared-final-cache"
+    assert result["canonical_read_fresh"] is False
     assert result["status"].status == "completed"
 
 
@@ -1006,6 +1016,8 @@ def test_runtime_topic_follow_terminal_stream_reconciles_once_with_canonical_fin
     assert result["stream_completed"] is True
     assert result["stream_terminal_reconciled"] is True
     assert result["shared_final_cache"] is False
+    assert result["snapshot_provenance"] == "canonical-read"
+    assert result["canonical_read_fresh"] is True
     assert result["status"].status == "completed"
     assert result["messages"][-1].message_id == "assistant-terminal"
     assert result["messages"][-1].text == "complete canonical answer"
@@ -1070,6 +1082,8 @@ def test_runtime_topic_follow_external_completion_reconciles_canonical_final_onc
     assert canonical_reads == ["conversation-1"]
     assert result["stream_completed"] is True
     assert result["stream_terminal_reconciled"] is True
+    assert result["snapshot_provenance"] == "canonical-read"
+    assert result["canonical_read_fresh"] is True
     assert result["messages"][-1].message_id == "assistant-final"
     assert result["messages"][-1].text == "canonical final after lost topic"
 

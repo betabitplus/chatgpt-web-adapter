@@ -702,6 +702,112 @@ def test_split_submit_accepts_normalizer_terminal_proof_after_revision_without_c
     assert any(event.get("type") == "assistant_text_revision" for event in delivered)
 
 
+def test_split_submit_accepts_end_turn_plus_external_completion_without_canonical_polling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Provider(FakeProvider):
+        revision_safe_streaming_supported = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.observe_calls = 0
+
+        def submit_text_streaming(
+            self,
+            text,
+            *,
+            conversation=None,
+            timeout=None,
+            on_text_event,
+            on_write_identity=None,
+            on_transport_event=None,
+            stream_should_stop=None,
+        ):
+            if on_write_identity is not None:
+                on_write_identity({"conversation_id": "conversation-1"})
+            return BrowserNativeTurnResult(
+                conversation_id="conversation-1",
+                turn_exchange_id="turn-external-final",
+                response_status=200,
+                response_mime_type="text/event-stream",
+                final_url="https://chatgpt.com/c/conversation-1",
+                tab_id=None,
+                tab_was_active=False,
+                elapsed_ms=100,
+                passive_observer_armed=True,
+                stream_topic_id="conversation-turn-external-final",
+            )
+
+        def follow_submitted_turn(
+            self,
+            turn,
+            *,
+            timeout,
+            on_transport_event=None,
+            stream_should_stop=None,
+        ):
+            assert on_transport_event is not None
+            on_transport_event(
+                {
+                    "type": "raw_ws_event",
+                    "parsed": {
+                        "message": {
+                            "id": "assistant-final",
+                            "author": {"role": "assistant"},
+                            "recipient": "all",
+                            "channel": "final",
+                            "content": {
+                                "content_type": "text",
+                                "parts": ["EXTERNAL_COMPLETION_FINAL"],
+                            },
+                            "status": "finished_successfully",
+                            "end_turn": True,
+                            "metadata": {
+                                "turn_exchange_id": "turn-external-final",
+                            },
+                        }
+                    },
+                }
+            )
+            return {
+                "external_completion_observed": True,
+                "stream_finality_proven": False,
+                "message_id": None,
+                "finish_reason": "conversation_turn_complete",
+                "segment_done_count": 0,
+            }
+
+        def observe_turn(self, **kwargs):
+            self.observe_calls += 1
+            raise AssertionError("external completion plus end_turn must not canonical-observe")
+
+    provider = Provider()
+    client = _client(provider)
+    delivered: list[dict] = []
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.browser_native_client._wait_for_new_final_assistant",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("external completion plus end_turn must not canonical-read")
+        ),
+    )
+
+    submission = submit_browser_native(
+        client,
+        "hello",
+        conversation="existing-conversation",
+        timeout=5,
+        poll_interval=0.01,
+        on_event=delivered.append,
+    )
+    response = await_browser_native_final(client, submission)
+
+    assert response.text == "EXTERNAL_COMPLETION_FINAL"
+    assert response.conversation.message_id == "assistant-final"
+    assert response.conversation.finish_reason == "conversation_turn_complete"
+    assert response.request.terminal_source == "stream"
+    assert provider.observe_calls == 0
+
+
 def test_split_submit_stop_cancels_topic_without_canonical_readback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2129,8 +2129,17 @@ def await_browser_native_final(
             and candidate_terminal_error.strip()
         ):
             terminal_error = candidate_terminal_error.strip()
+        # A final assistant frame (end_turn=true) plus an independent
+        # completion proof closes the same whole-turn fence as the trailing
+        # Celsius done marker. Completion proof alone is deliberately insufficient:
+        # a partial snapshot without turn_completed still falls through to
+        # canonical reconciliation.
         normalizer_finality_proven = bool(
-            topic_normalizer.turn_completed and topic_normalizer.segment_kind is None
+            topic_normalizer.turn_completed
+            and (
+                topic_normalizer.segment_kind is None
+                or deferred_external_completion_observed
+            )
         )
         stream_finality_proven = (
             (

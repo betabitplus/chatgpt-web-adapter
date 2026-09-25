@@ -98,7 +98,11 @@ The experimental `browserless-request` transport fails closed when current produ
 
 The SDK uses the normal ChatGPT login page for interactive authentication. Protect the persistent browser profile like any other signed-in browser profile.
 
-A copied `auth_data.json` is sensitive even when it is insufficient by itself to reproduce a complete signed-in environment. Do not use that uncertainty as a reason to handle it less carefully.
+For reusable authorization at rest, CWA prefers an OS credential store when the optional `secret-store`/`keyring` backend is available. The companion `auth_data.json` is then a non-secret metadata pointer, not a copy of the credential blob. The secure-file fallback remains supported for portable/headless use and is clamped to owner-only permissions on POSIX.
+
+Credential backend transitions are fail-safe: migration to keyring writes and verifies the OS-store item before replacing plaintext with metadata; a profile already marked keyring-backed does not silently downgrade to plaintext if keyring becomes unavailable. Explicit migration to the file backend writes the fallback first, then removes the OS-store copy. `auth logout` removes the active reusable credential backend but is not a claim of server-side session revocation.
+
+A copied secret-bearing fallback `auth_data.json` is sensitive even when it is insufficient by itself to reproduce a complete signed-in environment. Do not use that uncertainty as a reason to handle it less carefully.
 
 See [`docs/authentication.md`](docs/authentication.md).
 

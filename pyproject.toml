@@ -55,6 +55,7 @@ test = [
   "ruff>=0.11",
 ]
 browser = ["zendriver==0.15.3"]
+secret-store = ["keyring>=25,<26"]
 
 [project.scripts]
 chatgpt-web-adapter = "chatgpt_web_adapter.cli_v02:main"

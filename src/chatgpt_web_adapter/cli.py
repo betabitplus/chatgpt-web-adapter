@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any, Sequence
 
 from .auth import DEFAULT_AUTH_FILE, load_auth_data
 from .auth_browser import browser_login
 from .auth_refresh import refresh_auth_session
 from .auth_status import get_auth_status
+from .auth_store import clear_auth_data, migrate_auth_data
 from .browser_native_install import (
     EXTENSION_ID,
     browser_native_extension_dir,
@@ -65,8 +66,20 @@ def _build_parser() -> argparse.ArgumentParser:
     def add_auth_file(command: argparse.ArgumentParser) -> None:
         command.add_argument("--auth-file", type=Path, default=DEFAULT_AUTH_FILE)
 
+    def add_credential_store(command: argparse.ArgumentParser) -> None:
+        command.add_argument(
+            "--credential-store",
+            choices=("auto", "keyring", "file"),
+            default="auto",
+            help=(
+                "reusable credential backend: auto prefers the OS credential store, "
+                "keyring requires it, file keeps the owner-only portable fallback"
+            ),
+        )
+
     login = auth_commands.add_parser("login", help="open a browser and save authorization")
     add_auth_file(login)
+    add_credential_store(login)
     login.add_argument("--profile-dir", type=Path)
     login.add_argument("--timeout", type=float, default=300.0)
     login.add_argument("--browser-executable-path", type=Path)
@@ -82,6 +95,25 @@ def _build_parser() -> argparse.ArgumentParser:
 
     refresh = auth_commands.add_parser("refresh", help="refresh tokens without browser login")
     add_auth_file(refresh)
+    add_credential_store(refresh)
+
+    migrate = auth_commands.add_parser(
+        "migrate",
+        help="migrate reusable authorization between OS credential store and secure file",
+    )
+    add_auth_file(migrate)
+    migrate.add_argument(
+        "--backend",
+        choices=("keyring", "file"),
+        default="keyring",
+        help="target credential backend; keyring uses the OS credential store",
+    )
+
+    logout = auth_commands.add_parser(
+        "logout",
+        help="remove reusable local authorization material",
+    )
+    add_auth_file(logout)
 
     snapshot = commands.add_parser(
         "snapshot",
@@ -228,6 +260,7 @@ def _run_auth(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             browser_executable_path=args.browser_executable_path,
             reuse_existing_auth=not args.force,
+            credential_store=args.credential_store,
         )
         print(f"Authorization saved to {result.auth_file}")
         print(f"Persistent browser profile: {result.profile_dir}")
@@ -239,6 +272,9 @@ def _run_auth(args: argparse.Namespace) -> int:
                 {
                     "auth_file": str(status.auth_file),
                     "file_exists": status.file_exists,
+                    "credential_backend": status.credential_backend,
+                    "keyring_available": status.keyring_available,
+                    "keyring_backend": status.keyring_backend,
                     "access_token_present": status.access_token_present,
                     "access_token_expires_at": (
                         status.access_token_expires_at.isoformat()
@@ -263,7 +299,11 @@ def _run_auth(args: argparse.Namespace) -> int:
             auth_file=args.auth_file,
             auto_refresh_auth=False,
         )
-        result = refresh_auth_session(client, auth_file=args.auth_file)
+        result = refresh_auth_session(
+            client,
+            auth_file=args.auth_file,
+            credential_store=args.credential_store,
+        )
         print(
             json.dumps(
                 {
@@ -274,6 +314,24 @@ def _run_auth(args: argparse.Namespace) -> int:
                 indent=2,
             )
         )
+        return 0
+    if args.auth_command == "migrate":
+        migrate_auth_data(args.auth_file, backend=args.backend)
+        status = get_auth_status(args.auth_file)
+        print(
+            json.dumps(
+                {
+                    "auth_file": str(args.auth_file),
+                    "credential_backend": status.credential_backend,
+                    "keyring_available": status.keyring_available,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    if args.auth_command == "logout":
+        removed = clear_auth_data(args.auth_file)
+        print(json.dumps({"removed": removed}, indent=2))
         return 0
     return 2
 

@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from .auth import (
-    CHATGPT_SESSION_COOKIE,
     CHAT_URL,
+    CHATGPT_SESSION_COOKIE,
     DEFAULT_USER_AGENT,
     _get_access_token_expiry,
 )
@@ -127,12 +127,15 @@ def _persist_refreshed_auth(
     client: Any,
     path: Path,
     response: dict[str, Any],
+    *,
+    credential_store: str | None = None,
 ) -> None:
     persist_auth_data(
         client.auth,
         path,
         session_token=response["sessionToken"].strip(),
         session_expires_at=response.get("expires"),
+        credential_store=credential_store,
     )
 
 
@@ -229,6 +232,7 @@ def refresh_auth_session(
     *,
     persist: bool = True,
     auth_file: str | Path | None = None,
+    credential_store: str | None = None,
 ) -> AuthRefreshResult:
     """Refresh access/session credentials without delegating auth to curl."""
 
@@ -272,7 +276,12 @@ def refresh_auth_session(
     )
     persisted = bool(persist and isinstance(target, Path))
     if persisted:
-        _persist_refreshed_auth(client, target, response)
+        _persist_refreshed_auth(
+            client,
+            target,
+            response,
+            credential_store=credential_store,
+        )
     return AuthRefreshResult(
         status_code=int(status),
         access_token_present=True,

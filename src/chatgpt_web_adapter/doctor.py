@@ -180,6 +180,38 @@ def _safe_error(error: BaseException) -> dict[str, str]:
     return {"type": type(error).__name__, "message": str(error)}
 
 
+def _auth_credential_store_check(status: Any) -> DoctorCheck:
+    backend = str(getattr(status, "credential_backend", "file") or "file")
+    keyring_available = bool(getattr(status, "keyring_available", False))
+    keyring_backend = getattr(status, "keyring_backend", None)
+    evidence = {
+        "backend": backend,
+        "keyring_available": keyring_available,
+        "keyring_backend": keyring_backend,
+    }
+    if backend == "keyring":
+        return _pass(
+            "auth.credential_store",
+            "auth",
+            "Reusable authorization is stored in the OS credential store",
+            evidence=evidence,
+        )
+    remediation = (
+        "Install `chatgpt-web-adapter[secret-store]` and run "
+        "`cwa auth migrate --backend keyring`."
+        if not keyring_available
+        else "Run `cwa auth migrate --backend keyring` to move reusable authorization "
+        "into the OS credential store."
+    )
+    return _warn(
+        "auth.credential_store",
+        "auth",
+        "Reusable authorization is using the owner-only secure file fallback",
+        evidence=evidence,
+        remediation=remediation,
+    )
+
+
 def _auth_file_permissions_check(path: Path) -> DoctorCheck:
     if os.name == "nt":
         return _skip(
@@ -327,6 +359,9 @@ def _auth_checks(
     evidence = {
         "auth_file": str(status.auth_file.resolve()),
         "file_exists": status.file_exists,
+        "credential_backend": getattr(status, "credential_backend", "file"),
+        "keyring_available": bool(getattr(status, "keyring_available", False)),
+        "keyring_backend": getattr(status, "keyring_backend", None),
         "access_token_present": status.access_token_present,
         "access_token_expires_at": (
             status.access_token_expires_at.isoformat()
@@ -366,6 +401,7 @@ def _auth_checks(
         return checks
 
     checks.append(_auth_file_permissions_check(status.auth_file))
+    checks.append(_auth_credential_store_check(status))
 
     if status.access_token_present or status.session_cookie_present:
         checks.append(

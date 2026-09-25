@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from .auth import CHATGPT_SESSION_COOKIE, _get_access_token_expiry
+from .credential_store import (
+    delete_keyring_payload,
+    keyring_metadata,
+    load_auth_payload,
+    select_persist_backend,
+    store_keyring_payload,
+)
 from .exceptions import AuthError
 from .file_lock import InterProcessFileLock
 
@@ -72,6 +79,7 @@ def persist_auth_data(
     *,
     session_token: str | None = None,
     session_expires_at: Any = None,
+    credential_store: str | None = None,
 ) -> Path:
     """Atomically persist reusable auth state under a cross-process write lock."""
 
@@ -83,18 +91,11 @@ def persist_auth_data(
     )
     try:
         with lock:
-            try:
-                current = (
-                    json.loads(path.read_text(encoding="utf-8"))
-                    if path.is_file()
-                    else {}
-                )
-            except (OSError, ValueError) as error:
-                raise AuthError(
-                    f"Failed to read auth data before saving: {error}"
-                ) from error
-            if not isinstance(current, dict):
-                current = {}
+            current, store_info = load_auth_payload(
+                path,
+                credential_store=credential_store,
+            )
+            current = dict(current or {})
 
             access_token = getattr(auth, "accessToken", None)
             cookies = dict(getattr(auth, "cookies", {}) or {})
@@ -130,7 +131,85 @@ def persist_auth_data(
             current["headers"] = headers
             current.pop("proof_token", None)
             current.pop("turnstile_token", None)
-            _atomic_write_json(path, current)
+
+            backend = select_persist_backend(
+                path,
+                current=store_info,
+                credential_store=credential_store,
+            )
+            if backend == "keyring":
+                store_keyring_payload(store_info.account, current)
+                _atomic_write_json(path, keyring_metadata(store_info.account, current))
+            else:
+                _atomic_write_json(path, current)
     except TimeoutError as error:
         raise AuthError(str(error)) from error
     return path
+
+
+def migrate_auth_data(
+    auth_file: str | Path,
+    *,
+    backend: str = "keyring",
+) -> Path:
+    """Explicitly migrate reusable auth material between keyring and file backends."""
+
+    if backend not in {"keyring", "file"}:
+        raise AuthError("Credential migration backend must be 'keyring' or 'file'")
+    path = Path(auth_file)
+    lock = InterProcessFileLock(
+        _auth_lock_path(path),
+        timeout=_AUTH_LOCK_TIMEOUT_SECONDS,
+        timeout_message=f"Authorization store is busy: {path}",
+    )
+    try:
+        with lock:
+            payload, store_info = load_auth_payload(path)
+            if payload is None:
+                raise AuthError("No reusable authorization data is available to migrate")
+            if backend == store_info.backend:
+                if backend == "file":
+                    _atomic_write_json(path, payload)
+                return path
+            if backend == "keyring":
+                if not store_info.keyring_available:
+                    raise AuthError("OS credential store is unavailable")
+                store_keyring_payload(store_info.account, payload)
+                _atomic_write_json(path, keyring_metadata(store_info.account, payload))
+                return path
+
+            _atomic_write_json(path, payload)
+            try:
+                delete_keyring_payload(store_info.account)
+            except AuthError as error:
+                raise AuthError(
+                    "Secure file fallback was written, but the OS credential-store copy "
+                    "could not be removed"
+                ) from error
+            return path
+    except TimeoutError as error:
+        raise AuthError(str(error)) from error
+
+
+def clear_auth_data(auth_file: str | Path) -> bool:
+    """Remove reusable auth material from the active backend and metadata file."""
+
+    path = Path(auth_file)
+    lock = InterProcessFileLock(
+        _auth_lock_path(path),
+        timeout=_AUTH_LOCK_TIMEOUT_SECONDS,
+        timeout_message=f"Authorization store is busy: {path}",
+    )
+    try:
+        with lock:
+            payload, store_info = load_auth_payload(path)
+            existed = payload is not None or path.exists()
+            if store_info.backend == "keyring" and payload is not None:
+                delete_keyring_payload(store_info.account)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                raise AuthError("Failed to remove authorization metadata file") from error
+            return existed
+    except TimeoutError as error:
+        raise AuthError(str(error)) from error

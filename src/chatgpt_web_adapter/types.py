@@ -158,12 +158,9 @@ class AuthData:
         ]
 
     @classmethod
-    def from_json(cls, path: str | Path) -> "AuthData":
-        import json
-
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    def from_mapping(cls, payload: dict[str, Any]) -> "AuthData":
         access_token = None
-        for key in ("accessToken", "access_token", "api_key"):
+        for key in ('accessToken', 'access_token', 'api_key'):
             value = payload.get(key)
             if isinstance(value, str):
                 value = value.strip()
@@ -183,6 +180,16 @@ class AuthData:
             proof_token=payload.get("proof_token"),
             turnstile_token=payload.get("turnstile_token"),
         )
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "AuthData":
+        import json
+
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("auth data must contain a JSON object")
+        return cls.from_mapping(payload)
+
 
 
 @dataclass

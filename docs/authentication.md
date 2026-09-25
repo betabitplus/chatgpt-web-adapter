@@ -3,14 +3,15 @@
 `chatgpt-web-adapter` uses an existing ChatGPT web account session. It does not
 use an OpenAI API key and does not implement an alternative login protocol.
 
-## Install the Browser Extra
+## Install Auth Extras
+
+Install the browser extra required by the legacy interactive login flow, and add the secret-store extra on desktop systems where reusable credentials should live in the OS credential store:
 
 ```bash
-python -m pip install "chatgpt-web-adapter[browser]==0.1.7"
+python -m pip install "chatgpt-web-adapter[browser,secret-store]"
 ```
 
-The core HTTP transport has no Python runtime dependencies, but current
-protected ChatGPT writes require the optional Chromium integration.
+`secret-store` installs the mature Python `keyring` abstraction (macOS Keychain, Windows Credential Manager, and supported Linux Secret Service backends). CWA still supports an explicit owner-only file fallback for portable/headless environments.
 
 ## First Login
 
@@ -33,22 +34,13 @@ Set `CHATGPT_WEB_ADAPTER_PROFILE_DIR` or pass `--profile-dir` to override it.
 
 ## What Is Stored
 
-The login command creates two related pieces of reusable state:
+The login command creates two related pieces of reusable state. With a working `keyring` backend, the access/session tokens, cookies, structured `browserCookies`, reusable request headers, and compatible legacy fields are stored as one JSON credential blob in the OS credential store. `auth_data.json` remains as an owner-only metadata pointer containing the backend/account identifier and non-secret expiry/timestamp hints. If keyring support is unavailable, `auto` retains the same data in the existing owner-only file backend instead.
 
-1. `auth_data.json` contains the current access token, flat cookies used by the
-   HTTP transport, structured `browserCookies`, request headers, and expiry
-   metadata.
-2. The persistent Chromium profile contains the browser-side session needed to
-   run the official ChatGPT page and obtain current one-shot Sentinel evidence.
+The persistent browser profile remains separate browser-side session state. `browserCookies` preserves cookie domain, path, expiry, SameSite, priority, and source metadata. Neither `proof_token` nor `turnstile_token` is persisted by the reusable auth store; those values are short-lived and memory-only.
 
-`browserCookies` preserves cookie domain, path, expiry, SameSite, priority, and
-source metadata. The flat `cookies` mapping remains for HTTP compatibility.
+Backend rules are intentionally asymmetric for safety: an existing plaintext file may migrate to keyring only after the keyring write is verified, and the metadata file is replaced only afterward. Once metadata says the profile is keyring-backed, a temporary keyring outage fails closed rather than silently writing bearer-equivalent credentials back to plaintext.
 
-Neither `proof_token` nor `turnstile_token` is persisted by the current auth
-flow. Sentinel credentials are short-lived, single-use values kept in memory.
-
-Treat both the JSON file and profile directory as secrets. Do not commit, share,
-or attach them to bug reports.
+Treat a secret-bearing fallback file and the browser profile as secrets. The keyring metadata file itself contains no reusable credential values, but should still remain local and owner-only.
 
 ## Normal Startup
 
@@ -96,9 +88,28 @@ or with `client.refresh_auth()`.
 chatgpt-web-adapter auth status --auth-file auth_data.json
 ```
 
-The command reports token/session expiry, structured cookie count, persistent
-profile location, and whether the profile exists. It does not print credential
-values.
+The command reports token/session expiry, structured cookie count, persistent profile location, credential backend provenance, and whether the profile exists. It does not print credential values.
+
+## Credential Backend Migration and Logout
+
+`auto` is the default write policy: use keyring when a usable OS backend is installed, otherwise use the hardened file fallback. For new or already file-backed auth, choose the portable backend explicitly during login/refresh with `--credential-store file`, or require the OS backend with `--credential-store keyring`. An already keyring-backed profile is never silently downgraded by refresh/login; use the explicit `auth migrate --backend file` path so the old OS-store copy is removed safely.
+
+Existing authorization can be moved explicitly without re-login:
+
+```bash
+chatgpt-web-adapter auth migrate --auth-file auth_data.json --backend keyring
+chatgpt-web-adapter auth migrate --auth-file auth_data.json --backend file
+```
+
+Migration never deletes the last usable credential set before the target copy exists. `auth migrate --backend file` writes the private file first and then deletes the OS-store item; a deletion failure is reported instead of being hidden.
+
+Remove reusable local authorization with:
+
+```bash
+chatgpt-web-adapter auth logout --auth-file auth_data.json
+```
+
+For a keyring-backed profile, logout deletes the OS credential first and removes the metadata file only after that succeeds. It does not claim to revoke the server-side ChatGPT session or delete the separate browser profile.
 
 ## Forced Reauthentication
 

@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .credential_store import load_auth_payload
 from .exceptions import AuthError
 from .types import AuthData
 
@@ -93,7 +94,7 @@ def _normalize_session_cookies(auth: AuthData) -> None:
         auth.cookies.pop(CHATGPT_SESSION_COOKIE, None)
 
 
-def _seed_session_cookie_from_auth_file(auth: AuthData, auth_path: Path) -> None:
+def _seed_session_cookie_from_payload(auth: AuthData, payload: dict | None) -> None:
     """Best-effort mapping for a raw ``/api/auth/session`` JSON dump.
 
     ChatGPT's session endpoint exposes ``sessionToken`` while browser requests use
@@ -101,13 +102,7 @@ def _seed_session_cookie_from_auth_file(auth: AuthData, auth_path: Path) -> None
     ``.0``/``.1`` variants copied from a browser.
     """
 
-    if _has_session_cookie(auth) or not auth_path.is_file():
-        return
-    try:
-        payload = json.loads(auth_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    if not isinstance(payload, dict):
+    if _has_session_cookie(auth) or not isinstance(payload, dict):
         return
     session_token = payload.get("sessionToken")
     if isinstance(session_token, str) and session_token.strip():
@@ -120,21 +115,20 @@ def load_auth_data(
     allow_expired_session_refresh: bool = False,
 ) -> AuthData:
     auth_path = Path(auth_file)
-    try:
-        auth = AuthData.from_json(auth_path)
-    except FileNotFoundError:
-        auth = AuthData()
-    except OSError as error:
-        raise AuthError(f"Failed to read auth data from {auth_path}: {error}") from error
-    except ValueError as error:
-        raise AuthError(f"Failed to parse auth data from {auth_path}: {error}") from error
+    payload, store_info = load_auth_payload(auth_path)
+    auth = AuthData.from_mapping(payload) if payload is not None else AuthData()
 
-    _seed_session_cookie_from_auth_file(auth, auth_path)
+    _seed_session_cookie_from_payload(auth, payload)
     _normalize_session_cookies(auth)
 
     candidates: list[tuple[str, str]] = []
     if auth.accessToken:
-        candidates.append((f"{auth_path.name}:accessToken", auth.accessToken))
+        source = (
+            "keyring:accessToken"
+            if store_info.backend == "keyring"
+            else f"{auth_path.name}:accessToken"
+        )
+        candidates.append((source, auth.accessToken))
     env_access_token = _load_access_token(auth_path)
     if env_access_token and env_access_token != auth.accessToken:
         candidates.append((".env:accessToken", env_access_token))

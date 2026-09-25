@@ -461,3 +461,31 @@ def test_doctor_cli_failure_uses_existing_unavailable_exit_code(monkeypatch, cap
     assert "CWA doctor: FAIL" in output
     assert "[FAIL] bridge.available" in output
     assert "remediation: Reload extension." in output
+
+
+def test_auth_credential_store_check_passes_for_keyring() -> None:
+    status = SimpleNamespace(
+        credential_backend="keyring",
+        keyring_available=True,
+        keyring_backend="tests.FakeKeyring",
+    )
+
+    check = doctor._auth_credential_store_check(status)
+
+    assert check.status is DoctorCheckStatus.PASS
+    assert check.evidence["backend"] == "keyring"
+    assert check.evidence["keyring_backend"] == "tests.FakeKeyring"
+
+
+def test_auth_credential_store_check_warns_for_secure_file_fallback() -> None:
+    status = SimpleNamespace(
+        credential_backend="file",
+        keyring_available=False,
+        keyring_backend=None,
+    )
+
+    check = doctor._auth_credential_store_check(status)
+
+    assert check.status is DoctorCheckStatus.WARN
+    assert check.required is False
+    assert "secret-store" in (check.remediation or "")

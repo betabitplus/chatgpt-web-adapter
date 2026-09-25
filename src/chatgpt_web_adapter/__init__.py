@@ -7,6 +7,7 @@ from .auth import DEFAULT_AUTH_FILE, load_auth_data
 from .auth_browser import BrowserLoginResult, browser_login, default_browser_profile_dir
 from .auth_refresh import AuthRefreshResult
 from .auth_status import AuthStatus, get_auth_status
+from .auth_store import clear_auth_data, migrate_auth_data, persist_auth_data
 from .browser_native_install import (
     EXTENSION_ID as BROWSER_NATIVE_EXTENSION_ID,
 )
@@ -173,9 +174,12 @@ SUPPORT_EXPORTS = [
     "DEFAULT_AUTH_FILE",
     "DEFAULT_MODEL",
     "browser_login",
+    "clear_auth_data",
     "default_browser_profile_dir",
     "get_auth_status",
     "load_auth_data",
+    "migrate_auth_data",
+    "persist_auth_data",
 ]
 
 PUBLIC_SURFACE_METADATA_EXPORTS = [
@@ -306,9 +310,12 @@ __all__ = [
     "DEFAULT_AUTH_FILE",
     "DEFAULT_MODEL",
     "browser_login",
+    "clear_auth_data",
     "default_browser_profile_dir",
     "get_auth_status",
     "load_auth_data",
+    "migrate_auth_data",
+    "persist_auth_data",
     "PublicSurfaceTier",
     "PUBLIC_SURFACE_TIERS",
     "PUBLIC_SURFACE_CLASSIFICATION",

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,8 +10,9 @@ from .auth import (
     DEFAULT_AUTH_FILE,
     _get_access_token_expiry,
 )
-from .auth_refresh import auth_needs_refresh
 from .auth_browser import default_browser_profile_dir
+from .auth_refresh import auth_needs_refresh
+from .credential_store import load_auth_payload
 from .types import AuthData
 
 
@@ -28,6 +28,9 @@ class AuthStatus:
     browser_cookie_count: int = 0
     browser_profile_dir: Path | None = None
     browser_profile_exists: bool = False
+    credential_backend: str = "file"
+    keyring_available: bool = False
+    keyring_backend: str | None = None
 
 
 def get_auth_status(
@@ -41,26 +44,35 @@ def get_auth_status(
         if profile_dir is not None
         else default_browser_profile_dir()
     )
-    if not path.is_file():
+    payload, store_info = load_auth_payload(path)
+    if payload is None:
         return AuthStatus(
-            path, False, False, None, True, False, None, 0, profile, profile.is_dir()
+            auth_file=path,
+            file_exists=path.is_file(),
+            access_token_present=False,
+            access_token_expires_at=None,
+            access_token_needs_refresh=True,
+            session_cookie_present=False,
+            session_expires_at=None,
+            browser_cookie_count=0,
+            browser_profile_dir=profile,
+            browser_profile_exists=profile.is_dir(),
+            credential_backend=store_info.backend,
+            keyring_available=store_info.keyring_available,
+            keyring_backend=store_info.keyring_backend,
         )
-    auth = AuthData.from_json(path)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        raw = {}
+    auth = AuthData.from_mapping(payload)
     has_session = any(
         name == CHATGPT_SESSION_COOKIE or name.startswith(f"{CHATGPT_SESSION_COOKIE}.")
         for name in auth.cookies
     )
-    if not has_session and isinstance(raw, dict):
-        session_token = raw.get("sessionToken")
+    if not has_session:
+        session_token = payload.get("sessionToken")
         has_session = isinstance(session_token, str) and bool(session_token.strip())
     expires_at = _get_access_token_expiry(auth.accessToken)
     return AuthStatus(
         auth_file=path,
-        file_exists=True,
+        file_exists=path.is_file(),
         access_token_present=bool(auth.accessToken),
         access_token_expires_at=expires_at,
         access_token_needs_refresh=auth_needs_refresh(auth.accessToken),
@@ -69,4 +81,7 @@ def get_auth_status(
         browser_cookie_count=len(auth.browserCookies),
         browser_profile_dir=profile,
         browser_profile_exists=profile.is_dir(),
+        credential_backend=store_info.backend,
+        keyring_available=store_info.keyring_available,
+        keyring_backend=store_info.keyring_backend,
     )

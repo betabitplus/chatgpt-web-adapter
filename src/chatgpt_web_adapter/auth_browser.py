@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .auth import CHATGPT_SESSION_COOKIE, CHAT_URL, DEFAULT_AUTH_FILE, load_auth_data
+from .auth import CHAT_URL, CHATGPT_SESSION_COOKIE, DEFAULT_AUTH_FILE, load_auth_data
 from .auth_store import persist_auth_data
 from .browser_cookies import (
     browser_cookie_params,
@@ -142,6 +142,7 @@ async def _browser_login_async(
     persist: bool,
     reuse_existing_auth: bool,
     profile_lock_timeout: float,
+    credential_store: str | None,
 ) -> BrowserLoginResult:
     zendriver = _import_zendriver()
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -305,6 +306,7 @@ async def _browser_login_async(
                 auth_file,
                 session_token=session["sessionToken"].strip(),
                 session_expires_at=session.get("expires"),
+                credential_store=credential_store,
             )
         return BrowserLoginResult(
             auth=auth,
@@ -328,6 +330,7 @@ def browser_login(
     persist: bool = True,
     reuse_existing_auth: bool = True,
     profile_lock_timeout: float = 30.0,
+    credential_store: str | None = None,
 ) -> BrowserLoginResult:
     """Open ChatGPT once, wait for sign-in, and persist reusable session auth."""
 
@@ -346,6 +349,7 @@ def browser_login(
                 persist=bool(persist),
                 reuse_existing_auth=bool(reuse_existing_auth),
                 profile_lock_timeout=float(profile_lock_timeout),
+                credential_store=credential_store,
             )
         )
     raise AuthError("Synchronous browser_login cannot run inside an active asyncio event loop")

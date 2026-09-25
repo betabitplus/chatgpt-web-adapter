@@ -133,3 +133,31 @@ def test_integrity_fixtures_remain_sanitized() -> None:
         assert "accessToken" not in text
         assert "resume-secret" not in text
         assert "authorization" not in text.lower()
+
+
+def test_minimal_shell_supports_current_rspack_split_integrity_layout() -> None:
+    source = SHELL.read_text(encoding="utf-8")
+
+    assert "const discoverRspackSplitIntegrityResource =" in source
+    assert 'kind: "rspack-split-v1"' in source
+    assert 'assetForChunk("23719")' in source
+    assert 'assetForChunk("262296")' in source
+    assert 'integrityURL: assetForChunk("592570")' in source
+    assert 'integrityModuleId: "n9O"' in source
+    assert 'integrityAcquireExport: "f"' in source
+    assert '"/backend-api/sentinel/chat-requirements/prepare"' in source
+    assert "const prepared = await serverAcquireIntegrity(" in source
+    assert "Object.assign(writeHeaders, integrityBundle.headers)" in source
+    assert '!proxyProtectedWrite && typeof officialConversationTransport !== "function"' in source
+
+
+def test_minimal_shell_rspack_split_discovery_fails_closed_on_bundle_ambiguity() -> None:
+    source = SHELL.read_text(encoding="utf-8")
+
+    assert "MINIMAL_RSPACK_CHUNK_ID_INVALID" in source
+    assert 'matches.length !== 1' in source
+    assert '"AMBIGUOUS" : "MISSING"' in source
+    assert "MINIMAL_RSPACK_RUNTIME_MISSING" in source
+    assert "MINIMAL_RSPACK_RUNTIME_INVALID" in source
+    assert "MINIMAL_RSPACK_CHUNK_INVALID" in source
+    assert "MINIMAL_RSPACK_INTEGRITY_EXPORT_MISSING" in source

@@ -544,6 +544,40 @@
     if (!window.SentinelSDK) throw new Error("MINIMAL_SENTINEL_SDK_MISSING");
   };
 
+  const discoverRspackSplitIntegrityResource = (manifestText, manifestURL) => {
+    const assetForChunk = (chunkId) => {
+      if (!/^[0-9]+$/.test(chunkId)) {
+        throw new Error("MINIMAL_RSPACK_CHUNK_ID_INVALID");
+      }
+      const expression = new RegExp(
+        `/cdn/assets/${chunkId}\\.[A-Za-z0-9]+\\.js`,
+        "g",
+      );
+      const matches = [...new Set(manifestText.match(expression) || [])];
+      if (matches.length !== 1) {
+        throw new Error(
+          `MINIMAL_RSPACK_CHUNK_${chunkId}_${matches.length ? "AMBIGUOUS" : "MISSING"}`,
+        );
+      }
+      return new URL(matches[0], manifestURL).href;
+    };
+    const entryMatch = /'entry':\{'module':'[^']+','imports':\['([^']+)'/.exec(manifestText);
+    if (!entryMatch || !entryMatch[1]) {
+      throw new Error("MINIMAL_RSPACK_RUNTIME_MISSING");
+    }
+    return Object.freeze({
+      kind: "rspack-split-v1",
+      runtimeURL: new URL(entryMatch[1], manifestURL).href,
+      dependencyURLs: [
+        assetForChunk("23719"),
+        assetForChunk("262296"),
+      ],
+      integrityURL: assetForChunk("592570"),
+      integrityModuleId: "n9O",
+      integrityAcquireExport: "f",
+    });
+  };
+
   const bootstrapProductResources = async () => {
     setStage("root");
     const rootResponse = await fetch("/", {
@@ -564,15 +598,91 @@
 
     const productAssets = [...parsed.querySelectorAll("script[src],link[href]")]
       .map((element) => element.getAttribute("src") || element.getAttribute("href") || "");
-    const integrityAsset = productAssets.find(
+    const legacyIntegrityAsset = productAssets.find(
       (value) => value.includes("/conversation-small-") && value.includes(".js"),
     );
-    if (!integrityAsset) throw new Error("MINIMAL_INTEGRITY_ASSET_MISSING");
-    return new URL(integrityAsset, pageBaseURL).href;
+    if (legacyIntegrityAsset) {
+      return Object.freeze({
+        kind: "legacy",
+        integrityURL: new URL(legacyIntegrityAsset, pageBaseURL).href,
+      });
+    }
+
+    // ChatGPT's 2026-09 rspack layout split the integrity helper out of the
+    // former conversation-small monolith. Resolve the current server-owned
+    // modules from the root manifest without hydrating the SPA or scanning the
+    // entire conversation route graph.
+    const manifestAsset = productAssets.find(
+      (value) => /\/cdn\/assets\/manifest-[A-Za-z0-9]+\.js(?:\?|$)/.test(value),
+    );
+    if (!manifestAsset) throw new Error("MINIMAL_INTEGRITY_MANIFEST_MISSING");
+    const manifestURL = new URL(manifestAsset, pageBaseURL).href;
+    setStage("manifest");
+    const manifestResponse = await fetch(manifestURL, {
+      credentials: "include",
+      cache: "no-store",
+    });
+    if (!manifestResponse.ok) {
+      throw new Error(`MINIMAL_INTEGRITY_MANIFEST_HTTP_${manifestResponse.status}`);
+    }
+    const manifestText = await manifestResponse.text();
+    return discoverRspackSplitIntegrityResource(manifestText, manifestURL);
   };
 
-  const loadIntegrityRuntime = async (integrityURL) => {
+  const loadIntegrityRuntime = async (integrityResource) => {
     setStage("integrity_discovery");
+    if (integrityResource?.kind === "rspack-split-v1") {
+      setStage("integrity_import");
+      const runtimeModule = await import(integrityResource.runtimeURL);
+      const rspackRequire = runtimeModule?.__webpack_require__;
+      if (typeof rspackRequire !== "function" || typeof rspackRequire.C !== "function") {
+        throw new Error("MINIMAL_RSPACK_RUNTIME_INVALID");
+      }
+      for (const moduleURL of [
+        ...integrityResource.dependencyURLs,
+        integrityResource.integrityURL,
+      ]) {
+        const chunk = await import(moduleURL);
+        if (!chunk?.__webpack_modules__ || !Array.isArray(chunk?.__rspack_esm_ids)) {
+          throw new Error("MINIMAL_RSPACK_CHUNK_INVALID");
+        }
+        rspackRequire.C(chunk);
+      }
+      const integrityModule = rspackRequire(integrityResource.integrityModuleId);
+      const serverAcquireIntegrity = integrityModule?.[integrityResource.integrityAcquireExport];
+      if (typeof serverAcquireIntegrity !== "function") {
+        throw new Error("MINIMAL_RSPACK_INTEGRITY_EXPORT_MISSING");
+      }
+      return Object.freeze({
+        createAcquireIntegrity: (accessToken) => async () => {
+          const deviceMatch = document.cookie.match(/(?:^|;\s*)oai-did=([^;]+)/);
+          const deviceId = deviceMatch ? decodeURIComponent(deviceMatch[1]) : "";
+          const prepared = await serverAcquireIntegrity(async (prepareProof) => {
+            const path = "/backend-api/sentinel/chat-requirements/prepare";
+            const response = await fetch(path, {
+              credentials: "include",
+              cache: "no-store",
+              method: "POST",
+              headers: requestHeaders(accessToken, deviceId, path),
+              body: JSON.stringify({ p: prepareProof }),
+            });
+            if (!response.ok) {
+              throw new Error(`MINIMAL_CHAT_REQUIREMENTS_HTTP_${response.status}`);
+            }
+            return response.json();
+          });
+          return {
+            ...prepared,
+            chatReq: prepared?.chatRequirements ?? {},
+          };
+        },
+        officialConversationTransport: null,
+        initializeConversationTransport: null,
+      });
+    }
+
+    const integrityURL = integrityResource?.integrityURL;
+    if (!integrityURL) throw new Error("MINIMAL_INTEGRITY_RESOURCE_INVALID");
     const integrityCacheKey = `__cwa_integrity_exports_v5:${integrityURL}`;
     integrityDiscoveryCacheKey = integrityCacheKey;
     let integrityExports = null;
@@ -627,7 +737,7 @@
     setStage("integrity_init");
     initializeIntegrity();
     return Object.freeze({
-      acquireIntegrity,
+      createAcquireIntegrity: () => acquireIntegrity,
       officialConversationTransport,
       initializeConversationTransport,
     });
@@ -722,11 +832,17 @@
     if (!sharedConversationInitializationPromise) {
       const candidate = (async () => {
         await waitForSentinel();
-        const integrityURL = await bootstrapProductResources();
-        const runtime = await loadIntegrityRuntime(integrityURL);
-        setStage("conversation_transport_init");
-        runtime.initializeConversationTransport();
+        const integrityResource = await bootstrapProductResources();
+        const runtime = await loadIntegrityRuntime(integrityResource);
+        if (typeof runtime.initializeConversationTransport === "function") {
+          setStage("conversation_transport_init");
+          runtime.initializeConversationTransport();
+        }
         const accessToken = await loadSession();
+        const acquireIntegrity = runtime.createAcquireIntegrity(accessToken);
+        if (typeof acquireIntegrity !== "function") {
+          throw new Error("MINIMAL_INTEGRITY_ACQUIRE_MISSING");
+        }
         setStage("request_client_init");
         let officialApiClient = null;
         try {
@@ -734,14 +850,14 @@
           officialApiClient = loadedApiClient.requestClient;
         } catch (_) {
           // The request-client singleton is a private frontend export and can
-          // change independently of the official conversation transport.
-          // Prepare has an authenticated page-fetch fallback, so keep writes
-          // available when only this optional optimization changes shape.
+          // change independently of the security helper. Prepare has an
+          // authenticated page-fetch fallback, so this optimization stays
+          // optional across frontend bundle layouts.
           officialApiClient = null;
         }
         return Object.freeze({
           accessToken,
-          acquireIntegrity: runtime.acquireIntegrity,
+          acquireIntegrity,
           officialConversationTransport: runtime.officialConversationTransport,
           officialApiClient,
         });
@@ -865,11 +981,18 @@
     const proofToken = integrity && typeof integrity.proofToken === "string"
       ? integrity.proofToken
       : "";
+    const integrityHeaders =
+      integrity && integrity.headers && typeof integrity.headers === "object"
+        ? Object.fromEntries(
+            Object.entries(integrity.headers)
+              .filter(([key, value]) => typeof key === "string" && key && typeof value === "string" && value),
+          )
+        : {};
+    const serverOwnedHeaders = Object.keys(integrityHeaders).length > 0;
     if (
       chatReq.force_login === true ||
       !(chatReq.token || chatReq.prepare_token) ||
-      !turnstileToken ||
-      !proofToken
+      (!serverOwnedHeaders && (!turnstileToken || !proofToken))
     ) {
       throw new Error("MINIMAL_INTEGRITY_INCOMPLETE");
     }
@@ -880,7 +1003,15 @@
       await window.SentinelSDK.token("conversation");
     } catch (_) {}
     const telemetry = window.SentinelSDK.timing?.();
-    return { chatReq, turnstileToken, proofToken, telemetry, deviceId };
+    return {
+      chatReq,
+      turnstileToken,
+      proofToken,
+      telemetry,
+      deviceId,
+      headers: integrityHeaders,
+      serverOwnedHeaders,
+    };
   };
 
   const buildConversationMessage = (attachmentDescriptors) => {
@@ -1440,14 +1571,22 @@
         turn_trace_id: turnTraceId,
       });
     }
-    if (integrityBundle.chatReq.token) {
-      writeHeaders["OpenAI-Sentinel-Chat-Requirements-Token"] = integrityBundle.chatReq.token;
+    if (integrityBundle.serverOwnedHeaders) {
+      Object.assign(writeHeaders, integrityBundle.headers);
     } else {
-      writeHeaders["OpenAI-Sentinel-Chat-Requirements-Prepare-Token"] =
-        integrityBundle.chatReq.prepare_token;
+      if (integrityBundle.chatReq.token) {
+        writeHeaders["OpenAI-Sentinel-Chat-Requirements-Token"] = integrityBundle.chatReq.token;
+      } else {
+        writeHeaders["OpenAI-Sentinel-Chat-Requirements-Prepare-Token"] =
+          integrityBundle.chatReq.prepare_token;
+      }
+      if (integrityBundle.turnstileToken) {
+        writeHeaders["OpenAI-Sentinel-Turnstile-Token"] = integrityBundle.turnstileToken;
+      }
+      if (integrityBundle.proofToken) {
+        writeHeaders["OpenAI-Sentinel-Proof-Token"] = integrityBundle.proofToken;
+      }
     }
-    writeHeaders["OpenAI-Sentinel-Turnstile-Token"] = integrityBundle.turnstileToken;
-    writeHeaders["OpenAI-Sentinel-Proof-Token"] = integrityBundle.proofToken;
     if (typeof integrityBundle.telemetry === "string" && integrityBundle.telemetry) {
       writeHeaders["OAI-Telemetry"] = integrityBundle.telemetry;
     }
@@ -1616,17 +1755,23 @@
       acquireIntegrity = shared.acquireIntegrity;
       officialConversationTransport = shared.officialConversationTransport;
       officialApiClient = shared.officialApiClient;
-      if (typeof officialConversationTransport !== "function") {
+      if (!proxyProtectedWrite && typeof officialConversationTransport !== "function") {
         throw new Error("MINIMAL_OFFICIAL_CONVERSATION_TRANSPORT_MISSING");
       }
       setStage("session");
     } else {
       await waitForSentinel();
-      const integrityURL = await bootstrapProductResources();
-      const runtime = await loadIntegrityRuntime(integrityURL);
-      acquireIntegrity = runtime.acquireIntegrity;
-      officialConversationTransport = runtime.officialConversationTransport;
+      const integrityResource = await bootstrapProductResources();
+      const runtime = await loadIntegrityRuntime(integrityResource);
       accessToken = await loadSession();
+      acquireIntegrity = runtime.createAcquireIntegrity(accessToken);
+      if (typeof acquireIntegrity !== "function") {
+        throw new Error("MINIMAL_INTEGRITY_ACQUIRE_MISSING");
+      }
+      officialConversationTransport = runtime.officialConversationTransport;
+      if (!proxyProtectedWrite && typeof officialConversationTransport !== "function") {
+        throw new Error("MINIMAL_OFFICIAL_CONVERSATION_TRANSPORT_MISSING");
+      }
       if (temporary) {
         sharedConversationInitializationPromise = Promise.resolve(Object.freeze({
           accessToken,

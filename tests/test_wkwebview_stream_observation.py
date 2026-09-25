@@ -395,7 +395,7 @@ def test_minimal_security_protected_write_observes_response_directly() -> None:
     assert "__cwaDirectObserve: true" in shell
     assert "void observeDirectWriteResponse(writeResponse)" in shell
     assert shell.index("const observeProtectedWriteResponse =") < shell.index(
-        "loadIntegrityRuntime(integrityURL)"
+        "loadIntegrityRuntime(integrityResource)"
     )
 
 

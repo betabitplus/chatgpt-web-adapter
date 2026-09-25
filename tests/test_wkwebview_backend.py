@@ -3209,7 +3209,7 @@ def test_minimal_security_shell_keeps_named_stage_boundaries() -> None:
     assert "await fetch(" not in entrypoint
     for invocation in (
         "bootstrapProductResources()",
-        "loadIntegrityRuntime(integrityURL)",
+        "loadIntegrityRuntime(integrityResource)",
         "loadSession()",
         "loadModelCatalog(accessToken)",
         "resolveModelSelection(modelsPayload)",

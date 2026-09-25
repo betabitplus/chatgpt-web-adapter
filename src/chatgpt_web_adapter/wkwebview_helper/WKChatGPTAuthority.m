@@ -629,7 +629,7 @@ static NSString *ComposerResolverSource(void) {
     return @"()=>{"
             "const visible=(element)=>{if(!(element instanceof Element))return false;const rect=element.getBoundingClientRect();if(rect.width<=0||rect.height<=0)return false;const style=getComputedStyle(element);return style.display!=='none'&&style.visibility!=='hidden'&&style.opacity!=='0';};"
             "const writable=(element)=>{if(!(element instanceof Element))return false;if(element.getAttribute('aria-disabled')==='true')return false;if(element.disabled===true||element.readOnly===true)return false;if(element.hasAttribute('contenteditable')&&element.getAttribute('contenteditable')!=='true')return false;return true;};"
-            "const structural=(element)=>{if(element.closest('[data-testid*=\"composer\"]'))return true;const testId=String(element.getAttribute('data-testid')||'').toLowerCase();if(testId.includes('composer')||testId.includes('prompt'))return true;const form=element.closest('form');if(!form)return false;return form.querySelectorAll('button[type=\"submit\"],button[data-testid*=\"send\"],button[data-testid*=\"submit\"]').length>0;};"
+            "const structural=(element)=>{if(element.closest('[data-testid*=\"composer\"]'))return true;const testId=String(element.getAttribute('data-testid')||'').toLowerCase();if(testId.includes('composer')||testId.includes('prompt'))return true;if(element.getAttribute('contenteditable')==='true'&&element.getAttribute('role')==='textbox'&&element.getAttribute('aria-multiline')==='true')return true;const form=element.closest('form');if(!form)return false;return form.querySelectorAll('button[type=\"submit\"],button[data-testid*=\"send\"],button[data-testid*=\"submit\"]').length>0;};"
             "const score=(element)=>{let value=0;if(element.id==='prompt-textarea')value+=1000;if(element.getAttribute('data-lexical-editor')==='true')value+=900;if(element.matches('textarea[placeholder]'))value+=800;if(element.getAttribute('contenteditable')==='true')value+=500;if(element.getAttribute('role')==='textbox')value+=120;if(element.getAttribute('aria-multiline')==='true')value+=100;if(element.closest('form'))value+=120;if(element.closest('[data-testid*=\"composer\"]'))value+=120;return value;};"
             "const selectors=['#prompt-textarea','[contenteditable=\"true\"][data-lexical-editor=\"true\"]','textarea[placeholder]','[contenteditable=\"true\"]'];const seen=new Set(),candidates=[];let order=0;"
             "for(const selector of selectors){for(const element of document.querySelectorAll(selector)){if(seen.has(element))continue;seen.add(element);if(!visible(element)||!writable(element))continue;const genericOnly=element.getAttribute('contenteditable')==='true'&&element.id!=='prompt-textarea'&&element.getAttribute('data-lexical-editor')!=='true';if(genericOnly&&!structural(element))continue;candidates.push({element,score:score(element),order});order+=1;}}"
@@ -691,12 +691,162 @@ static NSString *ComposerDiagnosticsScript(void) {
     return [NSString stringWithFormat:
             @"(()=>{"
               "const resolveComposer=%@;const e=resolveComposer();"
-              "const all=[...document.querySelectorAll('#prompt-textarea,[contenteditable=\"true\"][data-lexical-editor=\"true\"],textarea[placeholder],[contenteditable=\"true\"]')].map((x,i)=>{const r=x.getBoundingClientRect();const s=getComputedStyle(x);return {i,tag:x.tagName,id:x.id||null,test:x.getAttribute('data-testid')||null,lexical:x.getAttribute('data-lexical-editor')||null,role:x.getAttribute('role')||null,ce:x.getAttribute('contenteditable')||null,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0',w:Math.round(r.width),h:Math.round(r.height),text_len:String(x.innerText||x.value||'').length,active:x===document.activeElement};});"
+              "const all=[...document.querySelectorAll('#prompt-textarea,[contenteditable=\"true\"][data-lexical-editor=\"true\"],textarea[placeholder],[contenteditable=\"true\"],[role=\"textbox\"],[aria-multiline=\"true\"]')].map((x,i)=>{const r=x.getBoundingClientRect();const s=getComputedStyle(x);return {i,tag:x.tagName,id:x.id||null,test:x.getAttribute('data-testid')||null,lexical:x.getAttribute('data-lexical-editor')||null,role:x.getAttribute('role')||null,multiline:x.getAttribute('aria-multiline')||null,ce:x.getAttribute('contenteditable')||null,visible:r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0',w:Math.round(r.width),h:Math.round(r.height),text_len:String(x.innerText||x.value||'').length,active:x===document.activeElement};});"
               "if(!e)return JSON.stringify({selected:null,candidates:all});"
               "const form=e.closest('form'),scope=e.closest('[data-testid*=\"composer\"]');const r=e.getBoundingClientRect();"
               "return JSON.stringify({selected:{tag:e.tagName,id:e.id||null,test:e.getAttribute('data-testid')||null,lexical:e.getAttribute('data-lexical-editor')||null,role:e.getAttribute('role')||null,ce:e.getAttribute('contenteditable')||null,class:String(e.className||'').slice(0,160),active:e===document.activeElement,connected:e.isConnected,w:Math.round(r.width),h:Math.round(r.height),text_len:String(e.innerText||e.value||'').length,form:!!form,scope_test:scope?scope.getAttribute('data-testid')||null:null},candidates:all});"
             "})()",
             resolver];
+}
+
+static NSString *ModeControlPointScript(void) {
+    NSString *resolver = ComposerResolverSource();
+    return [NSString stringWithFormat:
+            @"(()=>{"
+              "const resolveComposer=%@;const composer=resolveComposer();"
+              "if(!composer)return JSON.stringify({ok:false,reason:'composer_missing'});"
+              "const normalize=(v)=>String(v||'').trim().toLowerCase().replace(/[\\s_\\-]+/g,' ');"
+              "const classify=(v)=>{const t=normalize(v);if(t==='instant'||t==='мгновенно')return 'INSTANT';if(t==='medium'||t==='средний'||t==='thinking standard')return 'MEDIUM';if(t==='high'||t==='высокий'||t==='thinking extended')return 'HIGH';return null;};"
+              "const visible=(e)=>{if(!(e instanceof Element))return false;const r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;const s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'&&s.pointerEvents!=='none';};"
+              "const cr=composer.getBoundingClientRect(),items=[],seen=new Set();"
+              "const add=(e,mode)=>{if(!(e instanceof Element)||seen.has(e)||!visible(e))return;const r=e.getBoundingClientRect();const dx=Math.max(0,Math.max(cr.left-r.right,r.left-cr.right));const dy=Math.max(0,Math.max(cr.top-r.bottom,r.top-cr.bottom));const d=Math.hypot(dx,dy);if(d<=800){seen.add(e);items.push({e,mode,r,d});}};"
+              "for(const e of document.querySelectorAll('button,[role=button]')){const modes=[e.innerText,e.getAttribute('aria-label'),e.getAttribute('title')].map(classify).filter(Boolean);const unique=[...new Set(modes)];if(unique.length===1)add(e,unique[0]);}"
+              "for(const leaf of document.querySelectorAll('span,div,p')){if(leaf.children.length)continue;const mode=classify(leaf.textContent);if(!mode)continue;const control=leaf.closest('button,[role=button],[aria-haspopup],[tabindex]');if(control)add(control,mode);}"
+              "items.sort((a,b)=>a.d-b.d);if(!items.length){const debug=[];for(const leaf of document.querySelectorAll('span,div,p')){if(leaf.children.length)continue;const mode=classify(leaf.textContent);if(!mode)continue;const chain=[];let node=leaf;for(let depth=0;node&&depth<7;depth++,node=node.parentElement){const r=node.getBoundingClientRect();chain.push({depth,tag:node.tagName,role:node.getAttribute('role'),tabindex:node.getAttribute('tabindex'),haspopup:node.getAttribute('aria-haspopup'),expanded:node.getAttribute('aria-expanded'),state:node.getAttribute('data-state'),test:node.getAttribute('data-testid'),cls:String(node.className||'').slice(0,120),x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)});}debug.push({mode,chain});}return JSON.stringify({ok:false,reason:'mode_control_missing',candidateCount:0,debug:debug.slice(0,4)});}const nearest=items[0],near=items.filter(x=>x.d<=nearest.d+16),nearModes=[...new Set(near.map(x=>x.mode))];if(nearModes.length!==1)return JSON.stringify({ok:false,reason:'mode_control_ambiguous',candidateCount:items.length});"
+              "const r=nearest.r,x=r.left+r.width/2,y=r.top+r.height/2,inside=Number.isFinite(x)&&Number.isFinite(y)&&x>=0&&y>=0&&x<=innerWidth&&y<=innerHeight;"
+              "if(!inside)return JSON.stringify({ok:false,reason:'mode_control_outside_viewport'});"
+              "return JSON.stringify({ok:true,mode:nearest.mode,candidateCount:items.length,x,y,w:r.width,h:r.height,viewportWidth:innerWidth,viewportHeight:innerHeight,expanded:nearest.e.getAttribute('aria-expanded'),state:nearest.e.getAttribute('data-state')});"
+            "})()",
+            resolver];
+}
+
+static NSString *EffortSliderScript(BOOL focus) {
+    return [NSString stringWithFormat:
+            @"(()=>{"
+              "const doFocus=%@,visible=(e)=>{if(!(e instanceof Element))return false;const r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;const s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0';};"
+              "const num=(v)=>{if(v===null||v===undefined||v==='')return null;const n=Number(v);return Number.isFinite(n)?n:null;};"
+              "const items=[];for(const e of document.querySelectorAll('[role=slider],input[type=range]')){if(!visible(e))continue;const min=num(e.getAttribute('aria-valuemin'))??num(e.min),max=num(e.getAttribute('aria-valuemax'))??num(e.max),now=num(e.getAttribute('aria-valuenow'))??num(e.value);if(!(Number.isInteger(min)&&Number.isInteger(max)&&Number.isInteger(now)&&min===0&&max===2&&now>=0&&now<=2))continue;items.push({e,min,max,now});}"
+              "if(items.length!==1)return JSON.stringify({ok:false,reason:items.length?'effort_slider_ambiguous':'effort_slider_missing',candidateCount:items.length});const item=items[0];if(doFocus){try{item.e.focus({preventScroll:true});}catch(_){try{item.e.focus();}catch(__){}}}"
+              "return JSON.stringify({ok:true,candidateCount:1,min:item.min,max:item.max,now:item.now,focused:document.activeElement===item.e});"
+            "})()",
+            focus ? @"true" : @"false"];
+}
+
+static NSDictionary *NativeClickModeControl(WKWebView *webView) {
+    NSError *pointError = nil;
+    NSDictionary *point = ParseJSONResult(
+        EvaluateSync(webView, ModeControlPointScript(), 1.0, &pointError)
+    );
+    if (pointError != nil || ![point[@"ok"] boolValue]) {
+        NSData *detailData = point != nil
+            ? [NSJSONSerialization dataWithJSONObject:point options:0 error:nil]
+            : nil;
+        NSString *detail = detailData != nil
+            ? [[NSString alloc] initWithData:detailData encoding:NSUTF8StringEncoding]
+            : nil;
+        return @{
+            @"ok": @NO,
+            @"reason": pointError.localizedDescription ?: detail ?: [point[@"reason"] description] ?: @"mode_point_failed"
+        };
+    }
+    double viewportWidth = [point[@"viewportWidth"] doubleValue];
+    double viewportHeight = [point[@"viewportHeight"] doubleValue];
+    double cssX = [point[@"x"] doubleValue];
+    double cssY = [point[@"y"] doubleValue];
+    if (viewportWidth <= 0 || viewportHeight <= 0 || !isfinite(cssX) || !isfinite(cssY)) {
+        return @{@"ok": @NO, @"reason": @"mode_point_invalid"};
+    }
+    NSRect bounds = webView.bounds;
+    NSPoint localPoint = NSMakePoint(
+        cssX * (bounds.size.width / viewportWidth),
+        cssY * (bounds.size.height / viewportHeight)
+    );
+    NSPoint windowPoint = [webView convertPoint:localPoint toView:nil];
+    NSWindow *window = webView.window;
+    if (window == nil) return @{@"ok": @NO, @"reason": @"mode_window_missing"};
+    [window makeFirstResponder:webView];
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    NSEvent *down = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown location:windowPoint modifierFlags:0 timestamp:now windowNumber:window.windowNumber context:nil eventNumber:1 clickCount:1 pressure:1.0];
+    NSEvent *up = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp location:windowPoint modifierFlags:0 timestamp:now windowNumber:window.windowNumber context:nil eventNumber:2 clickCount:1 pressure:0.0];
+    [webView mouseDown:down];
+    [webView mouseUp:up];
+    return @{@"ok": @YES, @"mode": [point[@"mode"] description] ?: @""};
+}
+
+static BOOL NativeKeyPress(WKWebView *webView, unsigned short keyCode, unichar character) {
+    NSWindow *window = webView.window;
+    if (window == nil) return NO;
+    [window makeFirstResponder:webView];
+    NSString *characters = [NSString stringWithCharacters:&character length:1];
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    NSEvent *down = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:now windowNumber:window.windowNumber context:nil characters:characters charactersIgnoringModifiers:characters isARepeat:NO keyCode:keyCode];
+    NSEvent *up = [NSEvent keyEventWithType:NSEventTypeKeyUp location:NSZeroPoint modifierFlags:0 timestamp:now windowNumber:window.windowNumber context:nil characters:characters charactersIgnoringModifiers:characters isARepeat:NO keyCode:keyCode];
+    if (down == nil || up == nil) return NO;
+    [webView keyDown:down];
+    [webView keyUp:up];
+    return YES;
+}
+
+static NSDictionary *EnsureRequestedMode(WKWebView *webView, NSString *requested) {
+    NSString *mode = [requested uppercaseString];
+    NSInteger target = NSNotFound;
+    if ([mode isEqualToString:@"INSTANT"]) target = 0;
+    else if ([mode isEqualToString:@"MEDIUM"]) target = 1;
+    else if ([mode isEqualToString:@"HIGH"]) target = 2;
+    else if (mode.length == 0) return @{@"ok": @YES, @"changed": @NO};
+    else return @{@"ok": @NO, @"reason": @"unsupported_mode"};
+
+    NSDictionary *before = ParseJSONResult(EvaluateSync(webView, ReadinessScript(), 1.0, nil));
+    if (before != nil && ModeMatches(before, mode)) {
+        return @{@"ok": @YES, @"changed": @NO, @"mode": mode};
+    }
+    NSDictionary *clicked = nil;
+    NSDate *modeControlDeadline = [NSDate dateWithTimeIntervalSinceNow:8.0];
+    while ([modeControlDeadline timeIntervalSinceNow] > 0) {
+        clicked = NativeClickModeControl(webView);
+        if ([clicked[@"ok"] boolValue]) break;
+        RunLoopFor(0.1);
+    }
+    if (![clicked[@"ok"] boolValue]) return clicked ?: @{@"ok": @NO, @"reason": @"mode_control_not_proven"};
+
+    NSDate *sliderDeadline = [NSDate dateWithTimeIntervalSinceNow:3.0];
+    NSDictionary *slider = nil;
+    while ([sliderDeadline timeIntervalSinceNow] > 0) {
+        RunLoopFor(0.1);
+        slider = ParseJSONResult(EvaluateSync(webView, EffortSliderScript(YES), 1.0, nil));
+        if ([slider[@"ok"] boolValue] && [slider[@"focused"] boolValue]) break;
+    }
+    if (![slider[@"ok"] boolValue] || ![slider[@"focused"] boolValue]) {
+        return @{@"ok": @NO, @"reason": [slider[@"reason"] description] ?: @"effort_slider_not_proven"};
+    }
+
+    if (!NativeKeyPress(webView, 115, NSHomeFunctionKey)) {
+        return @{@"ok": @NO, @"reason": @"effort_slider_home_failed"};
+    }
+    RunLoopFor(0.1);
+    for (NSInteger index = 0; index < target; index += 1) {
+        if (!NativeKeyPress(webView, 124, NSRightArrowFunctionKey)) {
+            return @{@"ok": @NO, @"reason": @"effort_slider_right_failed"};
+        }
+        RunLoopFor(0.1);
+    }
+    NativeKeyPress(webView, 53, 0x1b);
+
+    NSDate *settleDeadline = [NSDate dateWithTimeIntervalSinceNow:3.0];
+    NSDictionary *after = nil;
+    while ([settleDeadline timeIntervalSinceNow] > 0) {
+        RunLoopFor(0.1);
+        after = ParseJSONResult(EvaluateSync(webView, ReadinessScript(), 1.0, nil));
+        if (after != nil && ModeMatches(after, mode)) {
+            return @{@"ok": @YES, @"changed": @YES, @"mode": mode};
+        }
+    }
+    return @{
+        @"ok": @NO,
+        @"reason": @"effort_mode_did_not_settle",
+        @"selected": [after[@"selectedMode"] description] ?: @"",
+        @"requested": mode
+    };
 }
 
 static NSString *FocusAndSelectComposerScript(void) {
@@ -1683,9 +1833,19 @@ static BOOL PumpRealPageTurnBrokerEntry(
             entry.composerReadyStablePolls = 0;
             entry.nextComposerReadyPollAt = nil;
             if ([entry.deadline timeIntervalSinceNow] <= 0) {
+                NSDictionary *composerDiag = ParseJSONResult(
+                    EvaluateSync(webView, ComposerDiagnosticsScript(), 1.0, nil)
+                );
+                NSArray *candidateRows = [composerDiag[@"candidates"] isKindOfClass:[NSArray class]]
+                    ? composerDiag[@"candidates"]
+                    : @[];
+                NSData *diagData = [NSJSONSerialization dataWithJSONObject:candidateRows options:0 error:nil];
+                NSString *detail = diagData != nil
+                    ? [[NSString alloc] initWithData:diagData encoding:NSUTF8StringEncoding]
+                    : @"[]";
                 *outResult = TurnBrokerFailure(
                     @"WKWEBVIEW_TEMPORARY_COMPOSER_NOT_READY",
-                    @"",
+                    detail ?: @"[]",
                     @"real_page",
                     0
                 );
@@ -1714,6 +1874,29 @@ static BOOL PumpRealPageTurnBrokerEntry(
                 return NO;
             }
             entry.nextComposerReadyPollAt = nil;
+        }
+
+        if (entry.profile.length > 0 && !ModeMatches(snapshot, entry.profile)) {
+            NSDictionary *modeResult = EnsureRequestedMode(webView, entry.profile);
+            if (![modeResult[@"ok"] boolValue]) {
+                *outResult = TurnBrokerFailure(
+                    @"WKWEBVIEW_PROFILE_SELECTION_FAILED",
+                    [modeResult[@"reason"] description] ?: @"mode selection failed",
+                    @"real_page",
+                    0
+                );
+                return YES;
+            }
+            snapshot = ParseJSONResult(EvaluateSync(webView, ReadinessScript(), 1.0, nil));
+            if (snapshot == nil || !ModeMatches(snapshot, entry.profile)) {
+                *outResult = TurnBrokerFailure(
+                    @"WKWEBVIEW_PROFILE_NOT_SELECTED",
+                    [snapshot[@"selectedMode"] description] ?: @"",
+                    @"real_page",
+                    0
+                );
+                return YES;
+            }
         }
 
         if (!entry.realPageFilled) {
@@ -3004,9 +3187,7 @@ int main(int argc, const char *argv[]) {
                         NSString *latestMessageId = [snapshot[@"latestMessageId"] isKindOfClass:[NSString class]] ? snapshot[@"latestMessageId"] : nil;
                         parentReady = latestMessageId != nil && [latestMessageId isEqualToString:expectedCurrentNode];
                     }
-                    if ([snapshot[@"composerReady"] boolValue]
-                        && parentReady
-                        && (profile.length == 0 || ModeMatches(snapshot, profile))) {
+                    if ([snapshot[@"composerReady"] boolValue] && parentReady) {
                         break;
                     }
                 }
@@ -3094,7 +3275,25 @@ int main(int argc, const char *argv[]) {
         }
 
         if (![readySnapshot[@"composerReady"] boolValue]) {
-            PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_COMPOSER_NOT_READY",@"final_url":webView.URL.absoluteString ?: @""});
+            NSDictionary *composerDiag = ParseJSONResult(
+                EvaluateSync(webView, ComposerDiagnosticsScript(), 1.0, nil)
+            );
+            NSArray *candidateRows = [composerDiag[@"candidates"] isKindOfClass:[NSArray class]]
+                ? composerDiag[@"candidates"]
+                : @[];
+            NSData *diagData = [NSJSONSerialization dataWithJSONObject:@{
+                @"readiness":readySnapshot ?: @{},
+                @"composer_candidates":candidateRows
+            } options:0 error:nil];
+            NSString *detail = diagData != nil
+                ? [[NSString alloc] initWithData:diagData encoding:NSUTF8StringEncoding]
+                : @"{}";
+            PrintResult(@{
+                @"ok":@NO,
+                @"error":@"WKWEBVIEW_COMPOSER_NOT_READY",
+                @"final_url":webView.URL.absoluteString ?: @"",
+                @"detail":detail ?: @"{}"
+            });
             return 7;
         }
         if (expectedCurrentNode.length > 0) {
@@ -3106,9 +3305,18 @@ int main(int argc, const char *argv[]) {
             }
         }
         if (profile.length > 0 && !ModeMatches(readySnapshot, profile)) {
-            NSString *detail = [NSString stringWithFormat:@"WKWEBVIEW_PROFILE_NOT_SELECTED:%@:selected=%@:latest_message_id=%@:composer_tag=%@:contenteditable=%@:class=%@:candidates=%@", profile, readySnapshot[@"selectedMode"] ?: @"", readySnapshot[@"latestMessageId"] ?: @"", readySnapshot[@"composerTag"] ?: @"", readySnapshot[@"composerContentEditable"] ?: @"", readySnapshot[@"composerClass"] ?: @"", readySnapshot[@"modeCandidates"] ?: @[]];
-            PrintResult(@{@"ok":@NO,@"error":detail,@"final_url":webView.URL.absoluteString ?: @""});
-            return 8;
+            NSDictionary *modeResult = EnsureRequestedMode(webView, profile);
+            if (![modeResult[@"ok"] boolValue]) {
+                NSString *detail = [NSString stringWithFormat:@"WKWEBVIEW_PROFILE_SELECTION_FAILED:%@:%@", profile, [modeResult[@"reason"] description] ?: @"unknown"];
+                PrintResult(@{@"ok":@NO,@"error":detail,@"final_url":webView.URL.absoluteString ?: @""});
+                return 8;
+            }
+            readySnapshot = ParseJSONResult(EvaluateSync(webView, ReadinessScript(), 1.0, nil));
+            if (readySnapshot == nil || !ModeMatches(readySnapshot, profile)) {
+                NSString *detail = [NSString stringWithFormat:@"WKWEBVIEW_PROFILE_NOT_SELECTED:%@:selected=%@", profile, readySnapshot[@"selectedMode"] ?: @""];
+                PrintResult(@{@"ok":@NO,@"error":detail,@"final_url":webView.URL.absoluteString ?: @""});
+                return 8;
+            }
         }
         PrintEvent(@{@"type":@"composer_ready"});
 
@@ -3190,6 +3398,15 @@ int main(int argc, const char *argv[]) {
         NSDictionary *accepted = nil;
         while ([deadline timeIntervalSinceNow] > 0) {
             RunLoopFor(0.2);
+            BOOL terminalStreamAcceptance = delegate.submitRequestObserved
+                && delegate.submitProfileMatch
+                && delegate.streamTerminalObserved
+                && delegate.streamConversationId.length > 0;
+            if (terminalStreamAcceptance) {
+                resolvedConversationId = delegate.streamConversationId;
+                accepted = @{@"stream_terminal": @YES};
+                break;
+            }
             NSDictionary *snapshot = ParseJSONResult(EvaluateSync(webView, AcceptanceScript(prompt, baselineAssistantCount), 1.0, nil));
             if (!snapshot) continue;
             if ([snapshot[@"error"] boolValue]) {
@@ -3250,7 +3467,11 @@ int main(int argc, const char *argv[]) {
         BOOL streamResponseSucceeded = delegate.streamResponseObserved
             && delegate.streamStatus >= 200
             && delegate.streamStatus < 300;
-        BOOL submitSucceeded = submitObserverSucceeded || streamResponseSucceeded;
+        BOOL terminalStreamSucceeded = delegate.submitRequestObserved
+            && delegate.submitProfileMatch
+            && delegate.streamTerminalObserved
+            && delegate.streamConversationId.length > 0;
+        BOOL submitSucceeded = submitObserverSucceeded || streamResponseSucceeded || terminalStreamSucceeded;
         BOOL resumeConversationMatches = delegate.streamConversationId.length > 0
             && [delegate.streamConversationId isEqualToString:resolvedConversationId];
         BOOL resumeCommitFence = observeStream

@@ -6,10 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .artifact_io import write_private_artifact_text
 from .artifact_manifest import (
+    CURRENT_BRANCH_REPRESENTATION,
+    DIAGNOSTIC_RAW_SNAPSHOT_REPRESENTATION,
     SNAPSHOT_ARTIFACT_KIND,
     SNAPSHOT_CONTRACT,
     artifact_file_entry,
+    artifact_source_revision,
+    artifact_timestamp,
     build_artifact_manifest,
     write_artifact_manifest,
 )
@@ -167,17 +172,19 @@ def snapshot_conversation(
         include_empty=False,
     )
     selected = _context_messages(list(messages))
+    fetched_at = artifact_timestamp()
     context_text = render_snapshot_context(selected)
 
+    raw_payload: dict[str, Any] | None = None
     raw_text: str | None = None
     if raw_payload_path is not None:
         ref = ConversationRef.from_any(conversation)
         raw_payload = _snapshot_payload(client, ref.conversation_id)
         raw_text = json.dumps(raw_payload, ensure_ascii=False, indent=2) + "\n"
 
-    context_path.write_text(context_text, encoding="utf-8", newline="\n")
+    write_private_artifact_text(context_path, context_text)
     if raw_payload_path is not None and raw_text is not None:
-        raw_payload_path.write_text(raw_text, encoding="utf-8", newline="\n")
+        write_private_artifact_text(raw_payload_path, raw_text)
 
     ref = ConversationRef.from_any(conversation)
     manifest_files = [
@@ -185,6 +192,7 @@ def snapshot_conversation(
             context_path,
             role="context",
             media_type="text/markdown; charset=utf-8",
+            representation=CURRENT_BRANCH_REPRESENTATION,
         )
     ]
     if raw_payload_path is not None:
@@ -193,6 +201,7 @@ def snapshot_conversation(
                 raw_payload_path,
                 role="raw_payload",
                 media_type="application/json; charset=utf-8",
+                representation=DIAGNOSTIC_RAW_SNAPSHOT_REPRESENTATION,
             )
         )
     manifest = build_artifact_manifest(
@@ -201,6 +210,8 @@ def snapshot_conversation(
         conversation_id=ref.conversation_id,
         index=normalized_index,
         files=manifest_files,
+        fetched_at=fetched_at,
+        source_revision=artifact_source_revision(raw_payload or conversation),
     )
     write_artifact_manifest(manifest_path, manifest)
 

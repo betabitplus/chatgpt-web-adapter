@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,12 +12,14 @@ import pytest
 import chatgpt_web_adapter.cli_v02 as cli
 from chatgpt_web_adapter.artifact_manifest import (
     ARTIFACT_MANIFEST_SCHEMA,
-    ArtifactFileEntry,
-    StableArtifactManifest,
+    CURRENT_BRANCH_REPRESENTATION,
+    DIAGNOSTIC_RAW_SNAPSHOT_REPRESENTATION,
     artifact_file_entry,
+    build_artifact_manifest,
     render_artifact_manifest,
 )
 from chatgpt_web_adapter.conversation_snapshot import snapshot_conversation
+from chatgpt_web_adapter.doctor import DoctorCheckStatus, verify_artifact_manifest
 from chatgpt_web_adapter.export import write_conversation_export
 from chatgpt_web_adapter.types import ChatMessage, ConversationRef
 
@@ -40,22 +44,27 @@ def _manifest(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def test_manifest_render_is_deterministic_and_has_no_timestamp() -> None:
-    manifest = StableArtifactManifest(
+def test_manifest_render_is_deterministic_with_explicit_freshness(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "project_chat_export_2.jsonl"
+    artifact.write_text('{"role":"user"}\n', encoding="utf-8")
+    entry = artifact_file_entry(
+        artifact,
+        role="export",
+        media_type="application/x-ndjson; charset=utf-8",
+        representation=CURRENT_BRANCH_REPRESENTATION,
+    )
+    manifest = build_artifact_manifest(
         artifact_kind="conversation_export",
         contract="normalized_current_branch_export_v1",
         conversation_id="conversation-1",
         index=2,
         format="jsonl",
-        files=(
-            ArtifactFileEntry(
-                role="export",
-                path="project_chat_export_2.jsonl",
-                media_type="application/x-ndjson; charset=utf-8",
-                bytes=12,
-                sha256="a" * 64,
-            ),
-        ),
+        files=(entry,),
+        fetched_at="2026-09-26T12:00:00.000Z",
+        producer_version="0.3.1",
+        source_revision="revision-1",
     )
 
     first = render_artifact_manifest(manifest)
@@ -64,16 +73,34 @@ def test_manifest_render_is_deterministic_and_has_no_timestamp() -> None:
     assert first == second
     assert first.endswith("\n")
     payload = json.loads(first)
-    assert payload["schema"] == ARTIFACT_MANIFEST_SCHEMA == 1
-    assert "timestamp" not in payload
-    assert "created_at" not in payload
+    assert payload["schema"] == ARTIFACT_MANIFEST_SCHEMA == 2
+    assert payload["representations"] == [CURRENT_BRANCH_REPRESENTATION]
+    assert payload["content_sha256"] == manifest.content_sha256
+    assert payload["provenance"] == {
+        "producer": "chatgpt-web-adapter",
+        "producer_version": "0.3.1",
+        "source": "chatgpt-canonical-read",
+        "fetched_at": "2026-09-26T12:00:00.000Z",
+        "source_revision": "revision-1",
+        "projection_version": "normalized_current_branch_export_v1",
+    }
+    assert payload["storage"] == {
+        "privacy": "owner_only",
+        "creation": "private_exclusive",
+        "completion_marker": "manifest_last",
+    }
 
 
 def test_artifact_file_entry_hashes_exact_bytes(tmp_path: Path) -> None:
     path = tmp_path / "artifact.txt"
     path.write_bytes("Привет\n".encode("utf-8"))
 
-    entry = artifact_file_entry(path, role="export", media_type="text/plain; charset=utf-8")
+    entry = artifact_file_entry(
+        path,
+        role="export",
+        media_type="text/plain; charset=utf-8",
+        representation=CURRENT_BRANCH_REPRESENTATION,
+    )
 
     payload = path.read_bytes()
     assert entry.path == "artifact.txt"
@@ -106,10 +133,28 @@ def test_snapshot_writes_manifest_last_with_context_and_raw_hashes(tmp_path: Pat
     assert payload["conversation_id"] == "conversation-1"
     assert payload["index"] == 7
     assert payload["format"] is None
+    assert payload["schema"] == ARTIFACT_MANIFEST_SCHEMA == 2
+    assert payload["representations"] == [
+        CURRENT_BRANCH_REPRESENTATION,
+        DIAGNOSTIC_RAW_SNAPSHOT_REPRESENTATION,
+    ]
+    assert payload["storage"]["privacy"] == "owner_only"
+    assert payload["storage"]["completion_marker"] == "manifest_last"
+    assert payload["provenance"]["source"] == "chatgpt-canonical-read"
+    assert payload["provenance"]["fetched_at"].endswith("Z")
     assert [item["role"] for item in payload["files"]] == ["context", "raw_payload"]
     by_role = {item["role"]: item for item in payload["files"]}
     assert by_role["context"]["sha256"] == hashlib.sha256(result.context_path.read_bytes()).hexdigest()
     assert by_role["raw_payload"]["sha256"] == hashlib.sha256(result.raw_payload_path.read_bytes()).hexdigest()
+    assert by_role["context"]["representation"] == CURRENT_BRANCH_REPRESENTATION
+    assert (
+        by_role["raw_payload"]["representation"]
+        == DIAGNOSTIC_RAW_SNAPSHOT_REPRESENTATION
+    )
+    if os.name != "nt":
+        assert stat.S_IMODE(result.context_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(result.raw_payload_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(result.manifest_path.stat().st_mode) == 0o600
     assert result.message_count == 2
 
 
@@ -174,8 +219,14 @@ def test_export_writer_creates_portable_file_and_manifest(tmp_path: Path) -> Non
     assert payload["artifact_kind"] == "conversation_export"
     assert payload["contract"] == "normalized_current_branch_export_v1"
     assert payload["format"] == "markdown"
+    assert payload["representations"] == [CURRENT_BRANCH_REPRESENTATION]
+    assert payload["files"][0]["representation"] == CURRENT_BRANCH_REPRESENTATION
+    assert payload["storage"]["privacy"] == "owner_only"
     assert payload["files"][0]["path"] == "project_chat_export_4.md"
     assert payload["files"][0]["media_type"] == "text/markdown; charset=utf-8"
+    if os.name != "nt":
+        assert stat.S_IMODE(result.export_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(result.manifest_path.stat().st_mode) == 0o600
     assert result.message_count == 2
 
 
@@ -348,3 +399,55 @@ def test_snapshot_and_export_contracts_remain_distinct(tmp_path: Path) -> None:
     assert export_manifest["artifact_kind"] == "conversation_export"
     assert snapshot_manifest["contract"] != export_manifest["contract"]
     assert snapshot.context_path.name != exported.export_path.name
+
+
+def test_export_manifest_preserves_supplied_revision_without_extra_payload_read(
+    tmp_path: Path,
+) -> None:
+    client = _ArtifactClient([ChatMessage(role="user", text="Hello")])
+    conversation = {
+        "conversation_id": "conversation-1",
+        "update_time": 1727352000.5,
+    }
+
+    result = write_conversation_export(
+        client,
+        conversation,
+        output_dir=tmp_path,
+        name="project",
+        index=11,
+        format="markdown",
+    )
+
+    payload = _manifest(result.manifest_path)
+    assert payload["provenance"]["source_revision"] == "1727352000.5"
+    assert len(client.message_calls) == 1
+    assert client.payload_calls == []
+
+
+def test_schema2_doctor_rejects_representation_tamper_via_aggregate_hash(
+    tmp_path: Path,
+) -> None:
+    client = _ArtifactClient([ChatMessage(role="user", text="Hello")])
+    result = write_conversation_export(
+        client,
+        "conversation-1",
+        output_dir=tmp_path,
+        name="project",
+        index=12,
+        format="markdown",
+    )
+    payload = _manifest(result.manifest_path)
+    payload["files"][0]["representation"] = DIAGNOSTIC_RAW_SNAPSHOT_REPRESENTATION
+    payload["representations"] = [DIAGNOSTIC_RAW_SNAPSHOT_REPRESENTATION]
+    result.manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        os.chmod(result.manifest_path, 0o600)
+
+    check = verify_artifact_manifest(result.manifest_path)
+
+    assert check.status is DoctorCheckStatus.FAIL
+    assert "content_sha256 mismatch" in check.evidence["errors"]

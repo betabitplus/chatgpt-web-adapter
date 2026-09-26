@@ -15,10 +15,17 @@ from typing import Any, Iterable
 
 from .artifact_manifest import (
     ARTIFACT_MANIFEST_SCHEMA,
+    ARTIFACT_REPRESENTATIONS,
+    ARTIFACT_STORAGE_COMPLETION_MARKER,
+    ARTIFACT_STORAGE_CREATION,
+    ARTIFACT_STORAGE_PRIVACY,
     EXPORT_ARTIFACT_KIND,
     EXPORT_CONTRACT,
     SNAPSHOT_ARTIFACT_KIND,
     SNAPSHOT_CONTRACT,
+    SUPPORTED_ARTIFACT_MANIFEST_SCHEMAS,
+    ArtifactFileEntry,
+    artifact_content_sha256,
 )
 from .auth import DEFAULT_AUTH_FILE
 from .auth_status import get_auth_status
@@ -887,7 +894,7 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
             "artifact",
             "Artifact manifest does not exist",
             evidence={"manifest": str(manifest_path.resolve())},
-            remediation="Pass an existing PR8.15 `.manifest.json` file.",
+            remediation="Pass an existing CWA artifact manifest file.",
         )
 
     errors: list[str] = []
@@ -916,8 +923,13 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
     index = payload.get("index")
     artifact_format = payload.get("format")
     files = payload.get("files")
+    representations = payload.get("representations")
+    content_sha256 = payload.get("content_sha256")
+    provenance = payload.get("provenance")
+    storage = payload.get("storage")
+    schema_v2 = schema == ARTIFACT_MANIFEST_SCHEMA
 
-    if schema != ARTIFACT_MANIFEST_SCHEMA:
+    if schema not in SUPPORTED_ARTIFACT_MANIFEST_SCHEMAS:
         errors.append(f"unsupported schema: {schema!r}")
     expected_contract = {
         SNAPSHOT_ARTIFACT_KIND: SNAPSHOT_CONTRACT,
@@ -945,7 +957,58 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
         errors.append("files must be a non-empty list")
         files = []
 
+    if schema_v2:
+        if (
+            not isinstance(representations, list)
+            or not representations
+            or any(
+                not isinstance(item, str) or item not in ARTIFACT_REPRESENTATIONS
+                for item in representations
+            )
+            or len(representations) != len(set(representations))
+        ):
+            errors.append("representations must be a unique non-empty list of supported scopes")
+        if (
+            not isinstance(content_sha256, str)
+            or _SHA256_RE.fullmatch(content_sha256) is None
+        ):
+            errors.append("content_sha256 must be a lowercase SHA-256 digest")
+
+        if not isinstance(provenance, dict):
+            errors.append("provenance must be an object")
+            provenance = {}
+        for key in ("producer", "producer_version", "source", "fetched_at", "projection_version"):
+            if not isinstance(provenance.get(key), str) or not provenance[key].strip():
+                errors.append(f"provenance.{key} is required")
+        source_revision = provenance.get("source_revision")
+        if source_revision is not None and not isinstance(source_revision, str):
+            errors.append("provenance.source_revision must be a string or null")
+
+        if not isinstance(storage, dict):
+            errors.append("storage must be an object")
+            storage = {}
+        expected_storage = {
+            "privacy": ARTIFACT_STORAGE_PRIVACY,
+            "creation": ARTIFACT_STORAGE_CREATION,
+            "completion_marker": ARTIFACT_STORAGE_COMPLETION_MARKER,
+        }
+        for key, expected in expected_storage.items():
+            if storage.get(key) != expected:
+                errors.append(f"storage.{key} must be {expected!r}")
+
+        if os.name != "nt":
+            try:
+                manifest_mode = stat.S_IMODE(manifest_path.stat().st_mode)
+            except OSError as error:
+                errors.append(f"could not inspect manifest permissions: {_safe_error(error)}")
+            else:
+                if manifest_mode & 0o077:
+                    errors.append(
+                        f"manifest permissions are not owner-only: {oct(manifest_mode)}"
+                    )
+
     verified_files: list[dict[str, Any]] = []
+    declared_entries: list[ArtifactFileEntry] = []
     seen_roles: set[str] = set()
     for position, entry in enumerate(files):
         if not isinstance(entry, dict):
@@ -954,6 +1017,7 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
         role = entry.get("role")
         relative = entry.get("path")
         media_type = entry.get("media_type")
+        representation = entry.get("representation")
         expected_bytes = entry.get("bytes")
         expected_sha = entry.get("sha256")
         prefix = f"files[{position}]"
@@ -976,12 +1040,34 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
             continue
         if not isinstance(media_type, str) or not media_type:
             errors.append(f"{prefix}.media_type is required")
-        if isinstance(expected_bytes, bool) or not isinstance(expected_bytes, int) or expected_bytes < 0:
+        if schema_v2 and (
+            not isinstance(representation, str)
+            or representation not in ARTIFACT_REPRESENTATIONS
+        ):
+            errors.append(f"{prefix}.representation is unsupported")
+        if (
+            isinstance(expected_bytes, bool)
+            or not isinstance(expected_bytes, int)
+            or expected_bytes < 0
+        ):
             errors.append(f"{prefix}.bytes must be a non-negative integer")
             continue
         if not isinstance(expected_sha, str) or _SHA256_RE.fullmatch(expected_sha) is None:
             errors.append(f"{prefix}.sha256 must be a lowercase SHA-256 digest")
             continue
+
+        if schema_v2 and isinstance(representation, str) and isinstance(role, str):
+            if isinstance(media_type, str):
+                declared_entries.append(
+                    ArtifactFileEntry(
+                        role=role,
+                        path=relative,
+                        media_type=media_type,
+                        representation=representation,
+                        bytes=expected_bytes,
+                        sha256=expected_sha,
+                    )
+                )
 
         file_path = manifest_path.parent / relative
         if not file_path.is_file():
@@ -996,20 +1082,46 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
             )
         if actual_sha != expected_sha:
             errors.append(f"sha256 mismatch for {relative}")
-        verified_files.append(
-            {
-                "role": role,
-                "path": relative,
-                "bytes": actual_bytes,
-                "sha256": actual_sha,
-            }
+        if schema_v2 and os.name != "nt":
+            try:
+                file_mode = stat.S_IMODE(file_path.stat().st_mode)
+            except OSError as error:
+                errors.append(
+                    f"could not inspect permissions for {relative}: {_safe_error(error)}"
+                )
+            else:
+                if file_mode & 0o077:
+                    errors.append(
+                        f"artifact file permissions are not owner-only for {relative}: "
+                        f"{oct(file_mode)}"
+                    )
+        verified_entry = {
+            "role": role,
+            "path": relative,
+            "bytes": actual_bytes,
+            "sha256": actual_sha,
+        }
+        if schema_v2:
+            verified_entry["representation"] = representation
+        verified_files.append(verified_entry)
+
+    if schema_v2 and declared_entries:
+        expected_representations = list(
+            dict.fromkeys(entry.representation for entry in declared_entries)
         )
+        if representations != expected_representations:
+            errors.append(
+                "representations do not match the ordered file representation scopes"
+            )
+        actual_content_sha256 = artifact_content_sha256(declared_entries)
+        if content_sha256 != actual_content_sha256:
+            errors.append("content_sha256 mismatch")
 
     if artifact_kind == EXPORT_ARTIFACT_KIND and seen_roles != {"export"}:
-        errors.append("conversation_export must contain exactly the `export` role")
+        errors.append("conversation_export must contain exactly the export role")
     if artifact_kind == SNAPSHOT_ARTIFACT_KIND:
         if "context" not in seen_roles:
-            errors.append("conversation_snapshot must contain the `context` role")
+            errors.append("conversation_snapshot must contain the context role")
         if not seen_roles.issubset({"context", "raw_payload"}):
             errors.append("conversation_snapshot contains an unsupported file role")
 
@@ -1021,6 +1133,10 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
         "conversation_id": conversation_id,
         "index": index,
         "format": artifact_format,
+        "representations": representations,
+        "content_sha256": content_sha256,
+        "provenance": provenance,
+        "storage": storage,
         "files_verified": verified_files,
         "errors": errors,
     }

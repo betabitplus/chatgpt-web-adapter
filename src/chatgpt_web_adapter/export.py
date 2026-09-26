@@ -6,10 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .artifact_io import write_private_artifact_text
 from .artifact_manifest import (
+    CURRENT_BRANCH_REPRESENTATION,
     EXPORT_ARTIFACT_KIND,
     EXPORT_CONTRACT,
     artifact_file_entry,
+    artifact_source_revision,
+    artifact_timestamp,
     build_artifact_manifest,
     write_artifact_manifest,
 )
@@ -183,8 +187,9 @@ def write_conversation_export(
 
     ref = ConversationRef.from_any(conversation)
     messages = list(client.get_messages(ref, limit=None, include_empty=True))
+    fetched_at = artifact_timestamp()
     export_text = render_conversation_export(messages, format=export_format)
-    export_path.write_text(export_text, encoding="utf-8", newline="\n")
+    write_private_artifact_text(export_path, export_text)
 
     manifest = build_artifact_manifest(
         artifact_kind=EXPORT_ARTIFACT_KIND,
@@ -197,8 +202,11 @@ def write_conversation_export(
                 export_path,
                 role="export",
                 media_type=EXPORT_MEDIA_TYPES[export_format],
+                representation=CURRENT_BRANCH_REPRESENTATION,
             ),
         ),
+        fetched_at=fetched_at,
+        source_revision=artifact_source_revision(conversation),
     )
     write_artifact_manifest(manifest_path, manifest)
 

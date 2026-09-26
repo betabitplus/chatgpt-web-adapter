@@ -149,6 +149,12 @@ cwa snapshot <conversation-id> --name project --output-dir ./artifacts --json
 cwa export <conversation-id> --format jsonl --name project --output-dir ./artifacts --json
 ```
 
+Snapshot/export bundles write a manifest last as the completion marker. New manifests use
+schema v2: every emitted file declares its representation scope
+(`current_branch` or `diagnostic_raw_snapshot` today), the manifest records exact file
+hashes plus an aggregate content SHA-256, runtime/source freshness provenance, and an
+owner-only storage policy. Older schema-v1 manifests remain readable by `cwa doctor`.
+
 The long-form runtime commands remain supported:
 
 ```powershell

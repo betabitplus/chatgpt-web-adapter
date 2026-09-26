@@ -127,12 +127,12 @@ Before creating `vX.Y.Z`:
 
 3. The GitHub release tag must be exactly `vX.Y.Z` (the checker also accepts a raw `X.Y.Z` input for local verification).
 
-Validate the strict tagged contract locally before publishing. For the staged CWA 0.3.1 candidate:
+Validate the strict tagged contract locally before publishing. For the staged CWA 0.3.2 candidate:
 
 ```powershell
 python tools/release_gate.py `
   --dist-dir dist `
-  --tag v0.3.1 `
+  --tag v0.3.2 `
   --json
 ```
 

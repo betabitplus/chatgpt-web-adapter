@@ -6,11 +6,15 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+## 0.3.2 - 2026-09-26
+
 - auth privacy: add optional OS credential-store persistence through `keyring`, retain an explicit owner-only file fallback, migrate existing credentials with write/verify-before-metadata semantics, fail closed on keyring outages, expose backend provenance through status/doctor, and add explicit migrate/logout APIs and CLI commands without persisting transient proof/turnstile material
 - WK compatibility: adapt the native macOS path to ChatGPT's September 2026 ProseMirror composer and rspack-split integrity runtime, preserve fail-closed `Instant`/`Medium`/`High` selection and protected-write proof, and accept proven terminal stream completion without introducing Chrome, blind write retry, or post-submit canonical polling
 - security: serialize auth read-modify-write across processes with a shared kernel-backed file lock, clamp POSIX auth and lock files to owner-only permissions, and make doctor fail on unsafe auth ownership/mode
 - recovery provenance: mark follow snapshots with explicit origin plus `canonical_read_fresh`, so consumers can distinguish a fresh canonical read from cached/shared-final/passive-stream terminal evidence without inferring authority from payload shape
 - stop identity: expose proof-bearing `conversationIdentityVerified` on WK and Chrome Stop results, keep unresolved or post-click route drift explicitly unverified, and never rewrite passive-observer conversation identity from an unverified route
+- artifacts: version the export/snapshot manifest contract with explicit representation scope, aggregate content hash, producer/source/freshness provenance, private manifest-last storage semantics, and a dedicated canonical-visible-graph contract shared with downstream exporters
+- artifact validation: make `cwa doctor` verify schema-v2 hashes/scopes/provenance/storage/permissions while retaining schema-v1 compatibility and without adding product reads or artifact repair authority
 
 ## 0.3.1 - 2026-09-11
 

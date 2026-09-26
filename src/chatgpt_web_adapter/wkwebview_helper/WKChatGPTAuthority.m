@@ -2826,7 +2826,13 @@ int main(int argc, const char *argv[]) {
                         @"error":@"WKWEBVIEW_MINIMAL_SECURITY_WRITE_FAILED",
                         @"detail":[launch[@"error"] isKindOfClass:[NSString class]] ? launch[@"error"] : @"",
                         @"stage":[launch[@"stage"] isKindOfClass:[NSString class]] ? launch[@"stage"] : @"",
-                        @"status":[launch[@"status"] isKindOfClass:[NSNumber class]] ? launch[@"status"] : @0
+                        @"status":[launch[@"status"] isKindOfClass:[NSNumber class]] ? launch[@"status"] : @0,
+                        @"protected_write_dispatched":[launch[@"protected_write_dispatched"] isKindOfClass:[NSNumber class]]
+                            ? launch[@"protected_write_dispatched"]
+                            : [NSNull null],
+                        @"submit_request_observed":@(delegate.submitRequestObserved),
+                        @"submit_response_observed":@(delegate.submitResponseObserved),
+                        @"submit_response_status":@(delegate.submitStatus)
                     });
                     return 33;
                 }

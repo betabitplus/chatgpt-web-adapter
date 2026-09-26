@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from typing import Any
-import uuid
 
 
 class BrowserAuthorityPolicy(str, Enum):
@@ -23,6 +23,7 @@ class TurnLifecycleState(str, Enum):
     DISPATCHED = "DISPATCHED"
     WRITE_COMPLETED = "WRITE_COMPLETED"
     FINALIZED = "FINALIZED"
+    NOT_DISPATCHED = "NOT_DISPATCHED"
     READBACK_INCOMPLETE = "READBACK_INCOMPLETE"
     AMBIGUOUS = "AMBIGUOUS"
 
@@ -364,12 +365,16 @@ class TurnLifecycle:
             raise ValueError("WRITE_COMPLETED requires write_completed_at_ms")
         if self.state in {
             TurnLifecycleState.FINALIZED,
+            TurnLifecycleState.NOT_DISPATCHED,
             TurnLifecycleState.READBACK_INCOMPLETE,
             TurnLifecycleState.AMBIGUOUS,
         } and self.terminal_at_ms is None:
             raise ValueError(f"{self.state.value} requires terminal_at_ms")
-        if self.state is TurnLifecycleState.FINALIZED and self.reconciliation_required:
-            raise ValueError("FINALIZED lifecycle cannot require reconciliation")
+        if self.state in {
+            TurnLifecycleState.FINALIZED,
+            TurnLifecycleState.NOT_DISPATCHED,
+        } and self.reconciliation_required:
+            raise ValueError(f"{self.state.value} lifecycle cannot require reconciliation")
         if self.state in {
             TurnLifecycleState.READBACK_INCOMPLETE,
             TurnLifecycleState.AMBIGUOUS,
@@ -394,6 +399,7 @@ class TurnLifecycle:
     def logical_turn_terminal(self) -> bool:
         return self.state in {
             TurnLifecycleState.FINALIZED,
+            TurnLifecycleState.NOT_DISPATCHED,
             TurnLifecycleState.READBACK_INCOMPLETE,
             TurnLifecycleState.AMBIGUOUS,
         }
@@ -424,6 +430,21 @@ class TurnLifecycle:
         return replace(
             self,
             state=TurnLifecycleState.FINALIZED,
+            terminal_at_ms=at_ms,
+            reconciliation_required=False,
+        )
+
+    def not_dispatched(self, *, at_ms: int) -> "TurnLifecycle":
+        if self.state not in {
+            TurnLifecycleState.PREPARED,
+            TurnLifecycleState.DISPATCHED,
+        }:
+            raise ValueError(
+                "only PREPARED/DISPATCHED lifecycle can prove protected write not dispatched"
+            )
+        return replace(
+            self,
+            state=TurnLifecycleState.NOT_DISPATCHED,
             terminal_at_ms=at_ms,
             reconciliation_required=False,
         )

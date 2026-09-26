@@ -1,8 +1,8 @@
 from chatgpt_web_adapter.browser_authority_lease import (
+    BrowserAuthorityConfigSource,
     BrowserAuthorityLease,
     BrowserAuthorityLeaseState,
     BrowserAuthorityPolicy,
-    BrowserAuthorityConfigSource,
     TurnLifecycle,
     TurnLifecycleState,
     resolve_browser_authority_policy,
@@ -137,6 +137,20 @@ def test_browser_authority_release_does_not_finalize_turn_lifecycle() -> None:
     turn = turn.finalized(at_ms=3000)
     assert turn.state is TurnLifecycleState.FINALIZED
     assert turn.logical_turn_terminal is True
+
+
+def test_not_dispatched_is_terminal_without_reconciliation() -> None:
+    base = TurnLifecycle.prepare(
+        browser_authority_lease_id="lease-1",
+        started_at_ms=1000,
+        lifecycle_id="turn-1",
+    )
+    failed = base.not_dispatched(at_ms=1200)
+
+    assert failed.state is TurnLifecycleState.NOT_DISPATCHED
+    assert failed.logical_turn_terminal is True
+    assert failed.reconciliation_required is False
+    assert failed.terminal_at_ms == 1200
 
 
 def test_readback_incomplete_and_ambiguous_require_reconciliation() -> None:

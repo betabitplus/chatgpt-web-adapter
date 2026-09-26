@@ -40,9 +40,48 @@ from chatgpt_web_adapter.wkwebview_canonical import (
     WKCanonicalState,
     WKWebViewCanonicalClient,
 )
-from chatgpt_web_adapter.wkwebview_helper_runtime import WKWebViewHelperRuntime
+from chatgpt_web_adapter.wkwebview_helper_runtime import (
+    WKWebViewHelperRuntime,
+    _helper_write_evidence,
+)
 from chatgpt_web_adapter.wkwebview_provider import WKWebViewTurnProvider
 from chatgpt_web_adapter.wkwebview_turn_orchestrator import WKTurnOrchestrator
+
+
+def test_helper_write_evidence_preserves_exact_dispatch_boundary() -> None:
+    evidence = _helper_write_evidence(
+        {
+            "protected_write_dispatched": False,
+            "submit_request_observed": False,
+            "submit_response_observed": False,
+            "submit_response_status": 0,
+        }
+    )
+    error = RequestError(
+        "WKWEBVIEW_MINIMAL_SECURITY_WRITE_FAILED",
+        request_stage="wkwebview_authority_turn",
+        **evidence,
+    )
+
+    assert error.write_dispatched is False
+    assert error.submit_request_observed is False
+    assert error.submit_response_observed is False
+    assert error.submit_response_status is None
+
+    contradictory = _helper_write_evidence(
+        {
+            "protected_write_dispatched": False,
+            "submit_request_observed": True,
+            "submit_response_observed": True,
+            "submit_response_status": 204,
+        }
+    )
+    assert contradictory == {
+        "write_dispatched": False,
+        "submit_request_observed": True,
+        "submit_response_observed": True,
+        "submit_response_status": 204,
+    }
 
 
 def _invocation_argv(invocation) -> list[str]:

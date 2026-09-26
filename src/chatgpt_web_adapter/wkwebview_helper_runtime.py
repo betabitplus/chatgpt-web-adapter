@@ -29,6 +29,28 @@ _MINIMUM_MACOS = (12, 0)
 _PRE_SUBMIT_TIMEOUT_SECONDS = 30.0
 
 
+def _optional_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _optional_status(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _helper_write_evidence(payload: dict[str, Any]) -> dict[str, Any]:
+    write_dispatched = _optional_bool(payload.get("protected_write_dispatched"))
+    submit_request_observed = _optional_bool(payload.get("submit_request_observed"))
+    submit_response_observed = _optional_bool(payload.get("submit_response_observed"))
+    if write_dispatched is None and submit_request_observed is True:
+        write_dispatched = True
+    return {
+        "write_dispatched": write_dispatched,
+        "submit_request_observed": submit_request_observed,
+        "submit_response_observed": submit_response_observed,
+        "submit_response_status": _optional_status(payload.get("submit_response_status")),
+    }
+
+
 @dataclass
 class WKHelperInvocation:
     """Private request envelope for one native WK helper invocation."""
@@ -266,6 +288,7 @@ class WKWebViewHelperRuntime:
                 status_code=payload.get("status"),
                 body_preview=detail,
                 request_stage="wkwebview_authority_turn",
+                **_helper_write_evidence(payload),
             )
         return payload
 
@@ -561,6 +584,7 @@ class WKWebViewHelperRuntime:
                 status_code=payload.get("status"),
                 body_preview=detail,
                 request_stage="wkwebview_authority_turn",
+                **_helper_write_evidence(payload),
             )
         return payload
 
@@ -1063,6 +1087,7 @@ class WKWebViewHelperRuntime:
                 status_code=payload.get("status"),
                 body_preview=detail,
                 request_stage="wkwebview_authority_turn",
+                **_helper_write_evidence(payload),
             )
         return payload
 

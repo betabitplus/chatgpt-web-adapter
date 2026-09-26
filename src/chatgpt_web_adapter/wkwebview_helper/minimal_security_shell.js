@@ -30,6 +30,7 @@
       window.webkit.messageHandlers.cwaSubmit.postMessage(tagged(body));
     } catch (_) {}
   };
+  let protectedWriteDispatched = false;
   const prompt = typeof requestConfig?.prompt === "string"
     ? requestConfig.prompt
     : (typeof window.__CWA_MINIMAL_PROMPT__ === "string" ? window.__CWA_MINIMAL_PROMPT__ : "");
@@ -1624,6 +1625,7 @@
         rejectOpen = reject;
       });
       postSubmit({ phase: "request", temporary_mode: temporary });
+      protectedWriteDispatched = true;
       const stream = officialConversationTransport(
         new URL("/backend-api/f/conversation", pageBaseURL).href,
         {
@@ -1710,6 +1712,7 @@
       temporary_mode: temporary,
       endpoint: `shell_preflight:proxy=${proxyProtectedWrite ? "1" : "0"}:wrapper=${window.fetch?.__cwaIncludesSubmitObserver === true ? "1" : "0"}`,
     });
+    protectedWriteDispatched = true;
     const writePromise = window.fetch("/backend-api/f/conversation", {
       method: "POST",
       credentials: "include",
@@ -1859,6 +1862,7 @@
       status: 0,
       stage,
       error: renderedError,
+      protected_write_dispatched: protectedWriteDispatched,
     });
   });
   return true;

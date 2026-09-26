@@ -108,6 +108,10 @@ class RequestError(WebChatAdapterError):
         endpoint: str | None = None,
         body_preview: Any = None,
         request_stage: str | None = None,
+        write_dispatched: bool | None = None,
+        submit_request_observed: bool | None = None,
+        submit_response_observed: bool | None = None,
+        submit_response_status: int | None = None,
     ) -> None:
         message = str(message)
         inferred_stage = _request_stage_from_message(message)
@@ -119,6 +123,20 @@ class RequestError(WebChatAdapterError):
         self.body_preview = _body_preview(body_preview) or _body_preview_from_message(
             message
         )
+        self.write_dispatched = (
+            write_dispatched if isinstance(write_dispatched, bool) else None
+        )
+        self.submit_request_observed = (
+            submit_request_observed
+            if isinstance(submit_request_observed, bool)
+            else None
+        )
+        self.submit_response_observed = (
+            submit_response_observed
+            if isinstance(submit_response_observed, bool)
+            else None
+        )
+        self.submit_response_status = _optional_status_code(submit_response_status)
         super().__init__(message)
 
     def to_dict(self) -> dict[str, Any]:
@@ -128,6 +146,10 @@ class RequestError(WebChatAdapterError):
             "endpoint": self.endpoint,
             "body_preview": self.body_preview,
             "request_stage": self.request_stage,
+            "write_dispatched": self.write_dispatched,
+            "submit_request_observed": self.submit_request_observed,
+            "submit_response_observed": self.submit_response_observed,
+            "submit_response_status": self.submit_response_status,
         }
 
 

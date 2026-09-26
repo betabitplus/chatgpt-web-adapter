@@ -30,6 +30,7 @@ EXTENSION_DISCONNECTED = "BROWSER_NATIVE_EXTENSION_DISCONNECTED"
 CANONICAL_READ_UNAVAILABLE = "CANONICAL_READ_UNAVAILABLE"
 CONVERSATION_NOT_COMPLETED = "CANONICAL_CONVERSATION_NOT_COMPLETED"
 WRITE_OUTCOME_UNKNOWN = "BROWSER_OWNED_WRITE_OUTCOME_UNKNOWN"
+WRITE_NOT_DISPATCHED = "BROWSER_OWNED_WRITE_NOT_DISPATCHED"
 WRITE_ACCEPTED_READBACK_INCOMPLETE = "BROWSER_OWNED_WRITE_ACCEPTED_READBACK_INCOMPLETE"
 BROWSER_AUTHORITY_RELEASE_UNSUPPORTED = "BROWSER_AUTHORITY_RELEASE_UNSUPPORTED"
 BROWSER_AUTHORITY_NOT_FRESH = "BROWSER_AUTHORITY_NOT_FRESH"
@@ -82,6 +83,27 @@ def _optional_int(value: Any) -> int | None:
 
 def _optional_text(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _request_error_write_dispatched(error: BaseException) -> bool | None:
+    """Return exact write-dispatch evidence without inferring from generic failure text."""
+
+    request_observed = getattr(error, "submit_request_observed", None)
+    response_observed = getattr(error, "submit_response_observed", None)
+    response_status = getattr(error, "submit_response_status", None)
+    if request_observed is True or response_observed is True:
+        return True
+    if (
+        isinstance(response_status, int)
+        and not isinstance(response_status, bool)
+        and response_status > 0
+    ):
+        return True
+
+    dispatched = getattr(error, "write_dispatched", None)
+    if isinstance(dispatched, bool):
+        return dispatched
+    return None
 
 
 @dataclass(frozen=True)
@@ -221,6 +243,10 @@ class BrowserOwnedWriteRuntimeError(RequestError):
         reason_code: str | None = None,
         status_code: int | None = None,
         content_type: str | None = None,
+        write_dispatched: bool | None = None,
+        submit_request_observed: bool | None = None,
+        submit_response_observed: bool | None = None,
+        submit_response_status: int | None = None,
         browser_authority_lease: BrowserAuthorityLease | None = None,
         turn_lifecycle: TurnLifecycle | None = None,
     ) -> None:
@@ -242,6 +268,10 @@ class BrowserOwnedWriteRuntimeError(RequestError):
             if request_stage == "browser_owned_write_readback"
             else None,
             request_stage=request_stage,
+            write_dispatched=write_dispatched,
+            submit_request_observed=submit_request_observed,
+            submit_response_observed=submit_response_observed,
+            submit_response_status=submit_response_status,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -774,6 +804,27 @@ class BrowserOwnedProductWriteRuntime:
         self._schedule_disposal(current)
         return current
 
+    def _release_authority_without_write(
+        self,
+        lease: BrowserAuthorityLease,
+        *,
+        runtime_tab_id: int | None,
+    ) -> BrowserAuthorityLease:
+        """Release authority when exact provider evidence proves no write dispatch."""
+
+        with self._authority_lock:
+            current = self._last_browser_authority_lease
+            if current is None or current.lease_id != lease.lease_id:
+                return lease
+            if current.state is BrowserAuthorityLeaseState.ACTIVE:
+                current = current.release(
+                    released_at_ms=_monotonic_ms(),
+                    runtime_tab_id=runtime_tab_id,
+                )
+                self._last_browser_authority_lease = current
+        self._schedule_disposal(current)
+        return current
+
     def _finalize_turn(
         self,
         turn: TurnLifecycle,
@@ -801,7 +852,9 @@ class BrowserOwnedProductWriteRuntime:
             current = self._last_turn_lifecycle
             if current is None or current.lifecycle_id != turn.lifecycle_id:
                 current = turn
-            if state is TurnLifecycleState.READBACK_INCOMPLETE:
+            if state is TurnLifecycleState.NOT_DISPATCHED:
+                current = current.not_dispatched(at_ms=_monotonic_ms())
+            elif state is TurnLifecycleState.READBACK_INCOMPLETE:
                 current = current.readback_incomplete(at_ms=_monotonic_ms())
             elif state is TurnLifecycleState.AMBIGUOUS:
                 current = current.ambiguous(at_ms=_monotonic_ms())
@@ -1047,15 +1100,26 @@ class BrowserOwnedProductWriteRuntime:
             ) from error
         except WebChatAdapterError as error:
             readback_failure = write_event_observed
+            provider_write_dispatched = _request_error_write_dispatched(error)
+            no_write_dispatched = (
+                not readback_failure and provider_write_dispatched is False
+            )
             turn_ref = self._fail_turn(
                 turn_ref,
                 state=(
                     TurnLifecycleState.READBACK_INCOMPLETE
                     if readback_failure
+                    else TurnLifecycleState.NOT_DISPATCHED
+                    if no_write_dispatched
                     else TurnLifecycleState.AMBIGUOUS
                 ),
             )
-            if browser_context_readback and readback_failure and acknowledge_readback():
+            if no_write_dispatched:
+                lease_ref = self._release_authority_without_write(
+                    lease_ref,
+                    runtime_tab_id=runtime_tab_id,
+                )
+            elif browser_context_readback and readback_failure and acknowledge_readback():
                 lease_ref = self._release_authority_after_readback(
                     lease_ref,
                     runtime_tab_id=runtime_tab_id,
@@ -1067,16 +1131,20 @@ class BrowserOwnedProductWriteRuntime:
                 failure_kind=(
                     WRITE_ACCEPTED_READBACK_INCOMPLETE
                     if readback_failure
+                    else WRITE_NOT_DISPATCHED
+                    if no_write_dispatched
                     else WRITE_OUTCOME_UNKNOWN
                 ),
                 automatic_retry_allowed=False,
-                manual_retry_safe_after_repair=False,
-                write_may_have_been_submitted=True,
-                reconciliation_required=True,
+                manual_retry_safe_after_repair=no_write_dispatched,
+                write_may_have_been_submitted=not no_write_dispatched,
+                reconciliation_required=not no_write_dispatched,
                 cause=error,
                 request_stage=(
                     "browser_owned_write_readback"
                     if readback_failure
+                    else "browser_owned_write_pre_dispatch"
+                    if no_write_dispatched
                     else "browser_owned_write"
                 ),
                 conversation_id=(
@@ -1085,6 +1153,14 @@ class BrowserOwnedProductWriteRuntime:
                 reason_code=getattr(error, "reason_code", None),
                 status_code=getattr(error, "status_code", None),
                 content_type=getattr(error, "content_type", None),
+                write_dispatched=provider_write_dispatched,
+                submit_request_observed=getattr(
+                    error, "submit_request_observed", None
+                ),
+                submit_response_observed=getattr(
+                    error, "submit_response_observed", None
+                ),
+                submit_response_status=getattr(error, "submit_response_status", None),
                 browser_authority_lease=lease_ref,
                 turn_lifecycle=turn_ref,
             ) from error

@@ -10,13 +10,18 @@ from types import SimpleNamespace
 import pytest
 
 import chatgpt_web_adapter.cli_v02 as cli
+from chatgpt_web_adapter.artifact_io import write_private_artifact_text
 from chatgpt_web_adapter.artifact_manifest import (
     ARTIFACT_MANIFEST_SCHEMA,
+    CANONICAL_VISIBLE_GRAPH_REPRESENTATION,
     CURRENT_BRANCH_REPRESENTATION,
     DIAGNOSTIC_RAW_SNAPSHOT_REPRESENTATION,
+    VISIBLE_GRAPH_ARTIFACT_KIND,
+    VISIBLE_GRAPH_CONTRACT,
     artifact_file_entry,
     build_artifact_manifest,
     render_artifact_manifest,
+    write_artifact_manifest,
 )
 from chatgpt_web_adapter.conversation_snapshot import snapshot_conversation
 from chatgpt_web_adapter.doctor import DoctorCheckStatus, verify_artifact_manifest
@@ -451,3 +456,46 @@ def test_schema2_doctor_rejects_representation_tamper_via_aggregate_hash(
 
     assert check.status is DoctorCheckStatus.FAIL
     assert "content_sha256 mismatch" in check.evidence["errors"]
+
+
+def test_visible_graph_artifact_uses_shared_schema2_contract(tmp_path: Path) -> None:
+    markdown = write_private_artifact_text(tmp_path / "chat.md", "# Chat\n")
+    context = write_private_artifact_text(
+        tmp_path / "chat.context.json",
+        '{"schema":1,"scope":"canonical-web-visible"}\n',
+    )
+    manifest = build_artifact_manifest(
+        artifact_kind=VISIBLE_GRAPH_ARTIFACT_KIND,
+        contract=VISIBLE_GRAPH_CONTRACT,
+        conversation_id="conversation-1",
+        index=1,
+        format="markdown",
+        files=(
+            artifact_file_entry(
+                markdown,
+                role="markdown",
+                media_type="text/markdown; charset=utf-8",
+                representation=CANONICAL_VISIBLE_GRAPH_REPRESENTATION,
+            ),
+            artifact_file_entry(
+                context,
+                role="context",
+                media_type="application/json; charset=utf-8",
+                representation=CANONICAL_VISIBLE_GRAPH_REPRESENTATION,
+            ),
+        ),
+        fetched_at="2026-09-26T12:00:00.000Z",
+        producer_version="0.1.0",
+        source_revision="revision-visible-1",
+        source="chatgpt-canonical-visible-graph",
+        projection_version=VISIBLE_GRAPH_CONTRACT,
+    )
+    manifest_path = write_artifact_manifest(tmp_path / "chat.manifest.json", manifest)
+
+    check = verify_artifact_manifest(manifest_path)
+
+    assert check.status is DoctorCheckStatus.PASS
+    assert check.evidence["artifact_kind"] == VISIBLE_GRAPH_ARTIFACT_KIND
+    assert check.evidence["representations"] == [
+        CANONICAL_VISIBLE_GRAPH_REPRESENTATION
+    ]

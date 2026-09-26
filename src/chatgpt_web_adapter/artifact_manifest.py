@@ -18,8 +18,10 @@ SUPPORTED_ARTIFACT_MANIFEST_SCHEMAS = frozenset(
 
 SNAPSHOT_ARTIFACT_KIND = "conversation_snapshot"
 EXPORT_ARTIFACT_KIND = "conversation_export"
+VISIBLE_GRAPH_ARTIFACT_KIND = "conversation_visible_graph_export"
 SNAPSHOT_CONTRACT = "curated_current_branch_context_v1"
 EXPORT_CONTRACT = "normalized_current_branch_export_v1"
+VISIBLE_GRAPH_CONTRACT = "canonical_visible_graph_export_v1"
 
 CURRENT_BRANCH_REPRESENTATION = "current_branch"
 CANONICAL_VISIBLE_GRAPH_REPRESENTATION = "canonical_visible_graph"
@@ -36,6 +38,10 @@ ARTIFACT_PRODUCER = "chatgpt-web-adapter"
 ARTIFACT_SOURCE = "chatgpt-canonical-read"
 ARTIFACT_STORAGE_PRIVACY = "owner_only"
 ARTIFACT_STORAGE_CREATION = "private_exclusive"
+ARTIFACT_STORAGE_ATOMIC_REPLACE = "private_atomic_replace"
+ARTIFACT_STORAGE_CREATION_POLICIES = frozenset(
+    {ARTIFACT_STORAGE_CREATION, ARTIFACT_STORAGE_ATOMIC_REPLACE}
+)
 ARTIFACT_STORAGE_COMPLETION_MARKER = "manifest_last"
 _PACKAGE_NAME = "chatgpt-web-adapter"
 
@@ -189,6 +195,7 @@ def build_artifact_manifest(
     producer_version: str | None = None,
     projection_version: str | None = None,
     source: str = ARTIFACT_SOURCE,
+    storage_creation: str = ARTIFACT_STORAGE_CREATION,
 ) -> StableArtifactManifest:
     normalized_files = tuple(files)
     if not normalized_files:
@@ -203,6 +210,8 @@ def build_artifact_manifest(
         raise ValueError("artifact manifest contract is required")
 
     normalized_contract = contract.strip()
+    if storage_creation not in ARTIFACT_STORAGE_CREATION_POLICIES:
+        raise ValueError(f"unsupported artifact storage creation policy: {storage_creation!r}")
     representations = tuple(
         dict.fromkeys(_required_representation(item.representation) for item in normalized_files)
     )
@@ -235,7 +244,7 @@ def build_artifact_manifest(
         representations=representations,
         content_sha256=artifact_content_sha256(normalized_files),
         provenance=provenance,
-        storage=ArtifactStoragePolicy(),
+        storage=ArtifactStoragePolicy(creation=storage_creation),
         format=format.strip().lower() if isinstance(format, str) and format.strip() else None,
     )
 

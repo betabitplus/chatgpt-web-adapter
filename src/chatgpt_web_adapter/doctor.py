@@ -17,13 +17,16 @@ from .artifact_manifest import (
     ARTIFACT_MANIFEST_SCHEMA,
     ARTIFACT_REPRESENTATIONS,
     ARTIFACT_STORAGE_COMPLETION_MARKER,
-    ARTIFACT_STORAGE_CREATION,
+    ARTIFACT_STORAGE_CREATION_POLICIES,
     ARTIFACT_STORAGE_PRIVACY,
+    CANONICAL_VISIBLE_GRAPH_REPRESENTATION,
     EXPORT_ARTIFACT_KIND,
     EXPORT_CONTRACT,
     SNAPSHOT_ARTIFACT_KIND,
     SNAPSHOT_CONTRACT,
     SUPPORTED_ARTIFACT_MANIFEST_SCHEMAS,
+    VISIBLE_GRAPH_ARTIFACT_KIND,
+    VISIBLE_GRAPH_CONTRACT,
     ArtifactFileEntry,
     artifact_content_sha256,
 )
@@ -934,6 +937,7 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
     expected_contract = {
         SNAPSHOT_ARTIFACT_KIND: SNAPSHOT_CONTRACT,
         EXPORT_ARTIFACT_KIND: EXPORT_CONTRACT,
+        VISIBLE_GRAPH_ARTIFACT_KIND: VISIBLE_GRAPH_CONTRACT,
     }.get(artifact_kind)
     if expected_contract is None:
         errors.append(f"unsupported artifact_kind: {artifact_kind!r}")
@@ -953,6 +957,8 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
         errors.append(f"unsupported export format: {artifact_format!r}")
     if artifact_kind == SNAPSHOT_ARTIFACT_KIND and artifact_format is not None:
         errors.append("snapshot format must be null")
+    if artifact_kind == VISIBLE_GRAPH_ARTIFACT_KIND and artifact_format != "markdown":
+        errors.append("visible graph export format must be markdown")
     if not isinstance(files, list) or not files:
         errors.append("files must be a non-empty list")
         files = []
@@ -989,12 +995,17 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
             storage = {}
         expected_storage = {
             "privacy": ARTIFACT_STORAGE_PRIVACY,
-            "creation": ARTIFACT_STORAGE_CREATION,
             "completion_marker": ARTIFACT_STORAGE_COMPLETION_MARKER,
         }
         for key, expected in expected_storage.items():
             if storage.get(key) != expected:
                 errors.append(f"storage.{key} must be {expected!r}")
+        creation = storage.get("creation")
+        if creation not in ARTIFACT_STORAGE_CREATION_POLICIES:
+            errors.append(
+                "storage.creation must be one of "
+                + ", ".join(sorted(ARTIFACT_STORAGE_CREATION_POLICIES))
+            )
 
         if os.name != "nt":
             try:
@@ -1124,6 +1135,15 @@ def verify_artifact_manifest(path: str | Path) -> DoctorCheck:
             errors.append("conversation_snapshot must contain the context role")
         if not seen_roles.issubset({"context", "raw_payload"}):
             errors.append("conversation_snapshot contains an unsupported file role")
+    if artifact_kind == VISIBLE_GRAPH_ARTIFACT_KIND:
+        if seen_roles != {"markdown", "context"}:
+            errors.append(
+                "conversation_visible_graph_export must contain markdown and context roles"
+            )
+        if schema_v2 and representations != [CANONICAL_VISIBLE_GRAPH_REPRESENTATION]:
+            errors.append(
+                "conversation_visible_graph_export must use canonical_visible_graph representation"
+            )
 
     evidence = {
         "manifest": str(manifest_path.resolve()),

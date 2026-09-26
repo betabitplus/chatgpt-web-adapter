@@ -363,7 +363,7 @@ Experimental surfaces include:
 - prepared/raw backend helpers;
 - `browserless-request`.
 
-These rely more directly on undocumented web behavior and may evolve faster than the primary runtime.
+These rely more directly on undocumented web behavior and may evolve faster than the primary runtime. The legacy approval helpers are now deliberately fail-closed: recipient allow-lists, operation labels such as `search`/`list`/`view`, and read-only metadata hints are observation/policy hints only and cannot authorize an approval write without a stable provider action identity. The current product runtime exposes required-action observation but no stable approval-continuation authority, so complete authorization in ChatGPT web.
 
 See [`docs/raw_payload.md`](docs/raw_payload.md) and [`docs/browserless_request_transport_pr9_1.md`](docs/browserless_request_transport_pr9_1.md).
 

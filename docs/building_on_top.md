@@ -48,9 +48,13 @@ These are the most natural building blocks for a terminal UI, CLI, or orchestrat
 
 They are useful, but they should not be the foundation of a product architecture.
 They depend more directly on unstable web behavior and should be isolated behind
-product-specific feature flags or adapter layers. In particular, raw
-`send_payload()` still uses the legacy requirements path and is not covered by
-the current prepared-write Sentinel transaction.
+product-specific feature flags or adapter layers. Approval compatibility helpers
+are fail-closed unless a future provider contract supplies stable action identity:
+recipient names, operation/display labels, and read-only metadata hints are never
+execution authority. Today required-action state is observation-only and user
+authorization remains in ChatGPT web. In particular, raw `send_payload()` still
+uses the legacy requirements path and is not covered by the current prepared-write
+Sentinel transaction.
 
 ## Suggested Product Boundary for gptty
 

@@ -6,7 +6,13 @@ from typing import Any, Callable, Sequence
 from .approval_events import emit_approval_event, make_approval_event
 from .approval_policy import ApprovalPolicy
 from .exceptions import RequestError
-from .types import ChatConversation, ChatMetrics, ChatResponse, MediaItem, PendingApproval
+from .types import (
+    ChatConversation,
+    ChatMetrics,
+    ChatResponse,
+    MediaItem,
+    PendingApproval,
+)
 
 
 class ApprovalDeniedError(RuntimeError):
@@ -65,8 +71,6 @@ def approve_pending_action(original: Callable[..., ChatResponse]) -> Callable[..
         _approval_round_index: int | None = None,
         **kwargs: Any,
     ) -> ChatResponse:
-        if policy is None:
-            return original(self, conversation, on_event=on_event, **kwargs)
         approval_policy = _resolve_policy(policy)
         original_finder = self._latest_confirm_action_leaf
         approval_state: dict[str, Any] = {}

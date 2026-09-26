@@ -13,6 +13,8 @@ ApprovalDecisionReason = Literal[
     "unknown_recipient_denied",
     "read_only_auto_approve_disabled",
     "read_only_auto_approved",
+    "recipient_allowlist_requires_stable_action",
+    "read_only_hint_requires_stable_action",
 ]
 APPROVAL_DECISION_REASONS: tuple[ApprovalDecisionReason, ...] = (
     "recipient_allowed",
@@ -21,6 +23,8 @@ APPROVAL_DECISION_REASONS: tuple[ApprovalDecisionReason, ...] = (
     "unknown_recipient_denied",
     "read_only_auto_approve_disabled",
     "read_only_auto_approved",
+    "recipient_allowlist_requires_stable_action",
+    "read_only_hint_requires_stable_action",
 )
 
 
@@ -143,25 +147,9 @@ class ApprovalPolicy:
         if not isinstance(metadata_preview, dict):
             return False
 
-        for key in ("read_only", "is_read_only"):
-            if metadata_preview.get(key) is True:
-                return True
-
-        for key in ("operation", "operation_type", "action_type", "capability", "intent"):
-            value = _optional_str(metadata_preview.get(key))
-            if value in {
-                "read",
-                "read_only",
-                "readonly",
-                "search",
-                "fetch",
-                "list",
-                "inspect",
-                "view",
-                "preview",
-            }:
-                return True
-        return False
+        # Provider-owned booleans may be useful as diagnostic evidence, but
+        # labels/operation names are never an authorization primitive.
+        return any(metadata_preview.get(key) is True for key in ("read_only", "is_read_only"))
 
     def evaluate(self, approval: PendingApproval) -> ApprovalDecision:
         return self.evaluate_with_metadata(approval)
@@ -185,19 +173,20 @@ class ApprovalPolicy:
 
         if recipient in self.allowed_recipients:
             return ApprovalDecision(
-                allowed=True,
-                reason="recipient_allowed",
+                allowed=False,
+                reason="recipient_allowlist_requires_stable_action",
                 recipient=recipient,
-                manual_required=False,
+                manual_required=True,
+                metadata_preview=metadata_preview,
             )
 
         is_read_only = self._is_read_only_metadata(metadata_preview)
         if is_read_only and self.auto_approve_read_only:
             return ApprovalDecision(
-                allowed=True,
-                reason="read_only_auto_approved",
+                allowed=False,
+                reason="read_only_hint_requires_stable_action",
                 recipient=recipient,
-                manual_required=False,
+                manual_required=True,
                 metadata_preview=metadata_preview,
             )
         if is_read_only and not self.auto_approve_read_only:

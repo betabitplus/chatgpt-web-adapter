@@ -78,8 +78,8 @@ The runtime deliberately separates:
 | Multimodal continuation | Production on the proven default provider path | Same canonical finality boundary |
 | Web-search observation | Production on the proven default provider path | Typed search/source/citation evidence |
 | Generic product-tool observation | Observed | Reports what the product emitted; does not create caller tool authority |
-| Required-action point evidence | Observed | Can represent visible authorization requirements without approving them |
-| Connector execution lifecycle | Conservative / `tools_connectors=UNKNOWN` | Requires explicit stable product identity/correlation |
+| Required-action point evidence | Observed | Can represent visible authorization requirements without approving them; legacy recipient/label/read-only hints never authorize a write |
+| Connector execution lifecycle | Conservative / `tools_connectors=UNKNOWN` | Requires explicit stable product identity/correlation; authorization stays in ChatGPT web |
 | Generated-artifact observation | Bounded internal boundary | Observation does not grant download authority |
 | Generated-artifact download | Unsupported today | Reopens only with stable product-owned identity + safe browser-owned resolution |
 | `browserless-request` writes | Experimental | May fail closed at current challenge/Sentinel boundaries |

@@ -263,15 +263,15 @@ def test_approval_policy_denied_recipient_denies() -> None:
     assert decision.manual_required is False
 
 
-def test_approval_policy_allowed_recipient_allows() -> None:
+def test_approval_policy_allowed_recipient_still_requires_stable_action_identity() -> None:
     policy = ApprovalPolicy(allowed_recipients={"python"})
 
     decision = policy.evaluate(_approval("python"))
 
-    assert decision.allowed is True
-    assert decision.reason == "recipient_allowed"
+    assert decision.allowed is False
+    assert decision.reason == "recipient_allowlist_requires_stable_action"
     assert decision.recipient == "python"
-    assert decision.manual_required is False
+    assert decision.manual_required is True
 
 
 def test_approval_policy_unknown_recipient_requires_manual_by_default() -> None:
@@ -306,7 +306,7 @@ def test_approval_policy_auto_approve_read_only_does_not_allow_without_evidence(
     assert decision.manual_required is True
 
 
-def test_approval_policy_auto_approve_read_only_allows_with_explicit_read_only_flag() -> None:
+def test_approval_policy_read_only_hint_requires_stable_action_identity() -> None:
     policy = ApprovalPolicy(auto_approve_read_only=True)
 
     decision = policy.evaluate_with_metadata(
@@ -314,9 +314,9 @@ def test_approval_policy_auto_approve_read_only_allows_with_explicit_read_only_f
         {"read_only": True},
     )
 
-    assert decision.allowed is True
-    assert decision.reason == "read_only_auto_approved"
-    assert decision.manual_required is False
+    assert decision.allowed is False
+    assert decision.reason == "read_only_hint_requires_stable_action"
+    assert decision.manual_required is True
     assert decision.metadata_preview == {"read_only": True}
 
 
@@ -325,13 +325,13 @@ def test_approval_policy_read_only_without_auto_approve_requires_manual() -> Non
 
     decision = policy.evaluate_with_metadata(
         _approval("python"),
-        {"operation_type": "read"},
+        {"read_only": True},
     )
 
     assert decision.allowed is False
     assert decision.reason == "read_only_auto_approve_disabled"
     assert decision.manual_required is True
-    assert decision.metadata_preview == {"operation_type": "read"}
+    assert decision.metadata_preview == {"read_only": True}
 
 
 def test_approval_policy_evaluate_rejects_non_pending_approval() -> None:
@@ -344,3 +344,46 @@ def test_approval_policy_types_are_exported_from_public_package() -> None:
     assert chatgpt_web_adapter.ApprovalPolicy is ApprovalPolicy
     assert "ApprovalDecision" in chatgpt_web_adapter.__all__
     assert "ApprovalPolicy" in chatgpt_web_adapter.__all__
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"operation": "search"},
+        {"operation_type": "read"},
+        {"action_type": "fetch"},
+        {"capability": "list"},
+        {"intent": "inspect"},
+        {"intent": "view"},
+        {"intent": "preview"},
+    ],
+)
+def test_approval_policy_display_or_operation_labels_never_grant_authority(metadata) -> None:
+    policy = ApprovalPolicy(auto_approve_read_only=True)
+
+    decision = policy.evaluate_with_metadata(_approval("python"), metadata)
+
+    assert decision.allowed is False
+    assert decision.reason == "manual_required_for_unknown_recipient"
+    assert decision.manual_required is True
+
+
+def test_approval_policy_no_legacy_hint_combination_can_return_allowed() -> None:
+    policies = [
+        ApprovalPolicy(allowed_recipients={"python"}),
+        ApprovalPolicy(auto_approve_read_only=True),
+        ApprovalPolicy(
+            allowed_recipients={"python"},
+            auto_approve_read_only=True,
+        ),
+    ]
+    metadata_values = [None, {"read_only": True}, {"operation": "search"}]
+
+    decisions = [
+        policy.evaluate_with_metadata(_approval("python"), metadata)
+        for policy in policies
+        for metadata in metadata_values
+    ]
+
+    assert decisions
+    assert all(decision.allowed is False for decision in decisions)

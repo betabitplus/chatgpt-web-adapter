@@ -6,6 +6,8 @@ The format is intentionally lightweight. Keep entries focused on user-visible be
 
 ## Unreleased
 
+- approval safety: remove recipient-name and metadata-string authority from legacy approval compatibility helpers; public approval is fail-closed without stable provider action identity, while required-action observation remains available and authorization stays in ChatGPT web
+
 ## 0.3.2 - 2026-09-26
 
 - auth privacy: add optional OS credential-store persistence through `keyring`, retain an explicit owner-only file fallback, migrate existing credentials with write/verify-before-metadata semantics, fail closed on keyring outages, expose backend provenance through status/doctor, and add explicit migrate/logout APIs and CLI commands without persisting transient proof/turnstile material

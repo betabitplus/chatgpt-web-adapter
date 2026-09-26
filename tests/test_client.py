@@ -16,6 +16,7 @@ import pytest
 
 import chatgpt_web_adapter as adapter
 import chatgpt_web_adapter.client as client_mod
+from chatgpt_web_adapter import legacy_client_core
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"0" * 40
 
@@ -1942,7 +1943,8 @@ def test_approve_pending_action_posts_prepare_and_polls_conversation(
     with _serve(_make_chat_handler(state)) as base_url:
         _patch_chat_endpoints(monkeypatch, base_url)
 
-        response = client.approve_pending_action(
+        response = legacy_client_core.ChatGPTWebClient.approve_pending_action(
+            client,
             adapter.ChatConversation(
                 conversation_id="conv-123",
                 message_id="assistant-old",
@@ -2029,7 +2031,8 @@ def test_approve_pending_action_missing_pending_descriptor_raises_stage_specific
             adapter.RequestError,
             match="pending tool approval not found in conversation payload",
         ):
-            client.approve_pending_action(
+            legacy_client_core.ChatGPTWebClient.approve_pending_action(
+                client,
                 adapter.ChatConversation(conversation_id="conv-123"),
                 poll=False,
             )
@@ -2092,7 +2095,8 @@ def test_approve_pending_action_can_skip_polling(monkeypatch: pytest.MonkeyPatch
     with _serve(_make_chat_handler(state)) as base_url:
         _patch_chat_endpoints(monkeypatch, base_url)
 
-        response = client.approve_pending_action(
+        response = legacy_client_core.ChatGPTWebClient.approve_pending_action(
+            client,
             {"conversation_id": "conv-123", "message_id": "assistant-old"},
             poll=False,
         )

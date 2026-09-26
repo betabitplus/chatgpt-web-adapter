@@ -125,44 +125,30 @@ def test_wait_and_approve_pending_actions_default_policy_blocks_before_prepare_o
     assert denied_event["reason"] == "manual_required_for_unknown_recipient"
 
 
-def test_approve_pending_action_allowed_policy_reaches_existing_send_flow() -> None:
+def test_approve_pending_action_allowed_recipient_still_blocks_before_send() -> None:
     client = _client_with_pending_payload(_confirm_action_payload(recipient="python"))
     events: list[dict[str, Any]] = []
     calls: list[str] = []
+    client._json_request = lambda *_args, **_kwargs: calls.append("prepare")
+    client._stream_backend_payload = lambda *_args, **_kwargs: calls.append("stream")
 
-    def fake_json_request(*_args: Any, **_kwargs: Any) -> tuple[int, dict[str, str]]:
-        calls.append("prepare")
-        return 200, {"status": "ok", "conduit_token": "conduit-token"}
+    with pytest.raises(ApprovalDeniedError) as exc_info:
+        client.approve_pending_action(
+            ChatConversation(conversation_id="conversation-1"),
+            poll=False,
+            policy=ApprovalPolicy(allowed_recipients={"python"}),
+            on_event=events.append,
+        )
 
-    def fake_stream(*_args: Any, **_kwargs: Any) -> tuple[str, str, str]:
-        calls.append("stream")
-        return "conversation-1", "message-1", "Approved"
-
-    client._json_request = fake_json_request
-    client._stream_backend_payload = fake_stream
-
-    response = client.approve_pending_action(
-        ChatConversation(conversation_id="conversation-1"),
-        poll=False,
-        policy=ApprovalPolicy(allowed_recipients={"python"}),
-        on_event=events.append,
-    )
-
-    assert calls == ["prepare", "stream"]
-    assert response.text == "Approved"
+    assert calls == []
+    assert exc_info.value.decision.allowed is False
+    assert exc_info.value.decision.manual_required is True
+    assert exc_info.value.decision.reason == "recipient_allowlist_requires_stable_action"
     canonical_types = [event["type"] for event in _canonical_events(events)]
-    assert canonical_types == [
-        "approval_detected",
-        "approval_allowed",
-        "approval_sent",
-        "approval_completed",
-    ]
-    assert "approval_policy_allowed" not in [event["type"] for event in events]
-    assert "pending_approval_detected" not in [event["type"] for event in events]
-    allowed_event = _canonical_events(events)[1]
-    assert allowed_event["allowed"] is True
-    assert allowed_event["reason"] == "recipient_allowed"
-
+    assert canonical_types == ["approval_detected", "approval_denied"]
+    denied_event = _canonical_events(events)[1]
+    assert denied_event["allowed"] is False
+    assert denied_event["reason"] == "recipient_allowlist_requires_stable_action"
 
 def test_approve_pending_action_denied_policy_blocks_before_prepare_or_stream() -> None:
     client = _client_with_pending_payload(_confirm_action_payload(recipient="browser"))
@@ -291,49 +277,38 @@ def test_send_and_auto_approve_passes_policy_to_wait_helper() -> None:
     assert response.text == "waited"
 
 
-def test_policy_aware_approval_failed_event_on_prepare_failure() -> None:
+def test_policy_aware_approval_allowlist_never_reaches_prepare_failure() -> None:
     client = _client_with_pending_payload(_confirm_action_payload(recipient="python"))
     events: list[dict[str, Any]] = []
-    client._json_request = lambda *_args, **_kwargs: (500, {"error": "prepare failed"})
+    client._json_request = lambda *_args, **_kwargs: pytest.fail("prepare must not run")
     client._stream_backend_payload = lambda *_args, **_kwargs: pytest.fail("stream must not run")
 
-    with pytest.raises(Exception):
+    with pytest.raises(ApprovalDeniedError) as exc_info:
         client.approve_pending_action(
             ChatConversation(conversation_id="conversation-1"),
             policy=ApprovalPolicy(allowed_recipients={"python"}),
             on_event=events.append,
         )
 
-    canonical_types = [event["type"] for event in _canonical_events(events)]
-    assert canonical_types == [
+    assert exc_info.value.decision.reason == "recipient_allowlist_requires_stable_action"
+    assert [event["type"] for event in _canonical_events(events)] == [
         "approval_detected",
-        "approval_allowed",
-        "approval_failed",
+        "approval_denied",
     ]
-    failed_event = _canonical_events(events)[-1]
-    assert failed_event["allowed"] is None
-    assert "prepare" in failed_event["reason"]
-
 
 def test_canonical_approval_events_have_stable_shape() -> None:
     client = _client_with_pending_payload(_confirm_action_payload(recipient="python"))
     events: list[dict[str, Any]] = []
+    client._json_request = lambda *_args, **_kwargs: pytest.fail("prepare must not run")
+    client._stream_backend_payload = lambda *_args, **_kwargs: pytest.fail("stream must not run")
 
-    def fake_json_request(*_args: Any, **_kwargs: Any) -> tuple[int, dict[str, str]]:
-        return 200, {"status": "ok", "conduit_token": "conduit-token"}
-
-    def fake_stream(*_args: Any, **_kwargs: Any) -> tuple[str, str, str]:
-        return "conversation-1", "message-1", "Approved"
-
-    client._json_request = fake_json_request
-    client._stream_backend_payload = fake_stream
-
-    client.approve_pending_action(
-        ChatConversation(conversation_id="conversation-1"),
-        poll=False,
-        policy=ApprovalPolicy(allowed_recipients={"python"}),
-        on_event=events.append,
-    )
+    with pytest.raises(ApprovalDeniedError):
+        client.approve_pending_action(
+            ChatConversation(conversation_id="conversation-1"),
+            poll=False,
+            policy=ApprovalPolicy(allowed_recipients={"python"}),
+            on_event=events.append,
+        )
 
     expected_keys = {
         "type",
@@ -352,3 +327,24 @@ def test_canonical_approval_events_have_stable_shape() -> None:
         assert event["tool_message_id"] == "tool-msg"
         assert event["target_message_id"] == "target-node"
         assert event["recipient"] == "python"
+
+
+def test_public_approve_pending_action_without_policy_is_fail_closed() -> None:
+    client = _client_with_pending_payload(_confirm_action_payload(recipient="python"))
+    events: list[dict[str, Any]] = []
+    client._json_request = lambda *_args, **_kwargs: pytest.fail("prepare must not run")
+    client._stream_backend_payload = lambda *_args, **_kwargs: pytest.fail("stream must not run")
+
+    with pytest.raises(ApprovalDeniedError) as exc_info:
+        client.approve_pending_action(
+            ChatConversation(conversation_id="conversation-1"),
+            poll=False,
+            on_event=events.append,
+        )
+
+    assert exc_info.value.decision.allowed is False
+    assert exc_info.value.decision.reason == "manual_required_for_unknown_recipient"
+    assert [event["type"] for event in _canonical_events(events)] == [
+        "approval_detected",
+        "approval_denied",
+    ]

@@ -401,7 +401,7 @@ def test_packaged_wk_helper_proves_temporary_mode_from_observed_submit_body() ->
     assert "submit_temporary_mode_observed" in helper
 
 
-def test_packaged_wk_helper_uses_native_trusted_send_click_without_double_flipping_y() -> None:
+def test_packaged_wk_helper_uses_one_page_owned_send_action_for_detached_workers() -> None:
     root = (
         Path(__file__).resolve().parents[1]
         / "src"
@@ -410,11 +410,20 @@ def test_packaged_wk_helper_uses_native_trusted_send_click_without_double_flippi
     )
     helper = (root / "WKChatGPTAuthority.m").read_text(encoding="utf-8")
 
-    assert "static NSDictionary *NativeClickSendButton(WKWebView *webView)" in helper
-    assert "NSEventTypeLeftMouseDown" in helper
-    assert "NSEventTypeLeftMouseUp" in helper
-    assert "cssY * scaleY" in helper
-    assert "[webView convertPoint:localPoint toView:nil]" in helper
-    assert "bounds.size.height - (cssY * scaleY)" not in helper
-    assert "static NSString *SendScript(void)" not in helper
-    assert '@"strategy": @"native_send_button_click"' in helper
+    start = helper.index("static NSDictionary *PageClickSendButton(WKWebView *webView)")
+    end = helper.index("static NSString *AcceptanceScript", start)
+    send_helper = helper[start:end]
+    assert "b.click();" in send_helper
+    assert send_helper.count("b.click();") == 1
+    assert "NSEventTypeLeftMouseDown" not in send_helper
+    assert "NSEventTypeLeftMouseUp" not in send_helper
+    assert "page_send_button_click" in send_helper
+
+    pump_start = helper.index("static BOOL PumpRealPageTurnBrokerEntry(")
+    pump_end = helper.index("if (delegate.submitRequestObserved", pump_start)
+    pre_submit = helper[pump_start:pump_end]
+    assert pre_submit.index("RearmFetchObserversScript()") < pre_submit.index(
+        "PageClickSendButton(webView)"
+    )
+    assert pre_submit.count("PageClickSendButton(webView)") == 1
+    assert "entry.realPageSent = YES;" in pre_submit

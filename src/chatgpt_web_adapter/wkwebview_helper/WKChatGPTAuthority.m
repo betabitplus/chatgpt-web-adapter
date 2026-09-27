@@ -970,101 +970,30 @@ static NSString *InjectAttachmentFilesScript(NSArray<NSString *> *paths) {
             json];
 }
 
-static NSString *SendButtonPointScript(void) {
+
+static NSDictionary *PageClickSendButton(WKWebView *webView) {
     NSString *composerResolver = ComposerResolverSource();
     NSString *sendResolver = ScopedSendResolverSource();
-    return [NSString stringWithFormat:
-            @"(()=>{"
-              "const resolveComposer=%@;const resolveSend=%@;const composer=resolveComposer();const b=resolveSend(composer);"
-              "if(!composer)return JSON.stringify({ok:false,reason:'no_composer'});"
-              "if(!b)return JSON.stringify({ok:false,reason:'no_send'});"
-              "const r=b.getBoundingClientRect();const x=r.left+r.width/2,y=r.top+r.height/2;"
-              "const inside=Number.isFinite(x)&&Number.isFinite(y)&&x>=0&&y>=0&&x<=innerWidth&&y<=innerHeight;"
-              "if(!inside)return JSON.stringify({ok:false,reason:'send_outside_viewport',x,y,w:r.width,h:r.height,viewportWidth:innerWidth,viewportHeight:innerHeight});"
-              "return JSON.stringify({ok:true,x,y,w:r.width,h:r.height,viewportWidth:innerWidth,viewportHeight:innerHeight,aria:b.getAttribute('aria-label'),test:b.getAttribute('data-testid')});"
-            "})()",
-            composerResolver,
-            sendResolver];
-}
-
-static NSDictionary *NativeClickSendButton(WKWebView *webView) {
-    NSError *pointError = nil;
-    NSDictionary *point = ParseJSONResult(
-        EvaluateSync(webView, SendButtonPointScript(), 1.0, &pointError)
-    );
-    if (pointError != nil || ![point[@"ok"] boolValue]) {
+    // Keep the send action inside the product page. Direct NSEvent delivery to an
+    // offscreen WKWebView can be dropped when this helper descends from a detached
+    // background worker even though mouseDown:/mouseUp: return normally. The page
+    // click invokes the same ChatGPT control exactly once, after the submit/stream
+    // observers have already been armed by PumpRealPageTurnBrokerEntry.
+    NSString *script = [NSString stringWithFormat:
+        @"(()=>{const resolveComposer=%@;const resolveSend=%@;const composer=resolveComposer();const b=resolveSend(composer);if(!composer)return JSON.stringify({ok:false,reason:'no_composer'});if(!b)return JSON.stringify({ok:false,reason:'no_send'});b.click();return JSON.stringify({ok:true,strategy:'page_send_button_click',aria:b.getAttribute('aria-label'),test:b.getAttribute('data-testid')});})()",
+        composerResolver,
+        sendResolver
+    ];
+    NSError *error = nil;
+    NSDictionary *result = ParseJSONResult(EvaluateSync(webView, script, 1.0, &error));
+    if (error != nil || ![result[@"ok"] boolValue]) {
         return @{
             @"ok": @NO,
-            @"reason": pointError.localizedDescription ?: [point[@"reason"] description] ?: @"send_point_failed"
+            @"reason": error.localizedDescription ?: [result[@"reason"] description] ?: @"page_send_click_failed"
         };
     }
-    double viewportWidth = [point[@"viewportWidth"] doubleValue];
-    double viewportHeight = [point[@"viewportHeight"] doubleValue];
-    double cssX = [point[@"x"] doubleValue];
-    double cssY = [point[@"y"] doubleValue];
-    if (
-        viewportWidth <= 0
-        || viewportHeight <= 0
-        || !isfinite(cssX)
-        || !isfinite(cssY)
-    ) {
-        return @{@"ok": @NO, @"reason": @"send_point_invalid"};
-    }
-    NSRect bounds = webView.bounds;
-    double scaleX = bounds.size.width / viewportWidth;
-    double scaleY = bounds.size.height / viewportHeight;
-    NSPoint localPoint = NSMakePoint(
-        cssX * scaleX,
-        cssY * scaleY
-    );
-    NSPoint windowPoint = [webView convertPoint:localPoint toView:nil];
-    NSWindow *window = webView.window;
-    if (window == nil) {
-        return @{@"ok": @NO, @"reason": @"send_window_missing"};
-    }
-    [window makeFirstResponder:webView];
-    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
-    NSEvent *moved = [NSEvent
-        mouseEventWithType:NSEventTypeMouseMoved
-        location:windowPoint
-        modifierFlags:0
-        timestamp:now
-        windowNumber:window.windowNumber
-        context:nil
-        eventNumber:0
-        clickCount:0
-        pressure:0.0];
-    NSEvent *down = [NSEvent
-        mouseEventWithType:NSEventTypeLeftMouseDown
-        location:windowPoint
-        modifierFlags:0
-        timestamp:now
-        windowNumber:window.windowNumber
-        context:nil
-        eventNumber:1
-        clickCount:1
-        pressure:1.0];
-    NSEvent *up = [NSEvent
-        mouseEventWithType:NSEventTypeLeftMouseUp
-        location:windowPoint
-        modifierFlags:0
-        timestamp:now
-        windowNumber:window.windowNumber
-        context:nil
-        eventNumber:2
-        clickCount:1
-        pressure:0.0];
-    [webView mouseMoved:moved];
-    [webView mouseDown:down];
-    [webView mouseUp:up];
-    return @{
-        @"ok": @YES,
-        @"strategy": @"native_send_button_click",
-        @"aria": [point[@"aria"] description] ?: @"",
-        @"test": [point[@"test"] description] ?: @""
-    };
+    return result;
 }
-
 static NSString *AcceptanceScript(NSString *prompt, NSInteger baselineAssistantCount) {
     NSString *literal = JSONStringLiteral(prompt ?: @"");
     return [NSString stringWithFormat:
@@ -2106,7 +2035,7 @@ static BOOL PumpRealPageTurnBrokerEntry(
             );
             return YES;
         }
-        NSDictionary *sent = NativeClickSendButton(webView);
+        NSDictionary *sent = PageClickSendButton(webView);
         if (![sent[@"ok"] boolValue]) {
             *outResult = TurnBrokerFailure(
                 @"WKWEBVIEW_TEMPORARY_SEND_FAILED",
@@ -3428,7 +3357,7 @@ int main(int argc, const char *argv[]) {
                 sendClicked = YES;
                 break;
             }
-            NSDictionary *sent = NativeClickSendButton(webView);
+            NSDictionary *sent = PageClickSendButton(webView);
             if ([sent[@"ok"] boolValue]) {
                 sendClicked = YES;
                 break;

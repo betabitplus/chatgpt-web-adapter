@@ -1571,6 +1571,65 @@ class WKWebViewTurnProvider:
             request=request,
         )
 
+    def minimal_security_preflight(
+        self,
+        *,
+        timeout: float = 20.0,
+        model_slug: str | None = None,
+    ) -> dict[str, Any]:
+        """Run the production minimal-shell preparation path without a conversation write."""
+
+        total_timeout = max(2.0, min(float(timeout), 30.0))
+        prepared = self._turn_orchestrator.prepare_turn(
+            conversation=None,
+            total_timeout=total_timeout,
+            attachment_paths=None,
+            model_slug=model_slug,
+            streaming=True,
+        )
+        if not prepared.use_minimal_security_shell:
+            raise RequestError(
+                "WKWEBVIEW_MINIMAL_SECURITY_PREFLIGHT_UNAVAILABLE",
+                request_stage="wkwebview_minimal_security_preflight",
+            )
+        invocation = self._turn_orchestrator.build_turn_invocation(
+            text="CWA_MINIMAL_SECURITY_PREFLIGHT",
+            total_timeout=total_timeout,
+            prepared=prepared,
+            streaming=True,
+        )
+        invocation.request["minimal_preflight_only"] = True
+        payload = self._run_helper_streaming(
+            invocation,
+            timeout=total_timeout,
+            on_text_event=lambda _event: None,
+            on_lifecycle_event=lambda _event: None,
+            on_transport_event=lambda _event: None,
+            external_completion_check=lambda: False,
+        )
+        if (
+            payload.get("minimal_security_preflight") is not True
+            or payload.get("protected_write_dispatched") is not False
+        ):
+            raise RequestError(
+                "WKWEBVIEW_MINIMAL_SECURITY_PREFLIGHT_BOUNDARY_INVALID",
+                request_stage="wkwebview_minimal_security_preflight",
+                write_dispatched=payload.get("protected_write_dispatched")
+                if isinstance(payload.get("protected_write_dispatched"), bool)
+                else None,
+            )
+        return {
+            "ok": True,
+            "stage": payload.get("stage"),
+            "protected_write_dispatched": False,
+            "conduit_token_present": payload.get("conduit_token_present") is True,
+            "model_resolved": payload.get("model_resolved") is True,
+            "thinking_effort_present": payload.get("thinking_effort_present") is True,
+            "integrity_server_owned_headers": (
+                payload.get("integrity_server_owned_headers") is True
+            ),
+        }
+
     def conversation_ui_state(
         self,
         conversation: str | ConversationRef,

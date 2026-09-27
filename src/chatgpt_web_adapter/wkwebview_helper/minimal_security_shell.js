@@ -12,6 +12,7 @@
     ? requestConfig.proxy_protected_write === true
     : window.__CWA_PROXY_PROTECTED_WRITE__ === true;
   const requestId = typeof requestConfig?.request_id === "string" ? requestConfig.request_id : "";
+  const preflightOnly = requestConfig?.preflight_only === true;
   const pageBaseURL = document.baseURI || location.href;
   const tagged = (body) => requestId ? {...body, request_id: requestId} : body;
   const post = (body) => {
@@ -579,6 +580,34 @@
     });
   };
 
+  const discoverRspackRouteIntegrityResource = (manifestText, manifestURL) => {
+    const entryMatch = /'entry':\{'module':'[^']+','imports':\['([^']+)'/.exec(manifestText);
+    if (!entryMatch || !entryMatch[1]) {
+      throw new Error("MINIMAL_RSPACK_RUNTIME_MISSING");
+    }
+    const routeNeedle = "'conversation-layout.route':{";
+    const routeStart = manifestText.indexOf(routeNeedle);
+    if (routeStart < 0) {
+      throw new Error("MINIMAL_RSPACK_CONVERSATION_LAYOUT_ROUTE_MISSING");
+    }
+    const routeEnd = manifestText.indexOf("},'", routeStart + routeNeedle.length);
+    if (routeEnd < 0) {
+      throw new Error("MINIMAL_RSPACK_CONVERSATION_LAYOUT_ROUTE_INVALID");
+    }
+    const routeBlock = manifestText.slice(routeStart, routeEnd + 1);
+    const moduleMatches = [...routeBlock.matchAll(/'module':'([^']+)'/g)];
+    if (moduleMatches.length !== 1 || !moduleMatches[0]?.[1]) {
+      throw new Error(
+        `MINIMAL_RSPACK_CONVERSATION_LAYOUT_MODULE_${moduleMatches.length ? "AMBIGUOUS" : "MISSING"}`,
+      );
+    }
+    return Object.freeze({
+      kind: "rspack-route-v2",
+      runtimeURL: new URL(entryMatch[1], manifestURL).href,
+      routeModuleURL: new URL(moduleMatches[0][1], manifestURL).href,
+    });
+  };
+
   const bootstrapProductResources = async () => {
     setStage("root");
     const rootResponse = await fetch("/", {
@@ -627,11 +656,87 @@
       throw new Error(`MINIMAL_INTEGRITY_MANIFEST_HTTP_${manifestResponse.status}`);
     }
     const manifestText = await manifestResponse.text();
-    return discoverRspackSplitIntegrityResource(manifestText, manifestURL);
+    try {
+      return discoverRspackRouteIntegrityResource(manifestText, manifestURL);
+    } catch (routeError) {
+      try {
+        return discoverRspackSplitIntegrityResource(manifestText, manifestURL);
+      } catch (_) {
+        throw routeError;
+      }
+    }
   };
 
   const loadIntegrityRuntime = async (integrityResource) => {
     setStage("integrity_discovery");
+    if (integrityResource?.kind === "rspack-route-v2") {
+      setStage("integrity_import");
+      const runtimeModule = await import(integrityResource.runtimeURL);
+      const rspackRequire = runtimeModule?.__webpack_require__;
+      if (typeof rspackRequire !== "function" || typeof rspackRequire.C !== "function") {
+        throw new Error("MINIMAL_RSPACK_RUNTIME_INVALID");
+      }
+      await import(integrityResource.routeModuleURL);
+      const markerCandidates = Object.entries(rspackRequire.m || {}).filter(([, factory]) => {
+        if (typeof factory !== "function") return false;
+        const source = Function.prototype.toString.call(factory);
+        return (
+          source.includes("chatRequirementsPrepareToken")
+          && source.includes("chatRequirementsToken")
+          && source.includes("proofToken")
+          && source.includes("turnstileToken")
+          && source.includes("OAI-Telemetry")
+        );
+      });
+      if (markerCandidates.length !== 1) {
+        throw new Error(
+          `MINIMAL_RSPACK_INTEGRITY_MODULE_${markerCandidates.length ? "AMBIGUOUS" : "MISSING"}`,
+        );
+      }
+      const integrityModule = rspackRequire(markerCandidates[0][0]);
+      const exportCandidates = Object.entries(integrityModule || {}).filter(([, value]) => {
+        if (typeof value !== "function") return false;
+        const source = Function.prototype.toString.call(value);
+        return (
+          source.includes("appAttestChallenge")
+          && source.includes("chatRequirements")
+          && source.includes("proofToken")
+          && source.includes("turnstileToken")
+        );
+      });
+      if (exportCandidates.length !== 1) {
+        throw new Error(
+          `MINIMAL_RSPACK_INTEGRITY_EXPORT_${exportCandidates.length ? "AMBIGUOUS" : "MISSING"}`,
+        );
+      }
+      const serverAcquireIntegrity = exportCandidates[0][1];
+      return Object.freeze({
+        createAcquireIntegrity: (accessToken) => async () => {
+          const deviceMatch = document.cookie.match(/(?:^|;\s*)oai-did=([^;]+)/);
+          const deviceId = deviceMatch ? decodeURIComponent(deviceMatch[1]) : "";
+          const prepared = await serverAcquireIntegrity(async (prepareProof) => {
+            const path = "/backend-api/sentinel/chat-requirements/prepare";
+            const response = await fetch(path, {
+              credentials: "include",
+              cache: "no-store",
+              method: "POST",
+              headers: requestHeaders(accessToken, deviceId, path),
+              body: JSON.stringify({ p: prepareProof }),
+            });
+            if (!response.ok) {
+              throw new Error(`MINIMAL_CHAT_REQUIREMENTS_HTTP_${response.status}`);
+            }
+            return response.json();
+          });
+          return {
+            ...prepared,
+            chatReq: prepared?.chatRequirements ?? {},
+          };
+        },
+        officialConversationTransport: null,
+        initializeConversationTransport: null,
+      });
+    }
     if (integrityResource?.kind === "rspack-split-v1") {
       setStage("integrity_import");
       const runtimeModule = await import(integrityResource.runtimeURL);
@@ -1817,6 +1922,23 @@
       onSubmitReady: conversationId && !temporary ? resolveSubmitReady : null,
       turnTraceId,
     });
+
+    if (preflightOnly) {
+      const conduitToken = await conduitPromise;
+      post({
+        ok: true,
+        status: 200,
+        stage,
+        minimal_security_preflight: true,
+        protected_write_dispatched: protectedWriteDispatched,
+        conduit_token_present: typeof conduitToken === "string" && conduitToken.length > 0,
+        model_resolved: typeof model === "string" && model.length > 0,
+        thinking_effort_present:
+          typeof thinkingEffort === "string" && thinkingEffort.length > 0,
+        integrity_server_owned_headers: integrityBundle.serverOwnedHeaders === true,
+      });
+      return;
+    }
 
     if (conversationId && !temporary) {
       await submitReadyPromise;

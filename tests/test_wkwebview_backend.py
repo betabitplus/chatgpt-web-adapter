@@ -4535,3 +4535,121 @@ def test_native_turn_broker_preserves_minimal_shell_dispatch_evidence() -> None:
     assert "TurnBrokerFailureWithWriteEvidence(" in pump
     assert "launch," in pump
     assert "delegate" in pump
+
+
+def test_minimal_security_preflight_branch_precedes_protected_write() -> None:
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "chatgpt_web_adapter"
+        / "wkwebview_helper"
+        / "minimal_security_shell.js"
+    ).read_text(encoding="utf-8")
+    entrypoint = source.rsplit("  (async () => {", 1)[1]
+
+    preflight_index = entrypoint.index("if (preflightOnly) {")
+    write_index = entrypoint.index("const writePromise = protectedWrite({")
+    assert preflight_index < write_index
+    assert "minimal_security_preflight: true" in entrypoint
+    assert "protected_write_dispatched: protectedWriteDispatched" in entrypoint
+
+    native_source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "chatgpt_web_adapter"
+        / "wkwebview_helper"
+        / "WKChatGPTAuthority.m"
+    ).read_text(encoding="utf-8")
+    assert 'RequestBool(request, @"minimal_preflight_only", NO)' in native_source
+    assert '@"preflight_only": @(entry.preflightOnly)' in native_source
+    assert "entry.preflightOnly" in native_source
+
+
+def test_provider_minimal_security_preflight_uses_production_invocation_without_write(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
+    prepared = SimpleNamespace(use_minimal_security_shell=True)
+    invocation = SimpleNamespace(
+        command=["helper", "--minimal-security-shell"],
+        request={"proxy_protected_write": True},
+    )
+
+    class Orchestrator:
+        def prepare_turn(self, **kwargs):
+            assert kwargs["conversation"] is None
+            assert kwargs["attachment_paths"] is None
+            assert kwargs["streaming"] is True
+            return prepared
+
+        def build_turn_invocation(self, **kwargs):
+            assert kwargs["prepared"] is prepared
+            assert kwargs["streaming"] is True
+            assert kwargs["text"] == "CWA_MINIMAL_SECURITY_PREFLIGHT"
+            return invocation
+
+    provider._turn_orchestrator = Orchestrator()
+
+    def fake_stream(candidate, **kwargs):
+        assert candidate is invocation
+        assert candidate.request["minimal_preflight_only"] is True
+        assert kwargs["external_completion_check"]() is False
+        return {
+            "ok": True,
+            "stage": "prepare",
+            "minimal_security_preflight": True,
+            "protected_write_dispatched": False,
+            "conduit_token_present": True,
+            "model_resolved": True,
+            "thinking_effort_present": False,
+            "integrity_server_owned_headers": True,
+        }
+
+    monkeypatch.setattr(provider, "_run_helper_streaming", fake_stream)
+
+    assert provider.minimal_security_preflight(timeout=12.0) == {
+        "ok": True,
+        "stage": "prepare",
+        "protected_write_dispatched": False,
+        "conduit_token_present": True,
+        "model_resolved": True,
+        "thinking_effort_present": False,
+        "integrity_server_owned_headers": True,
+    }
+
+
+def test_provider_minimal_security_preflight_rejects_dispatch_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    provider = WKWebViewTurnProvider(state_dir=tmp_path)
+    prepared = SimpleNamespace(use_minimal_security_shell=True)
+    invocation = SimpleNamespace(
+        command=["helper", "--minimal-security-shell"],
+        request={},
+    )
+
+    class Orchestrator:
+        def prepare_turn(self, **kwargs):
+            return prepared
+
+        def build_turn_invocation(self, **kwargs):
+            return invocation
+
+    provider._turn_orchestrator = Orchestrator()
+    monkeypatch.setattr(
+        provider,
+        "_run_helper_streaming",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "minimal_security_preflight": True,
+            "protected_write_dispatched": True,
+        },
+    )
+
+    with pytest.raises(
+        RequestError,
+        match="WKWEBVIEW_MINIMAL_SECURITY_PREFLIGHT_BOUNDARY_INVALID",
+    ):
+        provider.minimal_security_preflight()

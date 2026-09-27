@@ -1345,6 +1345,7 @@ static NSString *MinimalSecurityWriteScript(
 @property(nonatomic, assign) NSInteger attachmentCount;
 @property(nonatomic, assign) BOOL temporary;
 @property(nonatomic, assign) BOOL proxyProtectedWrite;
+@property(nonatomic, assign) BOOL preflightOnly;
 @property(nonatomic, assign) BOOL proxyFetchEnded;
 @property(nonatomic, assign) NSInteger proxyFetchStatus;
 @property(nonatomic, copy) NSString *proxyFetchError;
@@ -1672,6 +1673,7 @@ static void LaunchTurnBrokerEntry(WKTurnBrokerEntry *entry) {
         @"profile": entry.profile ?: @"",
         @"temporary": @(entry.temporary),
         @"proxy_protected_write": @(entry.proxyProtectedWrite),
+        @"preflight_only": @(entry.preflightOnly),
         @"conversation_id": entry.conversationId ?: @"",
         @"parent_message_id": entry.parentMessageId ?: @"",
         @"selected_model_slug": entry.modelSlug ?: @"",
@@ -1723,6 +1725,7 @@ static WKTurnBrokerEntry *StartTurnBrokerEntry(
     NSString *handoffAttemptId = RequestString(request, @"minimal_handoff_attempt_id", @"");
     BOOL temporary = RequestBool(request, @"minimal_temporary", NO);
     BOOL proxyProtectedWrite = RequestBool(request, @"proxy_protected_write", NO);
+    BOOL preflightOnly = RequestBool(request, @"minimal_preflight_only", NO);
     id rawAttachments = request[@"minimal_attachments"];
     NSString *attachmentsBase64 = [rawAttachments isKindOfClass:[NSArray class]] ? Base64JSONValue(rawAttachments) : @"";
     NSInteger attachmentCount = [rawAttachments isKindOfClass:[NSArray class]] ? (NSInteger)[(NSArray *)rawAttachments count] : 0;
@@ -1754,6 +1757,7 @@ static WKTurnBrokerEntry *StartTurnBrokerEntry(
     entry.attachmentCount = attachmentCount;
     entry.temporary = temporary;
     entry.proxyProtectedWrite = proxyProtectedWrite;
+    entry.preflightOnly = preflightOnly;
     entry.proxyFetchEnded = NO;
     entry.proxyFetchStatus = 0;
     entry.proxyFetchError = @"";
@@ -2324,6 +2328,15 @@ static BOOL PumpTurnBrokerEntry(WKTurnBrokerEntry *entry, NSDictionary **outResu
             launch,
             delegate
         );
+        return YES;
+    }
+    if (
+        entry.preflightOnly
+        && delegate.canonicalDone
+        && [launch isKindOfClass:[NSDictionary class]]
+        && [launch[@"ok"] boolValue]
+    ) {
+        *outResult = launch;
         return YES;
     }
 

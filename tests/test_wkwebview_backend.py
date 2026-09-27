@@ -4445,3 +4445,93 @@ def test_lightweight_phase_one_does_not_use_global_heavy_submit_gate() -> None:
     assert calls == ["stream"]
     assert result["_cwa_phase_a_gate_wait_ms"] == 0
     assert result["_cwa_phase_a_transport"] == "wkwebview_minimal_security_shell"
+
+
+def test_turn_broker_structured_pre_dispatch_failure_preserves_exact_dispatch_false(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.closed = False
+            self.envelopes = iter(
+                [
+                    {
+                        "type": "result",
+                        "result": {
+                            "ok": False,
+                            "error": "WKWEBVIEW_MINIMAL_SECURITY_WRITE_FAILED",
+                            "detail": "bootstrap failed before protected write",
+                            "stage": "bootstrap",
+                            "status": 0,
+                            "protected_write_dispatched": False,
+                        },
+                    }
+                ]
+            )
+
+        def recv_envelope(self, timeout: float):
+            return next(self.envelopes)
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FakeConnection()
+
+    class FakeBrokerClient:
+        def __init__(self, helper_binary: Path) -> None:
+            self.helper_binary = helper_binary
+
+        def start_turn(self, request: dict[str, Any], *, timeout: float):
+            assert request == {"prompt": "hello"}
+            return connection
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_helper_runtime.WKSystemTurnBrokerClient",
+        FakeBrokerClient,
+    )
+    runtime = WKWebViewHelperRuntime(tmp_path, build_timeout=1)
+    invocation = SimpleNamespace(request={"prompt": "hello"})
+
+    with pytest.raises(
+        RequestError,
+        match="WKWEBVIEW_MINIMAL_SECURITY_WRITE_FAILED stage=bootstrap",
+    ) as caught:
+        runtime._run_streaming_via_turn_broker(
+            invocation,
+            timeout=1.0,
+            on_text_event=lambda _event: None,
+            on_lifecycle_event=None,
+            on_transport_event=None,
+            on_submit_started=None,
+            external_completion_check=None,
+        )
+
+    error = caught.value
+    assert error.write_dispatched is False
+    assert error.submit_request_observed is None
+    assert error.submit_response_observed is None
+    assert error.submit_response_status is None
+    assert connection.closed is True
+
+
+def test_native_turn_broker_preserves_minimal_shell_dispatch_evidence() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src/chatgpt_web_adapter/wkwebview_helper/WKChatGPTAuthority.m"
+    ).read_text(encoding="utf-8")
+
+    helper_start = source.index("static NSDictionary *TurnBrokerFailureWithWriteEvidence(")
+    helper_end = source.index("static NSDictionary *TurnBrokerSuccessPayload", helper_start)
+    helper = source[helper_start:helper_end]
+    assert 'source[@"protected_write_dispatched"]' in helper
+    assert 'failure[@"protected_write_dispatched"] = dispatched;' in helper
+    assert "if (delegate.submitRequestObserved)" in helper
+    assert "if (delegate.submitResponseObserved)" in helper
+
+    pump_start = source.index("static BOOL PumpTurnBrokerEntry(")
+    pump_end = source.index("static BOOL DeliverProxyFetchCommand", pump_start)
+    pump = source[pump_start:pump_end]
+    assert "TurnBrokerFailureWithWriteEvidence(" in pump
+    assert "launch," in pump
+    assert "delegate" in pump

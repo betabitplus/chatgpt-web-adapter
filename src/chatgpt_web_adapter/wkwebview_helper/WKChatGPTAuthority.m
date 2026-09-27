@@ -1519,6 +1519,33 @@ static NSDictionary *TurnBrokerFailure(NSString *error, NSString *detail, NSStri
     };
 }
 
+static NSDictionary *TurnBrokerFailureWithWriteEvidence(
+    NSString *error,
+    NSString *detail,
+    NSString *stage,
+    NSInteger status,
+    NSDictionary *source,
+    WKAuthorityDelegate *delegate
+) {
+    NSMutableDictionary *failure = [
+        TurnBrokerFailure(error, detail, stage, status) mutableCopy
+    ];
+    id dispatched = [source[@"protected_write_dispatched"] isKindOfClass:[NSNumber class]]
+        ? source[@"protected_write_dispatched"]
+        : nil;
+    if (dispatched != nil) {
+        failure[@"protected_write_dispatched"] = dispatched;
+    }
+    if (delegate.submitRequestObserved) {
+        failure[@"submit_request_observed"] = @YES;
+    }
+    if (delegate.submitResponseObserved) {
+        failure[@"submit_response_observed"] = @YES;
+        failure[@"submit_response_status"] = @(delegate.submitStatus);
+    }
+    return failure;
+}
+
 static NSDictionary *TurnBrokerSuccessPayload(WKTurnBrokerEntry *entry, BOOL identityRecoveryRequired) {
     WKAuthorityDelegate *delegate = entry.delegate;
     NSDictionary *successTransportSnapshot = entry.webView != nil
@@ -2289,11 +2316,13 @@ static BOOL PumpTurnBrokerEntry(WKTurnBrokerEntry *entry, NSDictionary **outResu
 
     NSDictionary *launch = delegate.canonicalResult;
     if (delegate.canonicalDone && [launch isKindOfClass:[NSDictionary class]] && ![launch[@"ok"] boolValue]) {
-        *outResult = TurnBrokerFailure(
+        *outResult = TurnBrokerFailureWithWriteEvidence(
             @"WKWEBVIEW_MINIMAL_SECURITY_WRITE_FAILED",
             [launch[@"error"] isKindOfClass:[NSString class]] ? launch[@"error"] : @"",
             [launch[@"stage"] isKindOfClass:[NSString class]] ? launch[@"stage"] : @"",
-            [launch[@"status"] respondsToSelector:@selector(integerValue)] ? [launch[@"status"] integerValue] : 0
+            [launch[@"status"] respondsToSelector:@selector(integerValue)] ? [launch[@"status"] integerValue] : 0,
+            launch,
+            delegate
         );
         return YES;
     }

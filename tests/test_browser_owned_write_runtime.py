@@ -285,6 +285,33 @@ def test_observed_submit_request_dominates_conflicting_no_dispatch_flag(
     )
 
 
+def test_observed_submit_response_proves_dispatch_without_explicit_flag(
+    monkeypatch,
+) -> None:
+    def fail(*args, **kwargs):
+        raise subject.RequestError(
+            "WKWEBVIEW_AUTHORITY_NO_RESULT",
+            request_stage="wkwebview_authority_turn",
+            submit_response_observed=True,
+            submit_response_status=204,
+        )
+
+    monkeypatch.setattr(subject, "send_browser_native", fail)
+    with pytest.raises(subject.BrowserOwnedWriteRuntimeError) as caught:
+        runtime().send_text("hello")
+
+    error = caught.value
+    assert error.failure_kind == subject.WRITE_OUTCOME_UNKNOWN
+    assert error.automatic_retry_allowed is False
+    assert error.manual_retry_safe_after_repair is False
+    assert error.write_may_have_been_submitted is True
+    assert error.reconciliation_required is True
+    assert error.write_dispatched is True
+    assert error.submit_response_observed is True
+    assert error.submit_response_status == 204
+    assert error.turn_lifecycle.state is subject.TurnLifecycleState.AMBIGUOUS
+
+
 def test_governance_keeps_browser_confined_to_write() -> None:
     policy = runtime().governance()
     assert policy["read_plane"] == subject.READ_PLANE

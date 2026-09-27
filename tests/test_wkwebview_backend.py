@@ -9,6 +9,7 @@ import queue
 import socket
 import threading
 import time
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -43,9 +44,45 @@ from chatgpt_web_adapter.wkwebview_canonical import (
 from chatgpt_web_adapter.wkwebview_helper_runtime import (
     WKWebViewHelperRuntime,
     _helper_write_evidence,
+    _observed_write_evidence,
 )
 from chatgpt_web_adapter.wkwebview_provider import WKWebViewTurnProvider
 from chatgpt_web_adapter.wkwebview_turn_orchestrator import WKTurnOrchestrator
+
+
+def test_observed_write_evidence_never_infers_missing_dispatch() -> None:
+    assert _observed_write_evidence(
+        submit_request_seen=False,
+        submit_response_seen=False,
+        submit_response_status=None,
+    ) == {
+        "write_dispatched": None,
+        "submit_request_observed": None,
+        "submit_response_observed": None,
+        "submit_response_status": None,
+    }
+
+    assert _observed_write_evidence(
+        submit_request_seen=True,
+        submit_response_seen=False,
+        submit_response_status=None,
+    ) == {
+        "write_dispatched": True,
+        "submit_request_observed": True,
+        "submit_response_observed": None,
+        "submit_response_status": None,
+    }
+
+    assert _observed_write_evidence(
+        submit_request_seen=True,
+        submit_response_seen=True,
+        submit_response_status=204,
+    ) == {
+        "write_dispatched": True,
+        "submit_request_observed": True,
+        "submit_response_observed": True,
+        "submit_response_status": 204,
+    }
 
 
 def test_helper_write_evidence_preserves_exact_dispatch_boundary() -> None:
@@ -3954,6 +3991,222 @@ def test_turn_broker_pre_submit_watchdog_fails_and_closes_connection(
     assert time.monotonic() - started < 0.5
     assert connection.closed is True
     assert events == [{"type": "pre_submit_timeout", "timeout_seconds": 0.05}]
+
+
+def test_turn_broker_error_preserves_observed_submit_evidence(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.closed = False
+            self.envelopes = iter(
+                [
+                    {
+                        "type": "event",
+                        "event": {
+                            "type": "submit_request_observed",
+                            "temporary_mode": False,
+                        },
+                    },
+                    {
+                        "type": "event",
+                        "event": {
+                            "type": "submit_response_observed",
+                            "status": 204,
+                        },
+                    },
+                    {
+                        "type": "error",
+                        "error": "WKWEBVIEW_TURN_BROKER_PROCESS_ENDED",
+                    },
+                ]
+            )
+
+        def recv_envelope(self, timeout: float):
+            return next(self.envelopes)
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FakeConnection()
+
+    class FakeBrokerClient:
+        def __init__(self, helper_binary: Path) -> None:
+            self.helper_binary = helper_binary
+
+        def start_turn(self, request: dict[str, Any], *, timeout: float):
+            assert request == {"prompt": "hello"}
+            return connection
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_helper_runtime.WKSystemTurnBrokerClient",
+        FakeBrokerClient,
+    )
+    runtime = WKWebViewHelperRuntime(tmp_path, build_timeout=1)
+    invocation = SimpleNamespace(request={"prompt": "hello"})
+    transport_events: list[dict[str, Any]] = []
+
+    with pytest.raises(RequestError, match="WKWEBVIEW_TURN_BROKER_PROCESS_ENDED") as caught:
+        runtime._run_streaming_via_turn_broker(
+            invocation,
+            timeout=1.0,
+            on_text_event=lambda _event: None,
+            on_lifecycle_event=None,
+            on_transport_event=transport_events.append,
+            on_submit_started=None,
+            external_completion_check=None,
+        )
+
+    error = caught.value
+    assert error.write_dispatched is True
+    assert error.submit_request_observed is True
+    assert error.submit_response_observed is True
+    assert error.submit_response_status == 204
+    assert [event["type"] for event in transport_events] == [
+        "submit_request_observed",
+        "submit_response_observed",
+    ]
+    assert connection.closed is True
+
+
+def test_turn_broker_connection_end_preserves_positive_request_without_inference(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeConnection:
+        def __init__(self, *, emit_submit: bool) -> None:
+            self.emit_submit = emit_submit
+            self.closed = False
+            self.calls = 0
+
+        def recv_envelope(self, timeout: float):
+            self.calls += 1
+            if self.emit_submit and self.calls == 1:
+                return {
+                    "type": "event",
+                    "event": {
+                        "type": "submit_request_observed",
+                        "temporary_mode": False,
+                    },
+                }
+            raise RequestError(
+                "WKWEBVIEW_TURN_BROKER_CONNECTION_ENDED",
+                request_stage="wkwebview_authority_turn",
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    connections: list[FakeConnection] = []
+
+    class FakeBrokerClient:
+        def __init__(self, helper_binary: Path) -> None:
+            self.helper_binary = helper_binary
+
+        def start_turn(self, request: dict[str, Any], *, timeout: float):
+            connection = FakeConnection(emit_submit=not connections)
+            connections.append(connection)
+            return connection
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_helper_runtime.WKSystemTurnBrokerClient",
+        FakeBrokerClient,
+    )
+    runtime = WKWebViewHelperRuntime(tmp_path, build_timeout=1)
+    invocation = SimpleNamespace(request={"prompt": "hello"})
+
+    with pytest.raises(RequestError) as submitted:
+        runtime._run_streaming_via_turn_broker(
+            invocation,
+            timeout=1.0,
+            on_text_event=lambda _event: None,
+            on_lifecycle_event=None,
+            on_transport_event=None,
+            on_submit_started=None,
+            external_completion_check=None,
+        )
+    assert submitted.value.write_dispatched is True
+    assert submitted.value.submit_request_observed is True
+    assert submitted.value.submit_response_observed is None
+
+    with pytest.raises(RequestError) as unobserved:
+        runtime._run_streaming_via_turn_broker(
+            invocation,
+            timeout=1.0,
+            on_text_event=lambda _event: None,
+            on_lifecycle_event=None,
+            on_transport_event=None,
+            on_submit_started=None,
+            external_completion_check=None,
+        )
+    assert unobserved.value.write_dispatched is None
+    assert unobserved.value.submit_request_observed is None
+    assert unobserved.value.submit_response_observed is None
+    assert all(connection.closed for connection in connections)
+
+
+def test_direct_helper_no_result_preserves_observed_submit_evidence(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = None
+            self.stdout = StringIO(
+                "WK_EVENT "
+                + json.dumps(
+                    {
+                        "type": "submit_request_observed",
+                        "temporary_mode": False,
+                    }
+                )
+                + "\n"
+                + "WK_EVENT "
+                + json.dumps(
+                    {
+                        "type": "submit_response_observed",
+                        "status": 204,
+                    }
+                )
+                + "\n"
+            )
+            self.stderr = StringIO("helper ended without a result")
+            self.returncode = 1
+
+        def poll(self):
+            return self.returncode
+
+    process = FakeProcess()
+
+    def fake_popen(*args, **kwargs):
+        assert args[0] == ["fake-helper"]
+        return process
+
+    monkeypatch.setattr(
+        "chatgpt_web_adapter.wkwebview_helper_runtime.subprocess.Popen",
+        fake_popen,
+    )
+    runtime = WKWebViewHelperRuntime(tmp_path, build_timeout=1)
+    transport_events: list[dict[str, Any]] = []
+
+    with pytest.raises(RequestError, match="WKWEBVIEW_AUTHORITY_NO_RESULT") as caught:
+        runtime.run_streaming(
+            ["fake-helper"],
+            timeout=1.0,
+            on_text_event=lambda _event: None,
+            on_transport_event=transport_events.append,
+        )
+
+    error = caught.value
+    assert error.write_dispatched is True
+    assert error.submit_request_observed is True
+    assert error.submit_response_observed is True
+    assert error.submit_response_status == 204
+    assert [event["type"] for event in transport_events] == [
+        "submit_request_observed",
+        "submit_response_observed",
+    ]
 
 
 @pytest.mark.parametrize(

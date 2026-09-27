@@ -51,6 +51,28 @@ def _helper_write_evidence(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _observed_write_evidence(
+    *,
+    submit_request_seen: bool,
+    submit_response_seen: bool,
+    submit_response_status: int | None,
+) -> dict[str, Any]:
+    """Preserve only positive transport facts observed before an abnormal exit.
+
+    Absence of an event is not proof that the protected write was not dispatched.
+    Explicit false evidence remains owned by the helper result payload.
+    """
+
+    return {
+        "write_dispatched": True if submit_request_seen else None,
+        "submit_request_observed": True if submit_request_seen else None,
+        "submit_response_observed": True if submit_response_seen else None,
+        "submit_response_status": (
+            _optional_status(submit_response_status) if submit_response_seen else None
+        ),
+    }
+
+
 @dataclass
 class WKHelperInvocation:
     """Private request envelope for one native WK helper invocation."""
@@ -444,12 +466,30 @@ class WKWebViewHelperRuntime:
             _PRE_SUBMIT_TIMEOUT_SECONDS,
         )
         submit_request_seen = False
+        submit_response_seen = False
+        submit_response_status: int | None = None
         submit_temporary_mode_observed = False
         payload: dict[str, Any] | None = None
         connection_detached = False
         try:
             while time.monotonic() < deadline:
-                envelope = connection.recv_envelope(0.05)
+                try:
+                    envelope = connection.recv_envelope(0.05)
+                except RequestError as error:
+                    raise RequestError(
+                        str(error),
+                        status_code=getattr(error, "status_code", None),
+                        body_preview=getattr(error, "body_preview", None),
+                        request_stage=(
+                            getattr(error, "request_stage", None)
+                            or "wkwebview_authority_turn"
+                        ),
+                        **_observed_write_evidence(
+                            submit_request_seen=submit_request_seen,
+                            submit_response_seen=submit_response_seen,
+                            submit_response_status=submit_response_status,
+                        ),
+                    ) from error
                 if isinstance(envelope, dict):
                     kind = envelope.get("type")
                     if kind == "error":
@@ -459,6 +499,11 @@ class WKWebViewHelperRuntime:
                                 or "WKWEBVIEW_TURN_BROKER_FAILED"
                             ),
                             request_stage="wkwebview_authority_turn",
+                            **_observed_write_evidence(
+                                submit_request_seen=submit_request_seen,
+                                submit_response_seen=submit_response_seen,
+                                submit_response_status=submit_response_status,
+                            ),
                         )
                     if kind == "result":
                         candidate = envelope.get("result")
@@ -471,7 +516,8 @@ class WKWebViewHelperRuntime:
                             continue
                         event_type = event.get("type")
                         if (
-                            event_type == "submit_request_observed"
+                            event_type
+                            in {"submit_request_observed", "submit_response_observed"}
                             and on_transport_event is not None
                         ):
                             try:
@@ -488,6 +534,10 @@ class WKWebViewHelperRuntime:
                                     on_submit_started()
                                 except Exception:
                                     pass
+                        elif event_type == "submit_response_observed":
+                            submit_request_seen = True
+                            submit_response_seen = True
+                            submit_response_status = _optional_status(event.get("status"))
                         if event_type in {
                             "assistant_text_snapshot",
                             "assistant_text_delta",
@@ -570,6 +620,11 @@ class WKWebViewHelperRuntime:
             raise RequestError(
                 "WKWEBVIEW_TURN_BROKER_NO_RESULT",
                 request_stage="wkwebview_authority_turn",
+                **_observed_write_evidence(
+                    submit_request_seen=submit_request_seen,
+                    submit_response_seen=submit_response_seen,
+                    submit_response_status=submit_response_status,
+                ),
             )
         if payload.get("ok") is not True:
             error_message = str(
@@ -772,6 +827,8 @@ class WKWebViewHelperRuntime:
         deadline = time.monotonic() + max(1.0, timeout + 5.0)
         payload: dict[str, Any] | None = None
         submit_request_seen = False
+        submit_response_seen = False
+        submit_response_status: int | None = None
         stdout_lines: queue.Queue[str | None] = queue.Queue()
 
         def read_stdout_lines() -> None:
@@ -806,7 +863,8 @@ class WKWebViewHelperRuntime:
                             continue
                         event_type = event.get("type")
                         if (
-                            event_type == "submit_request_observed"
+                            event_type
+                            in {"submit_request_observed", "submit_response_observed"}
                             and on_transport_event is not None
                         ):
                             try:
@@ -820,6 +878,10 @@ class WKWebViewHelperRuntime:
                                     on_submit_started()
                                 except Exception:
                                     pass
+                        elif event_type == "submit_response_observed":
+                            submit_request_seen = True
+                            submit_response_seen = True
+                            submit_response_status = _optional_status(event.get("status"))
                         if event_type in {
                             "assistant_text_snapshot",
                             "assistant_text_delta",
@@ -1073,6 +1135,11 @@ class WKWebViewHelperRuntime:
             raise RequestError(
                 f"WKWEBVIEW_AUTHORITY_NO_RESULT: {detail[-2000:]}",
                 request_stage="wkwebview_authority_turn",
+                **_observed_write_evidence(
+                    submit_request_seen=submit_request_seen,
+                    submit_response_seen=submit_response_seen,
+                    submit_response_status=submit_response_status,
+                ),
             )
         if payload.get("ok") is not True:
             error_message = str(

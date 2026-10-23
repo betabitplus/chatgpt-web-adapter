@@ -211,6 +211,19 @@ class TemporaryFinalTextCollector:
         ]
         return visible_candidates[-1] if visible_candidates else None
 
+    def full_text(self) -> str:
+        """Every visible assistant message of the turn, in order, as the page shows it.
+
+        A tool-using turn writes text before and between tool calls; the final
+        message alone drops that part of the answer.
+        """
+        return "\n\n".join(
+            self._messages[key].text.strip()
+            for key in self._order
+            if self._messages[key].channel != "commentary"
+            and self._messages[key].text.strip()
+        )
+
 
 class TemporaryProductWriteRuntime:
     """Browser-owned Temporary product runtime with live-lifecycle authority.
@@ -509,7 +522,7 @@ class TemporaryProductWriteRuntime:
         )
         elapsed = max(0.0, time.monotonic() - started)
         response = ChatResponse(
-            text=final_message.text,
+            text=collector.full_text(),
             conversation=ChatConversation(
                 conversation_id=conversation_id,
                 message_id=final_message.message_id,

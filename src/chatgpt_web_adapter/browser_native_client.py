@@ -676,6 +676,59 @@ def _assistant_output_channel(message: dict[str, Any]) -> str | None:
     return None
 
 
+def _canonical_turn_text(payload: Any, final_message_id: str | None) -> str | None:
+    """The whole visible answer of the turn that ends at the final message.
+
+    A tool-using turn writes text before and between tool calls. Every visible
+    assistant text message between the user's message and the final one counts,
+    in order. A message whose text the previous visible message already ends
+    with is a piece mirrored into an aggregate answer and is not repeated.
+    """
+    if not isinstance(payload, dict) or not final_message_id:
+        return None
+    mapping = payload.get("mapping")
+    if not isinstance(mapping, dict):
+        return None
+    node_id = next(
+        (
+            key
+            for key, node in mapping.items()
+            if isinstance(node, dict)
+            and isinstance(node.get("message"), dict)
+            and node["message"].get("id") == final_message_id
+        ),
+        None,
+    )
+    texts: list[str] = []
+    while isinstance(node_id, str) and isinstance(mapping.get(node_id), dict):
+        node = mapping[node_id]
+        message = node.get("message")
+        if isinstance(message, dict):
+            author = message.get("author") if isinstance(message.get("author"), dict) else {}
+            if author.get("role") == "user":
+                break
+            content = message.get("content") if isinstance(message.get("content"), dict) else {}
+            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+            if (
+                author.get("role") == "assistant"
+                and (message.get("recipient") or "all") == "all"
+                and content.get("content_type") == "text"
+                and _assistant_output_channel(message) != "commentary"
+                and metadata.get("is_thinking_preamble_message") is not True
+            ):
+                parts = content.get("parts") if isinstance(content.get("parts"), list) else []
+                text = "".join(part for part in parts if isinstance(part, str)).strip()
+                if text:
+                    texts.append(text)
+        node_id = node.get("parent")
+    kept: list[str] = []
+    for text in reversed(texts):
+        if kept and kept[-1].endswith(text):
+            continue
+        kept.append(text)
+    return "\n\n".join(kept) or None
+
+
 def _clone_stream_message(message: dict[str, Any]) -> dict[str, Any]:
     cloned = dict(message)
     content = message.get("content")
@@ -2465,7 +2518,8 @@ def await_browser_native_final(
 
     total = time.monotonic() - submission.started_monotonic
     response = ChatResponse(
-        text=final_message.text,
+        text=_canonical_turn_text(canonical_payload, final_message.message_id)
+        or final_message.text,
         title=attached.title,
         conversation=result_conversation,
         metrics=ChatMetrics(total=total, backend_status=turn.response_status),

@@ -1419,22 +1419,36 @@
       postStream({ phase: "terminal", message_id: brokerCurrentMessageId || lastBrokerTextMessageId || null });
     }
   };
+  // A patch's `c` names the message it changes; without one it changes the last
+  // named message. Visible text is also mirrored into a streaming parent message,
+  // so only the current message's own text counts.
+  let brokerLastIndex = null;
+  let brokerCurrentIndex = null;
   const processBrokerPayload = (payload) => {
+    if (payload && typeof payload === "object" && typeof payload.c === "number") {
+      brokerLastIndex = payload.c;
+    }
+    if (payload && typeof payload === "object" && payload.v && typeof payload.v === "object"
+      && !Array.isArray(payload.v) && payload.v.message) {
+      brokerCurrentIndex = brokerLastIndex;
+    }
     inspectProtectedTransportData(payload);
     if (!payload || typeof payload !== "object") return;
     const value = payload.v;
     const path = payload.p;
+    const ownText = brokerLastIndex === null || brokerCurrentIndex === null
+      || brokerLastIndex === brokerCurrentIndex;
     if (value && typeof value === "object" && !Array.isArray(value) && value.message) {
       selectBrokerMessage(value.message);
     }
-    if (typeof value === "string" && brokerCurrentRecipient === "all"
+    if (typeof value === "string" && ownText && brokerCurrentRecipient === "all"
       && (path == null || path === "/message/content/parts/0")) {
       brokerCurrentText += value;
       lastBrokerTextMessageId = brokerCurrentMessageId || lastBrokerTextMessageId;
       lastBrokerTextSnapshot = brokerCurrentText;
       emitBrokerText("assistant_text_delta", brokerCurrentMessageId, value);
     } else if (path === "/message/content" && value && typeof value === "object"
-      && brokerCurrentRecipient === "all") {
+      && ownText && brokerCurrentRecipient === "all") {
       applyBrokerText(brokerContentText(value));
     }
     inspectBrokerTerminalPatch(path, value);
@@ -1445,13 +1459,13 @@
         selectBrokerMessage(item.v.message);
       }
       if (item.p === "/message/content/parts/0" && typeof item.v === "string"
-        && brokerCurrentRecipient === "all") {
+        && ownText && brokerCurrentRecipient === "all") {
         brokerCurrentText += item.v;
         lastBrokerTextMessageId = brokerCurrentMessageId || lastBrokerTextMessageId;
         lastBrokerTextSnapshot = brokerCurrentText;
         emitBrokerText("assistant_text_delta", brokerCurrentMessageId, item.v);
       } else if (item.p === "/message/content" && item.v && typeof item.v === "object"
-        && brokerCurrentRecipient === "all") {
+        && ownText && brokerCurrentRecipient === "all") {
         applyBrokerText(brokerContentText(item.v));
       }
       inspectBrokerTerminalPatch(item.p, item.v);

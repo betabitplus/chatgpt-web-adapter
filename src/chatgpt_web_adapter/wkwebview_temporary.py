@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from typing import Any
@@ -148,13 +149,24 @@ class WKTemporaryTurnRuntime:
             invocation.request["minimal_conversation_id"] = conversation_id
             invocation.request["minimal_parent_message_id"] = parent_message_id
         started = time.monotonic()
+        # The gate serializes the heavy submit only. Once the product has
+        # answered the submit, the turn streams on its own and the next turn
+        # may submit, so parallel Temporary turns do not queue behind each other.
+        gate = contextlib.ExitStack()
+
+        def release_gate_after_submit(event: dict[str, Any]) -> None:
+            if isinstance(event, dict) and event.get("type") == "submit_response_observed":
+                gate.close()
+
         try:
-            with self.provider._heavy_submit_gate(total_timeout):
+            with gate:
+                gate.enter_context(self.provider._heavy_submit_gate(total_timeout))
                 phase_timeout = max(1.0, total_timeout - (time.monotonic() - started))
                 payload = self.provider._run_helper_streaming(
                     invocation,
                     timeout=phase_timeout,
                     on_text_event=on_event,
+                    on_transport_event=release_gate_after_submit,
                 )
         except Exception:
             invalidate_fresh_lifecycle()

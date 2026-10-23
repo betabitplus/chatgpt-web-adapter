@@ -169,10 +169,13 @@ class _Provider:
         *,
         timeout: float,
         on_text_event: Any,
+        on_transport_event: Any = None,
         external_completion_check: Any = None,
     ) -> dict[str, Any]:
         del timeout, on_text_event
         self.invocations.append(invocation)
+        if callable(on_transport_event):
+            on_transport_event({"type": "submit_response_observed", "status": 200})
         conversation_id = (
             invocation.request.get("minimal_conversation_id") or "temporary-1"
         )
@@ -350,6 +353,7 @@ def test_wk_temporary_broker_terminal_uses_browser_sse_without_resume_leg() -> N
         *,
         timeout: float,
         on_text_event: Any,
+        on_transport_event: Any = None,
     ) -> dict[str, Any]:
         assert timeout > 0
         provider.invocations.append(invocation)

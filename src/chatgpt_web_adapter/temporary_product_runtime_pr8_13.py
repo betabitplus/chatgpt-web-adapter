@@ -491,6 +491,22 @@ class TemporaryProductWriteRuntime:
             self._lifecycle_token = lifecycle_token
             self._conversation_id = conversation_id
 
+        # Completion requires provider-owned terminal evidence, not just text.
+        terminal_observed = response_payload.get("terminalObserved") is True
+        terminal_source = (
+            response_payload.get("terminalSource")
+            if terminal_observed
+            and isinstance(response_payload.get("terminalSource"), str)
+            and response_payload["terminalSource"].strip()
+            else None
+        )
+        observed_model = (
+            response_payload.get("observedModel")
+            if terminal_observed
+            and isinstance(response_payload.get("observedModel"), str)
+            and response_payload["observedModel"].strip()
+            else None
+        )
         elapsed = max(0.0, time.monotonic() - started)
         response = ChatResponse(
             text=final_message.text,
@@ -507,6 +523,9 @@ class TemporaryProductWriteRuntime:
                 conversation_id=conversation_id,
                 is_continuation=is_continuation,
                 temporary=True,
+                terminal_observed=terminal_observed,
+                terminal_source=terminal_source,
+                observed_model=observed_model,
                 turn_exchange_id=(
                     response_payload.get("turnExchangeId")
                     if isinstance(response_payload.get("turnExchangeId"), str)
@@ -597,7 +616,7 @@ class TemporaryProductWriteRuntime:
             identity=ProductIdentityProvenance(
                 conversation_id=conversation_id,
                 message_id=final_message.message_id,
-                observed_model=None,
+                observed_model=observed_model,
             ),
             transport_metadata=observation.to_dict(),
             conversation_mode=mode_provenance,

@@ -1566,10 +1566,22 @@ class WKLightweightTransport:
                 "WKWEBVIEW_TEMPORARY_STREAM_FINALITY_MISSING",
                 request_stage="wkwebview_temporary_stream",
             )
+        # A visible assistant message is not a completed turn. In particular,
+        # tool-running Temporary chats can publish the final text before the
+        # transport observes end_turn / a terminal status. Never promote mere
+        # text delivery to an authoritative completion signal.
+        finish_reason = state.get("finish_reason")
+        terminal_proven = (
+            state.get("stream_terminal_observed") is True
+            and isinstance(finish_reason, str)
+            and bool(finish_reason.strip())
+        )
         return {
             "ok": True,
             "conversation_id": conversation_id,
             "message_id": message_id.strip(),
+            "stream_finality_proven": terminal_proven,
+            "observed_model": state.get("observed_model"),
             "parent_message_id": (
                 state.get("parent_message_id")
                 if isinstance(state.get("parent_message_id"), str)

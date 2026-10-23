@@ -32,6 +32,7 @@ class _FakeTemporaryProvider:
         self.closed = False
         self.force_gap = False
         self.force_mode_unproven = False
+        self.prove_terminal = False
 
     def status(self):
         return SimpleNamespace(available=True, extension_connected=True)
@@ -112,6 +113,9 @@ class _FakeTemporaryProvider:
             "temporaryLifecycleState": "LIVE",
             "temporaryLiveWriteAuthorityProven": True,
             "temporaryPausedConversationWriteCount": 1,
+            "terminalObserved": self.prove_terminal,
+            "terminalSource": "wkwebview_temporary_stream" if self.prove_terminal else None,
+            "observedModel": "gpt-6-thinking" if self.prove_terminal else None,
             "tabId": 123,
         }
 
@@ -170,6 +174,10 @@ def test_temporary_runtime_returns_page_owned_final_and_private_live_authority()
     assert execution.response.conversation.conversation_id == "temporary-conversation-1"
     assert execution.response.conversation.message_id == "final-1"
     assert execution.response.conversation.finish_reason == "stop"
+    # A text fragment and finish_reason alone are not completion proof.
+    assert execution.response.request.terminal_observed is False
+    assert execution.response.request.terminal_source is None
+    assert execution.response.request.observed_model is None
     assert provider.clear_count == 1
     assert len(provider.lease_ids) == 1
     assert visible_events[0]["channel"] == "commentary"
@@ -212,6 +220,23 @@ def test_temporary_runtime_returns_page_owned_final_and_private_live_authority()
         "token_present": True,
         "token_exported": False,
     }
+
+
+def test_temporary_terminal_proof_is_forwarded_into_chat_diagnostics() -> None:
+    provider = _FakeTemporaryProvider()
+    provider.prove_terminal = True
+    runtime = TemporaryProductWriteRuntime(provider)  # type: ignore[arg-type]
+
+    first = runtime.send_text_observed("first")
+    second = runtime.send_text_observed(
+        "second", conversation=first.response.conversation.conversation_id
+    )
+    for execution in (first, second):
+        assert execution.response.request.terminal_observed is True
+        assert execution.response.request.terminal_source == "wkwebview_temporary_stream"
+        assert execution.response.request.observed_model == "gpt-6-thinking"
+        assert execution.provenance.identity.observed_model == "gpt-6-thinking"
+    assert len(provider.payloads) == 2  # no extra POST/readback
 
 
 def test_same_runtime_continuation_reuses_private_lifecycle_token() -> None:

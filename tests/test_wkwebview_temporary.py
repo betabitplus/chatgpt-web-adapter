@@ -41,6 +41,7 @@ class _TemporaryStreamTransport:
             "parent_message_id": message_id,
             "finish_reason": "stop",
             "turn_exchange_id": f"turn-{self.index}",
+            "stream_finality_proven": True,
             "ws_token_events": 1,
         }
 
@@ -221,9 +222,14 @@ def test_wk_temporary_new_continuation_and_end_are_process_bound(monkeypatch) ->
     )
 
     assert first["conversationId"] == "temporary-1"
+    assert first["terminalObserved"] is True
+    assert first["terminalSource"] == "wkwebview_temporary_stream"
+    assert first["messageId"] == "assistant-1"
     assert first["temporaryModeProven"] is True
     assert first["temporaryContinuationIdentityProven"] is False
     assert second["conversationId"] == "temporary-1"
+    assert second["terminalObserved"] is True
+    assert second["messageId"] == "assistant-2"
     assert second["temporaryContinuationIdentityProven"] is True
     assert provider.invocations[0].request["minimal_temporary"] is True
     assert provider.invocations[0].request["minimal_temporary_lifecycle_id"] == "lifecycle-1"
@@ -253,6 +259,33 @@ def test_wk_temporary_new_continuation_and_end_are_process_bound(monkeypatch) ->
             on_event=events.append,
             browser_authority_lease_id="lease-1",
         )
+
+def test_wk_temporary_text_without_terminal_proof_is_not_confirmed() -> None:
+    provider = _Provider()
+
+    class UnconfirmedTransport(_TemporaryStreamTransport):
+        def stream_temporary_turn(self, **kwargs: Any) -> dict[str, Any]:
+            payload = super().stream_temporary_turn(**kwargs)
+            payload["stream_finality_proven"] = False
+            return payload
+
+    transport = UnconfirmedTransport()
+    provider._lightweight_transport = transport
+    runtime = WKTemporaryTurnRuntime(provider)
+
+    with pytest.raises(RequestError, match="WKWEBVIEW_TEMPORARY_STREAM_FINALITY_MISSING"):
+        runtime.send(
+            "first",
+            conversation_id=None,
+            lifecycle_id="unconfirmed-lifecycle",
+            timeout=30,
+            on_event=lambda _event: None,
+            browser_authority_lease_id="lease-1",
+        )
+    assert len(transport.calls) == 1  # no ambiguous second send
+    assert provider._helper_runtime.leases[0].closed is True
+    assert "unconfirmed-lifecycle" not in runtime._bindings
+
 
 def test_wk_temporary_proxy_can_be_explicitly_disabled(monkeypatch) -> None:
     monkeypatch.setenv("CWA_WK_PROXY_PROTECTED_WRITE", "0")
@@ -350,6 +383,8 @@ def test_wk_temporary_broker_terminal_uses_browser_sse_without_resume_leg() -> N
 
     assert result["conversationId"] == "temporary-direct-1"
     assert result["turnExchangeId"] == "turn-direct"
+    assert result["terminalObserved"] is True
+    assert result["messageId"] == "assistant-direct"
     assert provider._lightweight_transport.calls == []
     assert events == [
         {

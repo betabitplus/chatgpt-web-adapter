@@ -195,7 +195,9 @@ class WKTemporaryTurnRuntime:
             streamed = {
                 "message_id": assistant_message_id.strip(),
                 "turn_exchange_id": payload.get("turn_exchange_id"),
-                "finish_reason": "stop",
+                "finish_reason": payload.get("stream_finish_reason") or "stop",
+                "observed_model": payload.get("stream_model_slug"),
+                "stream_finality_proven": True,
             }
         else:
             try:
@@ -228,6 +230,14 @@ class WKTemporaryTurnRuntime:
             except Exception:
                 invalidate_fresh_lifecycle()
                 raise
+        # Both the broker SSE and the resumed WebSocket path must provide
+        # an explicit terminal proof. A text-bearing stream is insufficient.
+        if streamed.get("stream_finality_proven") is not True:
+            invalidate_fresh_lifecycle()
+            raise RequestError(
+                "WKWEBVIEW_TEMPORARY_STREAM_FINALITY_MISSING",
+                request_stage="wkwebview_temporary_stream",
+            )
         message_id = streamed.get("message_id")
         if not isinstance(message_id, str) or not message_id.strip():
             invalidate_fresh_lifecycle()
@@ -258,6 +268,11 @@ class WKTemporaryTurnRuntime:
             "temporaryPausedConversationWriteCount": 0,
             "turnExchangeId": streamed.get("turn_exchange_id")
             or payload.get("turn_exchange_id"),
+            "messageId": message_id.strip(),
+            "terminalObserved": True,
+            "terminalSource": "wkwebview_temporary_stream",
+            "finishReason": streamed.get("finish_reason"),
+            "observedModel": streamed.get("observed_model"),
             "tabId": None,
         }
 

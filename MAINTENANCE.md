@@ -5,6 +5,10 @@ This checkout is the maintained Betabit fork, used in production by `gptty`.
 - `origin`: `https://github.com/betabitplus/chatgpt-web-adapter.git` — writable fork.
 - `upstream`: `https://github.com/kymuco/chatgpt-web-adapter.git` — the author's repository; fetch only.
 - `main`: the one maintained branch. Work happens here; a short-lived branch only for a large or risky change.
+- Branches cleaned up on 2026-10-24 (all fully in `main`) are listed with their commits in
+  `docs/maintenance/deleted-branches-2026-10-24.txt`; restore one with
+  `git push origin <sha>:refs/heads/<name>`.
+- `.ai-bridge/` (not in git) keeps the working notes of past sessions: why things were done.
 
 Our line is the WKWebView backend: macOS WebKit, no Chrome, lighter than the author's browser
 extension. It is the default on macOS 12+.

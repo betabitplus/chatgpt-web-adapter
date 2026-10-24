@@ -1,8 +1,40 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
+#import <objc/message.h>
+
 #include <fcntl.h>
 #include <math.h>
 #include <unistd.h>
+
+// The helper's pages live in borderless windows parked off screen. WebKit
+// reports such a view as occluded, treats the page as hidden and gives its
+// WebContent process only a background assertion with suppressed timers. A
+// heavy ChatGPT load at background priority stalls for tens of seconds when
+// the Mac is busy, long past the pre-submit watchdog. These pages are the
+// helper's whole job, so they run as visible foreground pages.
+static void SetPrivateBool(id target, NSString *selectorName, BOOL value) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (target == nil || ![target respondsToSelector:selector]) return;
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(target, selector, value);
+}
+
+static void ConfigureForegroundPage(WKWebViewConfiguration *configuration) {
+    SetPrivateBool(configuration.preferences, @"_setPageVisibilityBasedProcessSuppressionEnabled:", NO);
+    SetPrivateBool(configuration.preferences, @"_setHiddenPageDOMTimerThrottlingEnabled:", NO);
+    SetPrivateBool(configuration, @"_setClientNavigationsRunAtForegroundPriority:", YES);
+}
+
+static void KeepPageForeground(WKWebView *webView) {
+    SetPrivateBool(webView, @"_setWindowOcclusionDetectionEnabled:", NO);
+}
+
+static void BeginForegroundActivity(void) {
+    static id activity = nil;
+    if (activity != nil) return;
+    activity = [[NSProcessInfo processInfo]
+        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical
+        reason:@"gptty WKWebView authority drives ChatGPT pages"];
+}
 
 static NSString * const WKResultPrefix = @"WK_RESULT ";
 
@@ -1289,6 +1321,7 @@ static NSString *MinimalSecurityWriteScript(
 @property(nonatomic, assign) NSInteger baselineAssistantCount;
 @property(nonatomic, copy) NSString *baselineAssistantMessageId;
 @property(nonatomic, copy) NSString *baselineAssistantText;
+@property(nonatomic, copy) NSString *realPageStage;
 @end
 @implementation WKTurnBrokerEntry
 @end
@@ -1310,6 +1343,7 @@ static WKWebViewConfiguration *TurnBrokerConfiguration(
 ) {
     WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
     configuration.websiteDataStore = [WKWebsiteDataStore defaultDataStore];
+    ConfigureForegroundPage(configuration);
     [configuration.userContentController addScriptMessageHandler:router name:@"cwaCanonical"];
     [configuration.userContentController addScriptMessageHandler:router name:@"cwaSubmit"];
     [configuration.userContentController addScriptMessageHandler:router name:@"cwaStream"];
@@ -1361,6 +1395,7 @@ static WKTurnBrokerPage *CreateTurnBrokerPage(
     WKWebView *webView = [[WKWebView alloc]
         initWithFrame:NSMakeRect(0, 0, 1000, 700)
         configuration:configuration];
+    KeepPageForeground(webView);
     NSWindow *window = [[NSWindow alloc]
         initWithContentRect:NSMakeRect(-20000, -20000, 1000, 700)
         styleMask:NSWindowStyleMaskBorderless
@@ -1707,6 +1742,17 @@ static WKTurnBrokerEntry *StartTurnBrokerEntry(
 
 }
 
+static void TurnBrokerRealPageStage(WKTurnBrokerEntry *entry, NSString *stage) {
+    if (entry == nil || stage.length == 0 || [entry.realPageStage isEqualToString:stage]) return;
+    entry.realPageStage = stage;
+    PrintEvent(@{
+        @"type": @"real_page_stage",
+        @"request_id": entry.requestId ?: @"",
+        @"stage": stage,
+        @"t_ms": @((NSInteger)(([NSDate timeIntervalSinceReferenceDate] - entry.started) * 1000.0))
+    });
+}
+
 static BOOL PumpRealPageTurnBrokerEntry(
     WKTurnBrokerEntry *entry,
     NSDictionary **outResult
@@ -1714,6 +1760,7 @@ static BOOL PumpRealPageTurnBrokerEntry(
     WKAuthorityDelegate *delegate = entry.delegate;
     WKWebView *webView = entry.webView;
     if (!entry.pageNavigationDelegate.navigationFinished) {
+        TurnBrokerRealPageStage(entry, @"page_loading");
         if ([entry.deadline timeIntervalSinceNow] <= 0) {
             *outResult = TurnBrokerFailure(
                 @"WKWEBVIEW_TEMPORARY_PAGE_LOAD_TIMEOUT",
@@ -1769,6 +1816,7 @@ static BOOL PumpRealPageTurnBrokerEntry(
             EvaluateSync(webView, ReadinessScript(), 1.0, &readinessError)
         );
         if (readinessError != nil || snapshot == nil) {
+            TurnBrokerRealPageStage(entry, @"readiness_unavailable");
             if ([entry.deadline timeIntervalSinceNow] <= 0) {
                 *outResult = TurnBrokerFailure(
                     @"WKWEBVIEW_TEMPORARY_COMPOSER_NOT_READY",
@@ -1790,6 +1838,7 @@ static BOOL PumpRealPageTurnBrokerEntry(
             return YES;
         }
         if (![snapshot[@"composerReady"] boolValue]) {
+            TurnBrokerRealPageStage(entry, @"composer_not_ready");
             entry.composerReadyStablePolls = 0;
             entry.nextComposerReadyPollAt = nil;
             if ([entry.deadline timeIntervalSinceNow] <= 0) {
@@ -1942,6 +1991,7 @@ static BOOL PumpRealPageTurnBrokerEntry(
             }
             entry.realPageFilled = YES;
             entry.nextRealPageFillAttemptAt = nil;
+            TurnBrokerRealPageStage(entry, @"filled");
             return NO;
         }
 
@@ -1949,6 +1999,7 @@ static BOOL PumpRealPageTurnBrokerEntry(
             EvaluateSync(webView, ReadinessScript(), 1.0, nil)
         );
         if (![sendReady[@"send"] boolValue]) {
+            TurnBrokerRealPageStage(entry, @"send_not_ready");
             if (
                 !delegate.submitRequestObserved
                 && [sendReady[@"composerTextLength"] integerValue] == 0
@@ -2046,6 +2097,7 @@ static BOOL PumpRealPageTurnBrokerEntry(
             return YES;
         }
         entry.realPageSent = YES;
+        TurnBrokerRealPageStage(entry, @"send_clicked");
         return NO;
     }
 
@@ -2395,6 +2447,7 @@ static void FinishTurnBrokerEntry(WKTurnBrokerEntry *entry, WKTurnBrokerRouter *
 }
 static int RunTurnBroker(void) {
     [NSApplication sharedApplication];
+    BeginForegroundActivity();
     NSString *shellSource = MinimalSecurityShellSource();
     if (shellSource.length == 0) {
         PrintEvent(@{@"type": @"broker_failed", @"error": @"WKWEBVIEW_MINIMAL_SECURITY_SCRIPT_MISSING"});
@@ -2711,12 +2764,14 @@ int main(int argc, const char *argv[]) {
         }
 
         [NSApplication sharedApplication];
+        BeginForegroundActivity();
         WKAuthorityDelegate *delegate = [WKAuthorityDelegate new];
         if (minimalSecurityShell && minimalConversationId.length > 0) {
             delegate.streamConversationId = minimalConversationId;
         }
         WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
         configuration.websiteDataStore = [WKWebsiteDataStore defaultDataStore];
+        ConfigureForegroundPage(configuration);
         [configuration.userContentController addScriptMessageHandler:delegate name:@"cwaCanonical"];
         if (observeSubmit) {
             [configuration.userContentController addScriptMessageHandler:delegate name:@"cwaSubmit"];
@@ -2734,6 +2789,7 @@ int main(int argc, const char *argv[]) {
         }
         WKWebView *webView = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 700)
                                                configuration:configuration];
+        KeepPageForeground(webView);
         NSRect rect = visible ? NSMakeRect(100, 100, 1000, 700) : NSMakeRect(-20000, -20000, 1000, 700);
         NSWindowStyleMask style = visible ? (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
                                           : NSWindowStyleMaskBorderless;

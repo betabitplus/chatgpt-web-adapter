@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import fcntl
+import hashlib
 import json
 import os
 import queue
@@ -110,13 +111,30 @@ class WKSystemTurnBrokerClient:
         self.runtime_dir = (
             Path(runtime_dir)
             if runtime_dir is not None
-            else Path("/tmp") / f"cwa-wk-turn-broker-{os.getuid()}"
+            else Path("/tmp") / f"cwa-wk-turn-broker-{os.getuid()}{self._build_suffix(self.helper)}"
         )
         self.idle_timeout = max(0.5, float(idle_timeout))
         self.socket_path = self.runtime_dir / "broker.sock"
         if len(os.fsencode(str(self.socket_path))) >= 104:
             raise ValueError("runtime_dir produces an overlong Unix socket path")
         self.launch_lock_path = self.runtime_dir / "launch.lock"
+
+    @staticmethod
+    def _build_suffix(helper: Path) -> str:
+        """Give every helper build its own broker.
+
+        A running broker keeps the helper image it started with. Keyed by the
+        build, a rebuilt helper starts a fresh broker at once instead of
+        reaching the old one for as long as its clients keep it busy; the old
+        broker then idles out on its own. The heavy submit lock is global, so
+        the two still submit one at a time.
+        """
+        try:
+            stat = helper.stat()
+        except OSError:
+            return ""
+        stamp = f"{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}".encode("ascii")
+        return "-" + hashlib.sha256(stamp).hexdigest()[:10]
 
     def _connect_once(self, timeout: float) -> socket.socket:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

@@ -752,16 +752,40 @@ static NSString *ModeControlPointScript(void) {
             resolver];
 }
 
-static NSString *EffortSliderScript(BOOL focus) {
+// The product's power slider announces its level as "High, 2 of 2." in a
+// status region (or aria-valuetext). Levels are read by name, never by index:
+// the number of levels changes with the account's plan and usage limits.
+static NSString *EffortLevelScript(BOOL focus) {
     return [NSString stringWithFormat:
             @"(()=>{"
               "const doFocus=%@,visible=(e)=>{if(!(e instanceof Element))return false;const r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;const s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0';};"
+              "const sliders=[...document.querySelectorAll('[role=slider],input[type=range]')].filter(visible);"
+              "if(sliders.length!==1)return JSON.stringify({ok:false,reason:sliders.length?'effort_slider_ambiguous':'effort_slider_missing',candidateCount:sliders.length});"
+              "const e=sliders[0];if(doFocus){try{e.focus({preventScroll:true});}catch(_){try{e.focus();}catch(__){}}}"
               "const num=(v)=>{if(v===null||v===undefined||v==='')return null;const n=Number(v);return Number.isFinite(n)?n:null;};"
-              "const items=[];for(const e of document.querySelectorAll('[role=slider],input[type=range]')){if(!visible(e))continue;const min=num(e.getAttribute('aria-valuemin'))??num(e.min),max=num(e.getAttribute('aria-valuemax'))??num(e.max),now=num(e.getAttribute('aria-valuenow'))??num(e.value);if(!(Number.isInteger(min)&&Number.isInteger(max)&&Number.isInteger(now)&&min===0&&max===2&&now>=0&&now<=2))continue;items.push({e,min,max,now});}"
-              "if(items.length!==1)return JSON.stringify({ok:false,reason:items.length?'effort_slider_ambiguous':'effort_slider_missing',candidateCount:items.length});const item=items[0];if(doFocus){try{item.e.focus({preventScroll:true});}catch(_){try{item.e.focus();}catch(__){}}}"
-              "return JSON.stringify({ok:true,candidateCount:1,min:item.min,max:item.max,now:item.now,focused:document.activeElement===item.e});"
+              "const max=num(e.getAttribute('aria-valuemax'))??num(e.max),now=num(e.getAttribute('aria-valuenow'))??num(e.value);"
+              "const scope=e.closest('[role=menu],[role=dialog],[data-radix-popper-content-wrapper]')||document;"
+              "let label=null;const parse=(t)=>{const m=String(t||'').trim().match(/^(.+?),\\s*\\d+\\s+of\\s+\\d+/i);return m?m[1].trim():null;};"
+              "for(const st of scope.querySelectorAll('[role=status]')){label=parse(st.textContent);if(label)break;}"
+              "if(!label)label=parse(e.getAttribute('aria-valuetext'))||(e.getAttribute('aria-valuetext')||'').trim()||null;"
+              "return JSON.stringify({ok:true,label,now,max,focused:document.activeElement===e});"
             "})()",
             focus ? @"true" : @"false"];
+}
+
+static NSString *ModeMenuChoiceScript(NSString *wanted) {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@[wanted ?: @""] options:0 error:nil];
+    NSString *literal = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return [NSString stringWithFormat:
+            @"(()=>{"
+              "const wanted=%@[0].trim().toLowerCase();"
+              "const visible=(e)=>{const r=e.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;const s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden';};"
+              "const items=[...document.querySelectorAll('[role=menuitemradio],[role=menuitem],[role=option]')].filter(visible).filter(e=>String(e.innerText||'').split('\\n')[0].trim().toLowerCase()===wanted);"
+              "if(items.length!==1)return JSON.stringify({ok:false,reason:items.length?'mode_choice_ambiguous':'mode_choice_missing'});"
+              "const e=items[0];if(e.getAttribute('aria-disabled')==='true'||e.hasAttribute('data-disabled'))return JSON.stringify({ok:false,reason:'mode_choice_locked'});"
+              "e.click();return JSON.stringify({ok:true});"
+            "})()",
+            literal];
 }
 
 static NSDictionary *NativeClickModeControl(WKWebView *webView) {
@@ -821,14 +845,23 @@ static BOOL NativeKeyPress(WKWebView *webView, unsigned short keyCode, unichar c
 
 static NSDictionary *EnsureRequestedMode(WKWebView *webView, NSString *requested) {
     NSString *mode = [requested uppercaseString];
-    NSInteger target = NSNotFound;
-    if ([mode isEqualToString:@"INSTANT"]) target = 0;
-    else if ([mode isEqualToString:@"MEDIUM"]) target = 1;
-    else if ([mode isEqualToString:@"HIGH"]) target = 2;
+    NSString *wanted = nil;
+    if ([mode isEqualToString:@"INSTANT"]) wanted = @"Instant";
+    else if ([mode isEqualToString:@"MEDIUM"]) wanted = @"Medium";
+    else if ([mode isEqualToString:@"HIGH"]) wanted = @"High";
     else if (mode.length == 0) return @{@"ok": @YES, @"changed": @NO};
     else return @{@"ok": @NO, @"reason": @"unsupported_mode"};
 
-    NSDictionary *before = ParseJSONResult(EvaluateSync(webView, ReadinessScript(), 1.0, nil));
+    // The selected mode's label renders after the composer becomes ready;
+    // deciding before it appears would open the menu for nothing.
+    NSDictionary *before = nil;
+    NSDate *labelDeadline = [NSDate dateWithTimeIntervalSinceNow:3.0];
+    while (YES) {
+        before = ParseJSONResult(EvaluateSync(webView, ReadinessScript(), 1.0, nil));
+        if ([before[@"selectedMode"] isKindOfClass:[NSString class]]) break;
+        if ([labelDeadline timeIntervalSinceNow] <= 0) break;
+        RunLoopFor(0.2);
+    }
     if (before != nil && ModeMatches(before, mode)) {
         return @{@"ok": @YES, @"changed": @NO, @"mode": mode};
     }
@@ -842,25 +875,45 @@ static NSDictionary *EnsureRequestedMode(WKWebView *webView, NSString *requested
     if (![clicked[@"ok"] boolValue]) return clicked ?: @{@"ok": @NO, @"reason": @"mode_control_not_proven"};
 
     NSDate *sliderDeadline = [NSDate dateWithTimeIntervalSinceNow:3.0];
-    NSDictionary *slider = nil;
+    NSDictionary *level = nil;
     while ([sliderDeadline timeIntervalSinceNow] > 0) {
         RunLoopFor(0.1);
-        slider = ParseJSONResult(EvaluateSync(webView, EffortSliderScript(YES), 1.0, nil));
-        if ([slider[@"ok"] boolValue] && [slider[@"focused"] boolValue]) break;
-    }
-    if (![slider[@"ok"] boolValue] || ![slider[@"focused"] boolValue]) {
-        return @{@"ok": @NO, @"reason": [slider[@"reason"] description] ?: @"effort_slider_not_proven"};
+        level = ParseJSONResult(EvaluateSync(webView, EffortLevelScript(YES), 1.0, nil));
+        if ([level[@"ok"] boolValue] && [level[@"focused"] boolValue]) break;
     }
 
-    if (!NativeKeyPress(webView, 115, NSHomeFunctionKey)) {
-        return @{@"ok": @NO, @"reason": @"effort_slider_home_failed"};
-    }
-    RunLoopFor(0.1);
-    for (NSInteger index = 0; index < target; index += 1) {
-        if (!NativeKeyPress(webView, 124, NSRightArrowFunctionKey)) {
-            return @{@"ok": @NO, @"reason": @"effort_slider_right_failed"};
+    BOOL onSlider = NO;
+    NSMutableArray<NSString *> *seen = [NSMutableArray array];
+    if ([level[@"ok"] boolValue] && [level[@"focused"] boolValue]) {
+        NSInteger maxLevel = [level[@"max"] respondsToSelector:@selector(integerValue)] ? [level[@"max"] integerValue] : 0;
+        if (!NativeKeyPress(webView, 115, NSHomeFunctionKey)) {
+            return @{@"ok": @NO, @"reason": @"effort_slider_home_failed"};
         }
-        RunLoopFor(0.1);
+        for (NSInteger index = 0; index <= MAX(0, MIN(maxLevel, 8)); index += 1) {
+            RunLoopFor(0.15);
+            level = ParseJSONResult(EvaluateSync(webView, EffortLevelScript(NO), 1.0, nil));
+            NSString *label = [level[@"label"] isKindOfClass:[NSString class]] ? level[@"label"] : @"";
+            [seen addObject:label];
+            if ([label caseInsensitiveCompare:wanted] == NSOrderedSame) {
+                onSlider = YES;
+                break;
+            }
+            if (index < maxLevel && !NativeKeyPress(webView, 124, NSRightArrowFunctionKey)) {
+                return @{@"ok": @NO, @"reason": @"effort_slider_right_failed"};
+            }
+        }
+    }
+    if (!onSlider) {
+        NSDictionary *choice = ParseJSONResult(EvaluateSync(webView, ModeMenuChoiceScript(wanted), 1.0, nil));
+        if (![choice[@"ok"] boolValue]) {
+            NativeKeyPress(webView, 53, 0x1b);
+            return @{
+                @"ok": @NO,
+                @"reason": [NSString stringWithFormat:@"%@ slider_levels=%@",
+                    [choice[@"reason"] description] ?: @"mode_choice_failed",
+                    [seen componentsJoinedByString:@"|"]]
+            };
+        }
     }
     NativeKeyPress(webView, 53, 0x1b);
 

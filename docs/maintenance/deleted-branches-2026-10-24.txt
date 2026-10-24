@@ -101,3 +101,26 @@ ecee790c feature/wkwebview-authority-e2e
 40016f1a fix/wk-resume-segment-continuation
 82b4e84c integration/upstream-wkwebview-0.3.1
 64e52791 prerelease/wkwebview-main-hardening
+
+# second cleanup 2026-10-24: copies of the author's branches (identical at upstream kymuco/chatgpt-web-adapter; get them with git fetch upstream)
+080b6cdb noop
+cf541440 pr1.2-attached-conversation
+733a95ed pr10-0-connector-required-action-lifecycle
+6e9b21e8 pr11-4-first-class-submission-lifecycle
+be5f357d pr11-5-browser-ui-liveness-observation
+1f9e2621 pr11-6-session-auth-transport-repair
+c15f0700 pr11-6a-strict-chatgpt-cookie-domain-validation
+f5e7622b pr12-1-engineering-quality-baseline
+8e077c8c pr12-2-first-class-product-runtime-surface
+d1e07562 pr6-1-expanded-metrics
+af295eb2 pr7-11a-existing-text-send-conduit
+24984d29 pr7-11b-two-phase-sentinel-contract-probe
+d7ba064e pr9-2-rich-input-multimodal
+c039d54e pr9-3-structured-product-observations
+4d48db5f pr9-4-cwa-0-3-stabilization-release
+9e096405 research/pr8.2.4-minimal-browser-owned-write-runtime
+0faa127e scratch/t13-capability-review
+8b05c593 tmp-ignore
+8b05c593 tmp-ignore2
+# our branch turned into a tag, then deleted
+6c283e40 pr/wkwebview-0.3.1-upstream -> tag archive/upstream-pr-89 (withdrawn PR #89 to the author)

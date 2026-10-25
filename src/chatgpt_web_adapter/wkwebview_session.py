@@ -35,18 +35,26 @@ def _helper_binary(state_dir: str | Path | None) -> Path:
     return WKWebViewTurnProvider(state_dir=state_dir)._ensure_helper()
 
 
-def _run_helper(args: list[str], timeout: float, state_dir: str | Path | None) -> dict[str, Any]:
+def _run_helper(
+    args: list[str], timeout: float, state_dir: str | Path | None
+) -> dict[str, Any]:
     helper = _helper_binary(state_dir)
     try:
         completed = subprocess.run(
-            [str(helper), *args], capture_output=True, text=True, timeout=timeout, check=False
+            [str(helper), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
     except subprocess.TimeoutExpired as error:
         raise AuthError("The ChatGPT browser session did not answer in time") from error
     for line in reversed(completed.stdout.splitlines()):
         if line.startswith(_RESULT_PREFIX):
-            return json.loads(line[len(_RESULT_PREFIX):])
-    raise AuthError(f"The ChatGPT browser session gave no result: {(completed.stderr or '').strip()[-500:]}")
+            return json.loads(line[len(_RESULT_PREFIX) :])
+    raise AuthError(
+        f"The ChatGPT browser session gave no result: {(completed.stderr or '').strip()[-500:]}"
+    )
 
 
 def _account(session: dict[str, Any]) -> str | None:
@@ -54,17 +62,31 @@ def _account(session: dict[str, Any]) -> str | None:
     return user.get("email") if isinstance(user, dict) else None
 
 
-def _persist(result: dict[str, Any], auth_file: str | Path, credential_store: str | None) -> str:
+def _persist(
+    result: dict[str, Any], auth_file: str | Path, credential_store: str | None
+) -> str:
     if not result.get("ok"):
         if result.get("error") == "WKWEBVIEW_AUTHORITY_LOGIN_REQUIRED":
-            raise AuthError("The ChatGPT browser is not signed in: run `gptty auth sign-in`")
-        raise AuthError(f"Reading the ChatGPT browser session failed: {result.get('error')}")
+            raise AuthError(
+                "The ChatGPT browser is not signed in: run `gptty auth sign-in`"
+            )
+        detail = (
+            f" ({json.dumps(result['detail'])[:300]})" if result.get("detail") else ""
+        )
+        raise AuthError(
+            f"Reading the ChatGPT browser session failed: {result.get('error')}{detail}"
+        )
     session = result["session"]
     records = serialize_browser_cookies(
         [
             SimpleNamespace(
-                name=c["name"], value=c["value"], domain=c["domain"], path=c.get("path") or "/",
-                secure=bool(c.get("secure")), http_only=bool(c.get("httpOnly")), expires=c.get("expires"),
+                name=c["name"],
+                value=c["value"],
+                domain=c["domain"],
+                path=c.get("path") or "/",
+                secure=bool(c.get("secure")),
+                http_only=bool(c.get("httpOnly")),
+                expires=c.get("expires"),
             )
             for c in result.get("cookies") or []
         ]
@@ -73,7 +95,11 @@ def _persist(result: dict[str, Any], auth_file: str | Path, credential_store: st
     if any(name.startswith("__Secure-next-auth.session-token.") for name in cookies):
         # A split session cookie wins over a stale whole one, as in the browser.
         cookies.pop("__Secure-next-auth.session-token", None)
-    headers = {"accept": "*/*", "accept-language": "en-US,en;q=0.8", "referer": CHAT_URL}
+    headers = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.8",
+        "referer": CHAT_URL,
+    }
     if result.get("user_agent"):
         headers["user-agent"] = result["user_agent"]
     auth = AuthData(
@@ -108,7 +134,9 @@ def sync_auth_from_browser(
         with _synced_lock:
             if key in _synced:
                 return None
-    account = _persist(_run_helper(["--session-export"], 90.0, state_dir), auth_file, credential_store)
+    account = _persist(
+        _run_helper(["--session-export"], 90.0, state_dir), auth_file, credential_store
+    )
     with _synced_lock:
         _synced.add(key)
     return account
@@ -125,7 +153,9 @@ def sign_in_to_browser(
 
     Returns the signed-in account."""
 
-    result = _run_helper(["--sign-in", "--timeout", str(int(timeout))], timeout + 60.0, state_dir)
+    result = _run_helper(
+        ["--sign-in", "--timeout", str(int(timeout))], timeout + 60.0, state_dir
+    )
     return _persist(result, auth_file, credential_store)
 
 

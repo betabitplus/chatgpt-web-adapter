@@ -2733,8 +2733,18 @@ static NSDictionary *SessionPayload(WKWebView *webView) {
     NSString *body = @"try{const r=await fetch('/api/auth/session',{credentials:'include',cache:'no-store'});"
                      "if(!r.ok)return JSON.stringify({status:r.status});return await r.text();}catch(e){return JSON.stringify({error:String(e)});}";
     NSDictionary *session = ParseJSONResult(CallAsyncSync(webView, body, 15.0));
+    return [session isKindOfClass:[NSDictionary class]] ? session : nil;
+}
+
+static BOOL SessionSignedIn(NSDictionary *session) {
     NSString *token = session[@"accessToken"];
-    return ([token isKindOfClass:[NSString class]] && token.length > 0) ? session : nil;
+    return [token isKindOfClass:[NSString class]] && token.length > 0;
+}
+
+// ChatGPT answers a signed-out browser with an empty session object; a failed or
+// unanswered fetch says nothing about the sign-in.
+static BOOL SessionSignedOut(NSDictionary *session) {
+    return session != nil && !SessionSignedIn(session) && session[@"status"] == nil && session[@"error"] == nil;
 }
 
 static NSArray *ChatGPTCookies(WKWebView *webView) {
@@ -2792,11 +2802,15 @@ static int RunSessionMode(NSArray<NSString *> *args) {
         RunLoopFor(1.0);
         if (webView.isLoading) continue;
         session = SessionPayload(webView);
-        if (session) break;
+        if (SessionSignedIn(session) || SessionSignedOut(session)) break;
     }
-    if (!session) {
-        PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_AUTHORITY_LOGIN_REQUIRED"});
-        return 60;
+    if (!SessionSignedIn(session)) {
+        if (SessionSignedOut(session)) {
+            PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_AUTHORITY_LOGIN_REQUIRED"});
+            return 60;
+        }
+        PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_SESSION_UNAVAILABLE",@"detail":session ?: @{}});
+        return 61;
     }
     NSString *userAgent = EvaluateSync(webView, @"navigator.userAgent", 5.0, nil);
     PrintResult(@{

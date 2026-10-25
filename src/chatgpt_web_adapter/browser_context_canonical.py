@@ -20,6 +20,7 @@ from .browser_native_provider import BrowserNativeTurnProvider
 from .client import ChatGPTWebClient
 from .exceptions import RequestError
 from .messages import get_messages
+from .required_action import get_required_action as _get_required_action
 from .status import get_status
 from .types import (
     AttachedConversation,
@@ -513,6 +514,8 @@ class BrowserContextCanonicalClient:
     ) -> list[ChatMessage]:
         return get_messages(self, conversation, **kwargs)
 
+    get_required_action = _get_required_action
+
     def get_conversation_payload(
         self,
         conversation: ConversationRef | ChatConversation | dict[str, Any] | str,
@@ -528,7 +531,11 @@ class BrowserContextCanonicalClient:
         return attach_conversation(self, conversation)
 
     def list_recent_conversations(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 100
+        ):
             raise ValueError("limit must be an int between 1 and 100")
         conversations: dict[str, dict[str, Any]] = {}
         for starred in (False, True):

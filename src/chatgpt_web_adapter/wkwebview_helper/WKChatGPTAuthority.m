@@ -2706,12 +2706,116 @@ static BOOL ModeMatches(NSDictionary *snapshot, NSString *requested) {
     return wanted != nil && selected != nil && [selected caseInsensitiveCompare:wanted] == NSOrderedSame;
 }
 
+// ---- The browser's own ChatGPT sign-in: the one place it lives -------------------------------
+// --session-export prints the signed-in session (token and cookies) of this helper's WebKit store.
+// --sign-in shows chatgpt.com in a window: the person signs in, or signs out and into another account,
+// and closes the window; then the session is printed as with --session-export.
+
+static id CallAsyncSync(WKWebView *webView, NSString *body, NSTimeInterval timeout) {
+    __block BOOL done = NO;
+    __block id result = nil;
+    [webView callAsyncJavaScript:body arguments:@{} inFrame:nil inContentWorld:WKContentWorld.pageWorld
+               completionHandler:^(id value, NSError *error) {
+        result = error ? nil : value;
+        done = YES;
+    }];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (!done && [deadline timeIntervalSinceNow] > 0) RunLoopFor(0.05);
+    return result;
+}
+
+static BOOL IsChatGPTDomain(NSString *domain) {
+    NSString *d = [domain lowercaseString];
+    return [d hasSuffix:@"chatgpt.com"] || [d hasSuffix:@"openai.com"];
+}
+
+static NSDictionary *SessionPayload(WKWebView *webView) {
+    NSString *body = @"try{const r=await fetch('/api/auth/session',{credentials:'include',cache:'no-store'});"
+                     "if(!r.ok)return JSON.stringify({status:r.status});return await r.text();}catch(e){return JSON.stringify({error:String(e)});}";
+    NSDictionary *session = ParseJSONResult(CallAsyncSync(webView, body, 15.0));
+    NSString *token = session[@"accessToken"];
+    return ([token isKindOfClass:[NSString class]] && token.length > 0) ? session : nil;
+}
+
+static NSArray *ChatGPTCookies(WKWebView *webView) {
+    __block BOOL done = NO;
+    __block NSArray<NSHTTPCookie *> *all = @[];
+    [webView.configuration.websiteDataStore.httpCookieStore getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
+        all = cookies ?: @[];
+        done = YES;
+    }];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:10];
+    while (!done && [deadline timeIntervalSinceNow] > 0) RunLoopFor(0.05);
+    NSMutableArray *records = [NSMutableArray array];
+    for (NSHTTPCookie *cookie in all) {
+        if (!IsChatGPTDomain(cookie.domain)) continue;
+        [records addObject:@{
+            @"name":cookie.name ?: @"", @"value":cookie.value ?: @"", @"domain":cookie.domain ?: @"",
+            @"path":cookie.path ?: @"/", @"secure":@(cookie.isSecure), @"httpOnly":@(cookie.isHTTPOnly),
+            @"expires":cookie.expiresDate ? @([cookie.expiresDate timeIntervalSince1970]) : [NSNull null]
+        }];
+    }
+    return records;
+}
+
+static int RunSessionMode(NSArray<NSString *> *args) {
+    BOOL signIn = HasArg(args, @"--sign-in");
+    NSTimeInterval timeout = [ArgValue(args, @"--timeout", signIn ? @"900" : @"45") doubleValue];
+    [NSApplication sharedApplication];
+    BeginForegroundActivity();
+    WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
+    configuration.websiteDataStore = [WKWebsiteDataStore defaultDataStore];
+    ConfigureForegroundPage(configuration);
+    WKWebView *webView = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 760) configuration:configuration];
+    NSRect rect = signIn ? NSMakeRect(120, 120, 1000, 760) : NSMakeRect(-20000, -20000, 1000, 760);
+    NSWindowStyleMask style = signIn ? (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
+                                     : NSWindowStyleMaskBorderless;
+    NSWindow *window = [[NSWindow alloc] initWithContentRect:rect styleMask:style backing:NSBackingStoreBuffered defer:NO];
+    window.title = @"ChatGPT sign-in for gptty";
+    window.contentView = webView;
+    window.releasedWhenClosed = NO;
+    [window orderFront:nil];
+    if (signIn) {
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        [NSApp activateIgnoringOtherApps:YES];
+        [window makeKeyAndOrderFront:nil];
+    }
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://chatgpt.com/"]]];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    NSDictionary *session = nil;
+    if (signIn) {
+        while (window.isVisible && [deadline timeIntervalSinceNow] > 0) RunLoopFor(0.5);
+        [window orderOut:nil];
+        session = SessionPayload(webView);
+    }
+    while (!signIn && [deadline timeIntervalSinceNow] > 0) {
+        RunLoopFor(1.0);
+        if (webView.isLoading) continue;
+        session = SessionPayload(webView);
+        if (session) break;
+    }
+    if (!session) {
+        PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_AUTHORITY_LOGIN_REQUIRED"});
+        return 60;
+    }
+    NSString *userAgent = EvaluateSync(webView, @"navigator.userAgent", 5.0, nil);
+    PrintResult(@{
+        @"ok":@YES,
+        @"session":session,
+        @"cookies":ChatGPTCookies(webView),
+        @"user_agent":[userAgent isKindOfClass:[NSString class]] ? userAgent : @"",
+        @"bundle_id":@"local.gptty.webkit-authority"
+    });
+    return 0;
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         (void)argc;
         (void)argv;
         NSArray<NSString *> *args = [[NSProcessInfo processInfo] arguments];
         if (HasArg(args, @"--turn-broker")) return RunTurnBroker();
+        if (HasArg(args, @"--session-export") || HasArg(args, @"--sign-in")) return RunSessionMode(args);
 
         BOOL requestFromStdin = HasArg(args, @"--request-stdin");
         NSDictionary *request = requestFromStdin ? ReadRequestEnvelope() : @{};

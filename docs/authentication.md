@@ -3,6 +3,23 @@
 `chatgpt-web-adapter` uses an existing ChatGPT web account session. It does not
 use an OpenAI API key and does not implement an alternative login protocol.
 
+## macOS: the WKWebView browser is the one sign-in
+
+With the WKWebView backend the helper's own WebKit store (bundle id
+`local.gptty.webkit-authority`) holds the ChatGPT web session that every protected
+write already runs in. `wkwebview_session` makes it the single source of reusable auth:
+
+- `sync_auth_from_browser(auth_file)` reads the store's session (`/api/auth/session`
+  and its chatgpt.com cookies, HttpOnly ones included) through the helper's
+  `--session-export` mode and persists it as `auth_file`; gptty does this once per
+  process before a WKWebView chat, so the HTTP parts of a turn (stream reads, final
+  reads, uploads) always use the browser's account.
+- `sign_in_to_browser(auth_file)` shows chatgpt.com in the helper's window
+  (`--sign-in`): the person signs in, or signs out and into another account, closes
+  the window, and the session is persisted the same way.
+
+The Chromium login below remains for systems without the WKWebView backend.
+
 ## Install Auth Extras
 
 Install the browser extra required by the legacy interactive login flow, and add the secret-store extra on desktop systems where reusable credentials should live in the OS credential store:

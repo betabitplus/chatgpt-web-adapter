@@ -21,7 +21,7 @@ from .browser_native_client import (
     _make_passive_terminal_stop_check,
 )
 from .client import DEFAULT_TIMEOUT_SECONDS, ChatGPTWebClient
-from .exceptions import RequestError
+from .exceptions import AuthError, RequestError
 from .messages import _current_branch_nodes, get_messages
 from .product_runtime_observation_gate import gate_product_runtime_send_text_observed
 from .product_submission import ProductSubmissionAck
@@ -1070,6 +1070,29 @@ class ChatGPTProductRuntime(_core.ChatGPTProductRuntime):
         return super().governance()
 
 
+def _is_wkwebview_provider(provider: Any) -> bool:
+    from .wkwebview_provider import WKWebViewTurnProvider
+
+    return isinstance(provider, WKWebViewTurnProvider)
+
+
+def _sync_auth_from_browser(auth_file: str | Path) -> None:
+    """The WKWebView browser holds the one sign-in: copy it in once per process.
+
+    Signed out there, this stops with a hint to sign in; if the browser cannot be read
+    for another reason, the stored copy is used."""
+    import sys
+
+    from .wkwebview_session import sync_auth_from_browser
+
+    try:
+        sync_auth_from_browser(auth_file, once_per_process=True)
+    except AuthError as error:
+        if "not signed in" in str(error):
+            raise
+        print(f"chatgpt-web-adapter: using the stored ChatGPT sign-in: {error}", file=sys.stderr)
+
+
 def assemble_product_runtime(
     *,
     transport: str = DEFAULT_PRODUCT_TRANSPORT,
@@ -1119,6 +1142,8 @@ def assemble_product_runtime(
         ):
             browser_authority_policy = "TURN_SCOPED"
 
+    if client is None and auto_refresh_auth and _is_wkwebview_provider(provider):
+        _sync_auth_from_browser(auth_file)
     if client is None:
         client = ChatGPTWebClient(
             auth_file=auth_file,

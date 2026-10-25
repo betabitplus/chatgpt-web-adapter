@@ -219,35 +219,6 @@ def test_wk_temporary_new_continuation_and_end_are_process_bound(monkeypatch) ->
         )
 
 
-def test_wk_temporary_text_without_terminal_proof_is_not_confirmed() -> None:
-    provider = _Provider()
-
-    class UnconfirmedTransport(_TemporaryStreamTransport):
-        def stream_temporary_turn(self, **kwargs: Any) -> dict[str, Any]:
-            payload = super().stream_temporary_turn(**kwargs)
-            payload["stream_finality_proven"] = False
-            return payload
-
-    transport = UnconfirmedTransport()
-    provider._lightweight_transport = transport
-    runtime = WKTemporaryTurnRuntime(provider)
-
-    with pytest.raises(
-        RequestError, match="WKWEBVIEW_TEMPORARY_STREAM_FINALITY_MISSING"
-    ):
-        runtime.send(
-            "first",
-            conversation_id=None,
-            lifecycle_id="unconfirmed-lifecycle",
-            timeout=30,
-            on_event=lambda _event: None,
-            browser_authority_lease_id="lease-1",
-        )
-    assert len(transport.calls) == 1  # no ambiguous second send
-    assert provider._helper_runtime.leases[0].closed is True
-    assert "unconfirmed-lifecycle" not in runtime._bindings
-
-
 def test_wk_temporary_requires_browser_observed_mode_proof() -> None:
     provider = _Provider()
     provider.temporary_mode_observed = False

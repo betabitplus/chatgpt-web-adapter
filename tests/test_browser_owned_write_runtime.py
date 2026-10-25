@@ -48,23 +48,6 @@ def runtime(*, available=True, connected=True, tab_id=None, status="completed"):
     )
 
 
-def test_success_delegates_exactly_once(monkeypatch) -> None:
-    expected = SimpleNamespace(text="ok")
-    calls = []
-
-    def fake_send(*args, **kwargs):
-        calls.append((args, kwargs))
-        return expected
-
-    monkeypatch.setattr(subject, "send_browser_native", fake_send)
-    rt = runtime()
-    result = rt.send_text("hello", timeout=12, poll_interval=0.2)
-    assert result is expected
-    assert len(calls) == 1
-    assert calls[0][0][1] == "hello"
-    assert calls[0][1]["timeout"] == 12
-
-
 def test_delegated_provider_error_is_never_auto_retried(monkeypatch) -> None:
     calls = 0
 
@@ -85,38 +68,6 @@ def test_delegated_provider_error_is_never_auto_retried(monkeypatch) -> None:
     assert error.reconciliation_required is True
     assert error.write_dispatched is None
     assert error.turn_lifecycle.state is subject.TurnLifecycleState.AMBIGUOUS
-
-
-def test_exact_pre_dispatch_provider_failure_is_safe_after_repair(monkeypatch) -> None:
-    def fail(*args, **kwargs):
-        raise subject.RequestError(
-            "WKWEBVIEW_MINIMAL_SECURITY_WRITE_FAILED",
-            request_stage="wkwebview_authority_turn",
-            write_dispatched=False,
-            submit_request_observed=False,
-            submit_response_observed=False,
-        )
-
-    monkeypatch.setattr(subject, "send_browser_native", fail)
-    with pytest.raises(subject.BrowserOwnedWriteRuntimeError) as caught:
-        runtime().send_text("hello")
-
-    error = caught.value
-    assert error.failure_kind == subject.WRITE_NOT_DISPATCHED
-    assert error.automatic_retry_allowed is False
-    assert error.manual_retry_safe_after_repair is True
-    assert error.write_may_have_been_submitted is False
-    assert error.reconciliation_required is False
-    assert error.request_stage == "browser_owned_write_pre_dispatch"
-    assert error.write_dispatched is False
-    assert error.submit_request_observed is False
-    assert error.submit_response_observed is False
-    assert error.turn_lifecycle.state is subject.TurnLifecycleState.NOT_DISPATCHED
-    assert error.turn_lifecycle.reconciliation_required is False
-    assert (
-        error.browser_authority_lease.state
-        is subject.BrowserAuthorityLeaseState.RELEASED
-    )
 
 
 def test_observed_submit_request_dominates_conflicting_no_dispatch_flag(

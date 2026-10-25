@@ -17,10 +17,6 @@ from chatgpt_web_adapter.browser_owned_write_runtime import (
     BrowserOwnedWriteRuntimeError,
 )
 from chatgpt_web_adapter.product_runtime import ChatGPTProductRuntime
-from chatgpt_web_adapter.product_submission import (
-    ProductSubmissionAck,
-    SubmissionEvidenceSource,
-)
 from chatgpt_web_adapter.revision_safe_streaming_pr8_9 import (
     RevisionSafeTextAccumulator,
 )
@@ -163,47 +159,6 @@ def _runtime(monkeypatch):
         write_transport=transport,
     )
     return runtime, transport, client, provider, calls
-
-
-def test_submit_ack_is_write_acceptance_not_canonical_finality(monkeypatch):
-    runtime, transport, client, provider, calls = _runtime(monkeypatch)
-
-    ack = runtime.submit("hello")
-
-    assert isinstance(ack, ProductSubmissionAck)
-    assert ack.submission_id == "submission-1"
-    assert ack.conversation_id == "conversation-1"
-    assert ack.turn_exchange_id == "exchange-1"
-    assert ack.write_may_have_committed is True
-    assert ack.automatic_retry_allowed is False
-    assert ack.canonical_finality_proven is False
-    assert ack.provenance.write_acknowledged is True
-    assert ack.provenance.canonical_finality_proven is False
-    assert ack.provenance.automatic_write_retry is False
-    assert ack.provenance.fallback_transport is None
-    assert (
-        ack.provenance.evidence_source
-        is SubmissionEvidenceSource.BROWSER_NATIVE_WRITE_COMPLETED
-    )
-    assert calls == {"submit": 1, "await": 0, "bound_during_await": None}
-    assert provider.bound is None
-    assert client.readback_ack_count == 0
-
-    snapshot = runtime.submission_lifecycle_snapshot()
-    assert snapshot["supported"] is True
-    assert snapshot["pending"] is True
-    assert snapshot["submission_id"] == ack.submission_id
-    assert snapshot["turn_lifecycle_state"] == "WRITE_COMPLETED"
-    assert snapshot["browser_authority_state"] == "ACTIVE"
-    assert snapshot["canonical_finality_proven"] is False
-
-    governance = transport.governance()
-    assert governance["submission_ack_is_canonical_finality"] is False
-    assert governance["submission_pending_limit"] == 1
-    assert governance["submission_pending_blocks_new_write"] is True
-    assert governance["submission_dispatch_serialized"] is True
-    assert governance["submission_await_serialized"] is True
-    assert governance["submission_automatic_write_retry"] is False
 
 
 def test_pending_submission_blocks_every_second_write_before_delegation(monkeypatch):

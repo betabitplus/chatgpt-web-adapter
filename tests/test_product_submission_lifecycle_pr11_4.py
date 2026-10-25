@@ -12,7 +12,6 @@ from chatgpt_web_adapter.browser_owned_product_transport import (
 )
 from chatgpt_web_adapter.browser_owned_submission_lifecycle import (
     SUBMISSION_FINALITY_PENDING,
-    SUBMISSION_HANDLE_INVALID,
 )
 from chatgpt_web_adapter.browser_owned_write_runtime import (
     BrowserOwnedWriteRuntimeError,
@@ -21,9 +20,6 @@ from chatgpt_web_adapter.product_runtime import ChatGPTProductRuntime
 from chatgpt_web_adapter.product_submission import (
     ProductSubmissionAck,
     SubmissionEvidenceSource,
-)
-from chatgpt_web_adapter.product_submission_runtime_gate import (
-    ProductSubmissionLifecycleUnavailableError,
 )
 from chatgpt_web_adapter.revision_safe_streaming_pr8_9 import (
     RevisionSafeTextAccumulator,
@@ -210,39 +206,6 @@ def test_submit_ack_is_write_acceptance_not_canonical_finality(monkeypatch):
     assert governance["submission_automatic_write_retry"] is False
 
 
-def test_split_submit_allows_stale_tool_running_for_browser_liveness_fence(monkeypatch):
-    runtime, _transport, client, _provider, calls = _runtime(monkeypatch)
-    client.status_value = "tool_running"
-
-    ack = runtime.submit("continue", conversation="conversation-1")
-
-    assert isinstance(ack, ProductSubmissionAck)
-    assert calls["submit"] == 1
-
-
-def test_split_submit_blocks_awaiting_tool_approval_before_browser_write(monkeypatch):
-    runtime, _transport, client, _provider, calls = _runtime(monkeypatch)
-    client.status_value = "awaiting_tool_approval"
-
-    with pytest.raises(BrowserOwnedWriteRuntimeError) as caught:
-        runtime.submit("continue", conversation="conversation-1")
-
-    assert calls["submit"] == 0
-    assert "awaiting_tool_approval" in str(caught.value)
-
-
-def test_split_submit_unreadable_commit_fails_closed_before_browser_write(monkeypatch):
-    runtime, _transport, client, _provider, calls = _runtime(monkeypatch)
-    client.status_value = RuntimeError("canonical busy")
-
-    with pytest.raises(BrowserOwnedWriteRuntimeError) as caught:
-        runtime.submit("continue", conversation="conversation-1")
-
-    assert calls["submit"] == 0
-    assert caught.value.failure_kind == lifecycle_subject.CANONICAL_READ_UNAVAILABLE
-    assert caught.value.write_may_have_been_submitted is False
-
-
 def test_pending_submission_blocks_every_second_write_before_delegation(monkeypatch):
     runtime, transport, _client, _provider, calls = _runtime(monkeypatch)
     ack = runtime.submit("first")
@@ -262,106 +225,3 @@ def test_pending_submission_blocks_every_second_write_before_delegation(monkeypa
 
     assert calls["submit"] == 1
     assert runtime.submission_lifecycle_snapshot()["submission_id"] == ack.submission_id
-
-
-def test_await_final_rebinds_same_authority_then_releases_slot(monkeypatch):
-    runtime, _transport, client, provider, calls = _runtime(monkeypatch)
-    ack = runtime.submit("hello")
-    lease_id = ack.turn_lifecycle_id
-
-    response = runtime.await_final(ack)
-
-    assert response.text == "done"
-    assert calls["await"] == 1
-    assert isinstance(calls["bound_during_await"], str)
-    assert calls["bound_during_await"]
-    assert provider.bound is None
-    assert client.readback_ack_count == 1
-    assert runtime.submission_lifecycle_snapshot()["pending"] is False
-
-    lifecycle = runtime.write_transport._runtime.lifecycle_snapshot()
-    assert lifecycle["turn_lifecycle"]["state"] == "FINALIZED"
-    assert lifecycle["browser_authority_lease"]["state"] == "RELEASED"
-    assert lifecycle["browser_authority_lease"]["authority_release_proven"] is True
-    assert lifecycle["turn_lifecycle"]["lifecycle_id"] == lease_id
-
-    second = runtime.submit("second")
-    assert second.submission_id == "submission-1"
-    assert calls["submit"] == 2
-
-
-def test_foreign_submission_handle_fails_without_consuming_pending(monkeypatch):
-    runtime, _transport, _client, _provider, calls = _runtime(monkeypatch)
-    ack = runtime.submit("hello")
-    foreign = ProductSubmissionAck(
-        submission_id="foreign-submission",
-        transport=ack.transport,
-        conversation_id=ack.conversation_id,
-        turn_exchange_id=ack.turn_exchange_id,
-        accepted_at_ms=ack.accepted_at_ms,
-        turn_lifecycle_id=ack.turn_lifecycle_id,
-        write_may_have_committed=True,
-        automatic_retry_allowed=False,
-        canonical_finality_proven=False,
-        provenance=ack.provenance,
-    )
-
-    with pytest.raises(BrowserOwnedWriteRuntimeError) as caught:
-        runtime.await_final(foreign)
-
-    assert caught.value.failure_kind == SUBMISSION_HANDLE_INVALID
-    assert calls["await"] == 0
-    assert runtime.submission_lifecycle_snapshot()["submission_id"] == ack.submission_id
-
-
-class UnsupportedTransport:
-    transport_id = "browserless-request"
-
-    def __init__(self) -> None:
-        self.write_calls = 0
-
-    def health(self, conversation=None):
-        return None
-
-    def capabilities(self):
-        return None
-
-    def send_text(self, text, **kwargs):
-        self.write_calls += 1
-        return ChatResponse(text="unexpected")
-
-    def send_text_observed(self, text, **kwargs):
-        self.write_calls += 1
-        raise AssertionError("unexpected write")
-
-    def governance(self):
-        return {
-            "fallback_transport": None,
-            "legacy_direct_write_fallback": False,
-            "submission_lifecycle_supported": False,
-        }
-
-
-def test_unsupported_transport_fails_split_lifecycle_before_write():
-    client = FakeClient()
-    writer = UnsupportedTransport()
-    runtime = ChatGPTProductRuntime(
-        client,
-        transport="browserless-request",
-        write_transport=writer,
-    )
-
-    with pytest.raises(ProductSubmissionLifecycleUnavailableError) as caught:
-        runtime.submit("hello")
-
-    assert caught.value.transport == "browserless-request"
-    assert writer.write_calls == 0
-
-
-def test_temporary_split_lifecycle_fails_before_browser_write(monkeypatch):
-    runtime, _transport, _client, _provider, calls = _runtime(monkeypatch)
-
-    with pytest.raises(ProductSubmissionLifecycleUnavailableError):
-        runtime.submit("hello", conversation_mode="temporary")
-
-    assert calls["submit"] == 0

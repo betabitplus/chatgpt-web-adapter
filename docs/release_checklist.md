@@ -14,11 +14,10 @@ Merging release-hardening code never grants permission to publish. A tagged PyPI
 
 ## 1. Regression
 
-Run the focused release-surface tests and then the full repository suite:
+Run the JavaScript syntax check and the full repository suite:
 
 ```powershell
 python tools/check_extension_js_syntax.py
-python -m pytest tests/test_release_hardening_pr8_17.py tests/test_release_surface_pr9_4.py -q
 python -m pytest -q
 ```
 

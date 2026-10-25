@@ -50,15 +50,8 @@ jobs:
             src/chatgpt_web_adapter/wkwebview_helper/WKChatGPTAuthority.m \
             -o "${RUNNER_TEMP}/WKChatGPTAuthority"
 
-      - name: Run tagged WK and release tests
-        run: >-
-          python -m pytest -q
-          tests/test_wkwebview_backend.py
-          tests/test_wkwebview_lightweight_transport.py
-          tests/test_wkwebview_temporary.py
-          tests/test_wkwebview_stream_observation.py
-          tests/test_wkwebview_integrity_fixtures.py
-          tests/test_release_hardening_pr8_17.py
+      - name: Run tagged test suite
+        run: python -m pytest -q
 
       - name: Build tagged release artifacts
         run: python -m build

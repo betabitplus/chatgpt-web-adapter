@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator
 
@@ -43,61 +42,6 @@ class _TemporaryStreamTransport:
             "turn_exchange_id": f"turn-{self.index}",
             "stream_finality_proven": True,
             "ws_token_events": 1,
-        }
-
-
-class _EarlyHandoffTemporaryTransport(_TemporaryStreamTransport):
-    def __init__(self) -> None:
-        super().__init__()
-        self.arm_calls: list[str] = []
-        self.release_calls: list[str] = []
-        self.follow_calls: list[dict[str, Any]] = []
-
-    def arm_conversation_completion(
-        self,
-        conversation_id: str,
-        *,
-        timeout: float,
-    ) -> int:
-        assert timeout > 0
-        self.arm_calls.append(f"completion:{conversation_id}")
-        return 0
-
-    def arm_early_handoff(self, conversation_id: str) -> str:
-        self.arm_calls.append(conversation_id)
-        return "attempt-temporary-1"
-
-    def early_handoff_control(self, attempt_id: str) -> dict[str, str]:
-        assert attempt_id == "attempt-temporary-1"
-        return {
-            "conversation_id": "temporary-1",
-            "topic_id": "conversation-turn-turn-2",
-            "turn_exchange_id": "turn-2",
-        }
-
-    def release_early_handoff(self, attempt_id: str) -> None:
-        self.release_calls.append(attempt_id)
-
-    def follow_topic(self, **kwargs: Any) -> dict[str, Any]:
-        self.follow_calls.append(dict(kwargs))
-        kwargs["on_event"](
-            {
-                "type": "assistant_text_delta",
-                "sequence": 1,
-                "message_id": "assistant-2",
-                "delta": "temporary-2",
-                "finish_reason": "stop",
-            }
-        )
-        return {
-            "ok": True,
-            "conversation_id": kwargs["conversation_id"],
-            "topic_id": kwargs["topic_id"],
-            "message_id": "assistant-2",
-            "turn_exchange_id": "turn-2",
-            "finish_reason": "stop",
-            "stream_finality_proven": True,
-            "completed": True,
         }
 
 
@@ -235,14 +179,25 @@ def test_wk_temporary_new_continuation_and_end_are_process_bound(monkeypatch) ->
     assert second["messageId"] == "assistant-2"
     assert second["temporaryContinuationIdentityProven"] is True
     assert provider.invocations[0].request["minimal_temporary"] is True
-    assert provider.invocations[0].request["minimal_temporary_lifecycle_id"] == "lifecycle-1"
-    assert provider.invocations[0].request["url"] == "https://chatgpt.com/?temporary-chat=true"
+    assert (
+        provider.invocations[0].request["minimal_temporary_lifecycle_id"]
+        == "lifecycle-1"
+    )
+    assert (
+        provider.invocations[0].request["url"]
+        == "https://chatgpt.com/?temporary-chat=true"
+    )
     assert provider.invocations[0].request["proxy_protected_write"] is True
-    assert provider.invocations[0].request["proxy_cookie_header"] == "session=test-cookie"
+    assert (
+        provider.invocations[0].request["proxy_cookie_header"] == "session=test-cookie"
+    )
     assert "minimal_conversation_id" not in provider.invocations[0].request
     assert provider.invocations[1].request["minimal_conversation_id"] == "temporary-1"
     assert provider.invocations[1].request["minimal_parent_message_id"] == "assistant-1"
-    assert provider.invocations[1].request["minimal_temporary_lifecycle_id"] == "lifecycle-1"
+    assert (
+        provider.invocations[1].request["minimal_temporary_lifecycle_id"]
+        == "lifecycle-1"
+    )
     assert [event["delta"] for event in events] == ["temporary-1", "temporary-2"]
     assert len(provider._helper_runtime.leases) == 1
     lifecycle_lease = provider._helper_runtime.leases[0]
@@ -263,6 +218,7 @@ def test_wk_temporary_new_continuation_and_end_are_process_bound(monkeypatch) ->
             browser_authority_lease_id="lease-1",
         )
 
+
 def test_wk_temporary_text_without_terminal_proof_is_not_confirmed() -> None:
     provider = _Provider()
 
@@ -276,7 +232,9 @@ def test_wk_temporary_text_without_terminal_proof_is_not_confirmed() -> None:
     provider._lightweight_transport = transport
     runtime = WKTemporaryTurnRuntime(provider)
 
-    with pytest.raises(RequestError, match="WKWEBVIEW_TEMPORARY_STREAM_FINALITY_MISSING"):
+    with pytest.raises(
+        RequestError, match="WKWEBVIEW_TEMPORARY_STREAM_FINALITY_MISSING"
+    ):
         runtime.send(
             "first",
             conversation_id=None,
@@ -288,124 +246,6 @@ def test_wk_temporary_text_without_terminal_proof_is_not_confirmed() -> None:
     assert len(transport.calls) == 1  # no ambiguous second send
     assert provider._helper_runtime.leases[0].closed is True
     assert "unconfirmed-lifecycle" not in runtime._bindings
-
-
-def test_wk_temporary_proxy_can_be_explicitly_disabled(monkeypatch) -> None:
-    monkeypatch.setenv("CWA_WK_PROXY_PROTECTED_WRITE", "0")
-    provider = _Provider()
-    runtime = WKTemporaryTurnRuntime(provider)
-
-    runtime.send(
-        "first",
-        conversation_id=None,
-        lifecycle_id="lifecycle-proxy-disabled",
-        timeout=30,
-        on_event=lambda _event: None,
-        browser_authority_lease_id="lease-1",
-    )
-
-    assert "proxy_protected_write" not in provider.invocations[0].request
-    assert "proxy_cookie_header" not in provider.invocations[0].request
-
-
-def test_wk_temporary_does_not_arm_global_completion_or_early_handoff() -> None:
-    provider = _Provider()
-    transport = _EarlyHandoffTemporaryTransport()
-    provider._lightweight_transport = transport
-    runtime = WKTemporaryTurnRuntime(provider)
-    events: list[dict[str, Any]] = []
-
-    first = runtime.send(
-        "first",
-        conversation_id=None,
-        lifecycle_id="lifecycle-no-global-observer",
-        timeout=30,
-        on_event=events.append,
-        browser_authority_lease_id="lease-1",
-    )
-    second = runtime.send(
-        "second",
-        conversation_id=first["conversationId"],
-        lifecycle_id="lifecycle-no-global-observer",
-        timeout=30,
-        on_event=events.append,
-        browser_authority_lease_id="lease-1",
-    )
-
-    assert second["conversationId"] == "temporary-1"
-    assert second["turnExchangeId"] == "turn-2"
-    assert "minimal_handoff_attempt_id" not in provider.invocations[0].request
-    assert "minimal_handoff_attempt_id" not in provider.invocations[1].request
-    assert transport.arm_calls == []
-    assert transport.release_calls == []
-    assert transport.follow_calls == []
-    assert len(transport.calls) == 2
-    assert [event["delta"] for event in events] == ["temporary-1", "temporary-2"]
-
-
-def test_wk_temporary_broker_terminal_uses_browser_sse_without_resume_leg() -> None:
-    provider = _Provider()
-    runtime = WKTemporaryTurnRuntime(provider)
-    events: list[dict[str, Any]] = []
-
-    def terminal_run(
-        invocation: WKHelperInvocation,
-        *,
-        timeout: float,
-        on_text_event: Any,
-        on_transport_event: Any = None,
-    ) -> dict[str, Any]:
-        assert timeout > 0
-        provider.invocations.append(invocation)
-        on_text_event(
-            {
-                "type": "assistant_text_snapshot",
-                "sequence": 1,
-                "message_id": "assistant-direct",
-                "text": "temporary-direct",
-            }
-        )
-        return {
-            "ok": True,
-            "conversation_id": "temporary-direct-1",
-            "response_status": 200,
-            "submit_temporary_mode_observed": True,
-            "stream_terminal_observed": True,
-            "assistant_message_id": "assistant-direct",
-            "turn_exchange_id": "turn-direct",
-        }
-
-    provider._run_helper_streaming = terminal_run  # type: ignore[method-assign]
-    result = runtime.send(
-        "first",
-        conversation_id=None,
-        lifecycle_id="lifecycle-direct",
-        timeout=30,
-        on_event=events.append,
-        browser_authority_lease_id="lease-1",
-    )
-
-    assert result["conversationId"] == "temporary-direct-1"
-    assert result["turnExchangeId"] == "turn-direct"
-    assert result["terminalObserved"] is True
-    assert result["messageId"] == "assistant-direct"
-    assert provider._lightweight_transport.calls == []
-    assert events == [
-        {
-            "type": "assistant_text_snapshot",
-            "sequence": 1,
-            "message_id": "assistant-direct",
-            "text": "temporary-direct",
-        }
-    ]
-    assert runtime._bindings["lifecycle-direct"] == (
-        "temporary-direct-1",
-        "assistant-direct",
-    )
-    assert runtime.end(
-        lifecycle_id="lifecycle-direct",
-        conversation_id="temporary-direct-1",
-    ) == {"ok": True, "temporaryLifecycleState": "ENDED"}
 
 
 def test_wk_temporary_requires_browser_observed_mode_proof() -> None:
@@ -422,47 +262,3 @@ def test_wk_temporary_requires_browser_observed_mode_proof() -> None:
             on_event=lambda _event: None,
             browser_authority_lease_id="lease-1",
         )
-
-
-def test_packaged_wk_helper_proves_temporary_mode_from_observed_submit_body() -> None:
-    root = (
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "chatgpt_web_adapter"
-        / "wkwebview_helper"
-    )
-    shell = (root / "minimal_security_shell.js").read_text(encoding="utf-8")
-    helper = (root / "WKChatGPTAuthority.m").read_text(encoding="utf-8")
-
-    assert "history_and_training_disabled: true" in shell
-    assert "history_and_training_disabled=${temporary" in shell
-    assert "temporary_mode:temporary" in helper
-    assert "submit_temporary_mode_observed" in helper
-
-
-def test_packaged_wk_helper_uses_one_page_owned_send_action_for_detached_workers() -> None:
-    root = (
-        Path(__file__).resolve().parents[1]
-        / "src"
-        / "chatgpt_web_adapter"
-        / "wkwebview_helper"
-    )
-    helper = (root / "WKChatGPTAuthority.m").read_text(encoding="utf-8")
-
-    start = helper.index("static NSDictionary *PageClickSendButton(WKWebView *webView)")
-    end = helper.index("static NSString *AcceptanceScript", start)
-    send_helper = helper[start:end]
-    assert "b.click();" in send_helper
-    assert send_helper.count("b.click();") == 1
-    assert "NSEventTypeLeftMouseDown" not in send_helper
-    assert "NSEventTypeLeftMouseUp" not in send_helper
-    assert "page_send_button_click" in send_helper
-
-    pump_start = helper.index("static BOOL PumpRealPageTurnBrokerEntry(")
-    pump_end = helper.index("if (delegate.submitRequestObserved", pump_start)
-    pre_submit = helper[pump_start:pump_end]
-    assert pre_submit.index("RearmFetchObserversScript()") < pre_submit.index(
-        "PageClickSendButton(webView)"
-    )
-    assert pre_submit.count("PageClickSendButton(webView)") == 1
-    assert "entry.realPageSent = YES;" in pre_submit

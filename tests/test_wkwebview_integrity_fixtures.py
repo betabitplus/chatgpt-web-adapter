@@ -148,14 +148,19 @@ def test_minimal_shell_supports_current_rspack_split_integrity_layout() -> None:
     assert '"/backend-api/sentinel/chat-requirements/prepare"' in source
     assert "const prepared = await serverAcquireIntegrity(" in source
     assert "Object.assign(writeHeaders, integrityBundle.headers)" in source
-    assert '!proxyProtectedWrite && typeof officialConversationTransport !== "function"' in source
+    assert (
+        '!proxyProtectedWrite && typeof officialConversationTransport !== "function"'
+        in source
+    )
 
 
-def test_minimal_shell_rspack_split_discovery_fails_closed_on_bundle_ambiguity() -> None:
+def test_minimal_shell_rspack_split_discovery_fails_closed_on_bundle_ambiguity() -> (
+    None
+):
     source = SHELL.read_text(encoding="utf-8")
 
     assert "MINIMAL_RSPACK_CHUNK_ID_INVALID" in source
-    assert 'matches.length !== 1' in source
+    assert "matches.length !== 1" in source
     assert '"AMBIGUOUS" : "MISSING"' in source
     assert "MINIMAL_RSPACK_RUNTIME_MISSING" in source
     assert "MINIMAL_RSPACK_RUNTIME_INVALID" in source

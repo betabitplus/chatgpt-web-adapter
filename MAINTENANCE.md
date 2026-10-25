@@ -46,8 +46,10 @@ When porting, write the change in our own code and name the source in the commit
 The `chrome-native` backend and `browser_native_extension/` stay in `main` as they are and are not
 developed. They are used only when asked for explicitly (`gptty --backend chrome-native`). Against
 the current ChatGPT they do not work: the extension does not find the composer (`composer_missing`,
-the ChatGPT frontend changed around 2026-09-25). Keep their tests passing; do not fix or delete
-them until we decide what to do with them.
+the ChatGPT frontend changed around 2026-09-25). Do not fix or delete the code until we decide
+what to do with it. Its tests were deleted from `main` on 2026-10-25: the suite keeps only tests of
+what `gptty` runs. The tag `chrome-baseline` keeps them; the last `main` commit with the whole
+old suite is `6a768c29`.
 
 Return point: tag `chrome-baseline` — here `524f400` (2026-09-07), in `gptty` `fcd409b` (2026-09-06).
 It is the author's code as of `fb8cc07` (2026-09-03) plus 20 of our patches that `gptty` needs (long

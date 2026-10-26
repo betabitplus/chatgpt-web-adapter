@@ -37,6 +37,8 @@ classifiers = [
 dependencies = [
   "curl-cffi==0.16.3; sys_platform == 'darwin'",
   "websockets==16.1.1; sys_platform == 'darwin'",
+  # The sign-in lives in the macOS Keychain; without keyring every tool reading it fails.
+  "keyring>=25,<26; sys_platform == 'darwin'",
 ]
 
 [project.urls]

@@ -2768,6 +2768,53 @@ static NSArray *ChatGPTCookies(WKWebView *webView) {
     return records;
 }
 
+// The sign-in window is a real window the person works in: it needs AppKit's event loop (clicks, keys,
+// redraws), an Edit menu (paste a password, a code), sign-in popups opened in place, and a page that
+// comes back if its web process dies.
+@interface WKSignInDelegate : NSObject <WKNavigationDelegate, WKUIDelegate>
+@end
+
+@implementation WKSignInDelegate
+- (WKWebView *)webView:(WKWebView *)webView createWebViewWithConfiguration:(WKWebViewConfiguration *)configuration
+   forNavigationAction:(WKNavigationAction *)navigationAction windowFeatures:(WKWindowFeatures *)windowFeatures {
+    if (navigationAction.request.URL) [webView loadRequest:navigationAction.request];
+    return nil;
+}
+
+- (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
+    [webView reload];
+}
+@end
+
+static void InstallEditMenu(void) {
+    NSMenu *main = [NSMenu new];
+    NSMenuItem *appItem = [NSMenuItem new];
+    appItem.submenu = [NSMenu new];
+    [appItem.submenu addItemWithTitle:@"Close" action:@selector(performClose:) keyEquivalent:@"w"];
+    [main addItem:appItem];
+    NSMenuItem *editItem = [NSMenuItem new];
+    NSMenu *edit = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [edit addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
+    [edit addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
+    [edit addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+    [edit addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
+    [edit addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
+    editItem.submenu = edit;
+    [main addItem:editItem];
+    NSApp.mainMenu = main;
+}
+
+static void PumpEventsFor(NSTimeInterval seconds) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while ([deadline timeIntervalSinceNow] > 0) {
+        NSEvent *event = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                            untilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]
+                                               inMode:NSDefaultRunLoopMode
+                                              dequeue:YES];
+        if (event) [NSApp sendEvent:event];
+    }
+}
+
 static int RunSessionMode(NSArray<NSString *> *args) {
     BOOL signIn = HasArg(args, @"--sign-in");
     NSTimeInterval timeout = [ArgValue(args, @"--timeout", signIn ? @"900" : @"45") doubleValue];
@@ -2785,8 +2832,15 @@ static int RunSessionMode(NSArray<NSString *> *args) {
     window.contentView = webView;
     window.releasedWhenClosed = NO;
     [window orderFront:nil];
+    WKSignInDelegate *signInDelegate = nil;
     if (signIn) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        [NSApp finishLaunching];
+        InstallEditMenu();
+        signInDelegate = [WKSignInDelegate new];
+        webView.navigationDelegate = signInDelegate;
+        webView.UIDelegate = signInDelegate;
+        KeepPageForeground(webView);
         [NSApp activateIgnoringOtherApps:YES];
         [window makeKeyAndOrderFront:nil];
     }
@@ -2794,7 +2848,7 @@ static int RunSessionMode(NSArray<NSString *> *args) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     NSDictionary *session = nil;
     if (signIn) {
-        while (window.isVisible && [deadline timeIntervalSinceNow] > 0) RunLoopFor(0.5);
+        while (window.isVisible && [deadline timeIntervalSinceNow] > 0) PumpEventsFor(0.5);
         [window orderOut:nil];
         session = SessionPayload(webView);
     }

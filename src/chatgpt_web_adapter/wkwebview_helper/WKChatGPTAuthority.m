@@ -644,6 +644,20 @@ static NSString *RearmFetchObserversScript(void) {
             "})()";
 }
 
+// ChatGPT shows some accounts a "Temporary chat" dialog (what the chat may use: memory, files,
+// plugins) with a Continue button. It traps the focus, so typed text lands on the button and the
+// mode menu is unreachable; Continue keeps the account's own choice.
+static NSString *DismissTemporaryChatNoticeScript(void) {
+    return @"(()=>{"
+            "for(const dialog of document.querySelectorAll('[role=dialog]')){"
+              "if(!/temporary chat|временн/i.test(dialog.textContent||''))continue;"
+              "for(const button of dialog.querySelectorAll('button')){"
+                "if(!/^(continue|продолжить)$/i.test((button.textContent||'').trim()))continue;"
+                "button.click();return true;}}"
+            "return false;"
+            "})()";
+}
+
 static NSString *ScrollBottomScript(void) {
     return @"(()=>{"
             "const root=document.scrollingElement||document.documentElement||document.body;"
@@ -1889,6 +1903,14 @@ static BOOL PumpRealPageTurnBrokerEntry(
                 0
             );
             return YES;
+        }
+        id noticeDismissed = EvaluateSync(webView, DismissTemporaryChatNoticeScript(), 1.0, nil);
+        if ([noticeDismissed respondsToSelector:@selector(boolValue)] && [noticeDismissed boolValue]) {
+            TurnBrokerRealPageStage(entry, @"temporary_notice_dismissed");
+            entry.realPageFilled = NO;  // whatever was typed went to the dialog; the fill replaces the composer's text
+            entry.composerReadyStablePolls = 0;
+            entry.nextComposerReadyPollAt = nil;
+            return NO;
         }
         if (![snapshot[@"composerReady"] boolValue]) {
             TurnBrokerRealPageStage(entry, @"composer_not_ready");

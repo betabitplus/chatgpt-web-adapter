@@ -11,6 +11,7 @@ from .auth import DEFAULT_AUTH_FILE
 from .conversation_snapshot import snapshot_conversation
 from .doctor import run_doctor
 from .export import EXPORT_FORMAT_ALIASES, write_conversation_export
+from .generated_images import download_generated_images, generate_images
 from .product_runtime import (
     DEFAULT_PRODUCT_TRANSPORT,
     SUPPORTED_PRODUCT_TRANSPORTS,
@@ -240,6 +241,41 @@ def _build_parser() -> argparse.ArgumentParser:
         help="PR8.15 artifact manifest to verify; repeat for multiple manifests",
     )
 
+    image = root.add_parser(
+        "image",
+        help="send a prompt (plus optional input pictures) and save the generated pictures",
+    )
+    _add_inspection_common(image)
+    image.add_argument(
+        "prompt",
+        nargs="?",
+        help="prompt text; omit with --conversation to only fetch the last turn's pictures",
+    )
+    image.add_argument(
+        "--media",
+        action="append",
+        type=Path,
+        default=[],
+        help="input picture or file to attach; repeat for several",
+    )
+    image.add_argument(
+        "--conversation",
+        help="continue this conversation id or URL (refine the previous picture)",
+    )
+    image.add_argument("--output-dir", type=Path, default=Path("."))
+    image.add_argument("--name", default="image", help="output file-name prefix")
+    image.add_argument(
+        "--profile",
+        type=_argparse_model_profile,
+        help="product model profile (INSTANT/MEDIUM/HIGH)",
+    )
+    image.add_argument(
+        "--wait",
+        type=float,
+        default=300.0,
+        help="seconds to wait for the generated turn to finish",
+    )
+
     return parser
 
 
@@ -409,6 +445,49 @@ def _run_conversation(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _run_image(args: argparse.Namespace) -> int:
+    runtime = _runtime_for(args)
+    if args.prompt:
+        kwargs: dict[str, Any] = {}
+        if args.profile:
+            kwargs["model_profile"] = args.profile
+        result = generate_images(
+            runtime,
+            args.prompt,
+            args.output_dir,
+            media=[str(path) for path in args.media],
+            conversation=args.conversation,
+            name=args.name,
+            wait_timeout=args.wait,
+            **kwargs,
+        )
+    elif args.conversation:
+        if args.media:
+            raise ValueError("--media needs a prompt")
+        ref = ConversationRef.from_any(args.conversation)
+        images = download_generated_images(
+            runtime,
+            ref,
+            args.output_dir,
+            name=args.name,
+            wait_timeout=args.wait,
+        )
+        result = {
+            "conversation_id": ref.conversation_id,
+            "images": [image.to_dict() for image in images],
+        }
+    else:
+        raise ValueError("give a prompt, or --conversation to fetch its pictures")
+    payload = {"schema": CLI_CONTRACT_SCHEMA, "command": "image", "ok": True, **result}
+    if args.json:
+        _json_print(payload)
+    else:
+        print(f"conversation: {result['conversation_id']}")
+        for image in result["images"]:
+            print(image["path"])
+    return EXIT_OK
+
+
 def _run_snapshot_artifact(args: argparse.Namespace) -> int:
     client = legacy_cli.ChatGPTWebClient(auth_file=args.auth_file, timeout=args.timeout)
     result = snapshot_conversation(
@@ -569,6 +648,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_export_artifact(args)
         if args.command == "doctor":
             return _run_doctor(args)
+        if args.command == "image":
+            return _run_image(args)
         return _legacy_dispatch(args)
     except Exception as error:
         exit_code = _error_exit_code(error)

@@ -279,6 +279,25 @@ product observation
 != local/Git/filesystem authority
 ```
 
+### Generated pictures (`cwa image`)
+
+On the WKWebView transport CWA can save the pictures ChatGPT generates in a turn:
+
+```bash
+cwa image "Redraw the first picture with the person from the second" \
+  --media ./frame.png --media ./face_sheet.png --output-dir ./out --name shot --json
+cwa image "Make the face closer to the sheet" --conversation <conversation-id> --output-dir ./out --name shot
+cwa image --conversation <conversation-id> --output-dir ./out   # only fetch the last turn's pictures
+```
+
+Python: `chatgpt_web_adapter.generated_images.generate_images(runtime, prompt, output_dir, media=[...], conversation=...)`
+and `download_generated_images(runtime, conversation_id, output_dir)`.
+
+Identity is the product's own file id from the `image_asset_pointer` part of the canonical conversation (only the
+messages after the latest user message, so input uploads never qualify). A file is kept only when its byte count equals
+the `size_bytes` recorded for it, and existing files are never overwritten. A send that ends with
+`BROWSER_NATIVE_DEFERRED_TOPIC_FINALITY_MISSING` may still have produced the picture: fetch it with `--conversation`.
+
 ### Connector / required-action boundary
 
 Post-0.3 PR10.0 adds stronger typed connector/required-action lifecycle models when the product provides stable explicit ids.

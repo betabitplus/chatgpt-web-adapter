@@ -757,6 +757,19 @@ class WKWebViewTurnProvider:
         )
         return WKWebViewCanonicalClient(source_client, self)
 
+    def download_file(
+        self,
+        file_id: str,
+        *,
+        timeout: float = 30.0,
+    ) -> tuple[bytes, dict[str, Any]]:
+        """Bytes of one product file (an upload or a generated picture) by its id."""
+
+        transport = self._lightweight_transport
+        if transport is None:
+            raise RuntimeError("WKWEBVIEW_FILE_DOWNLOAD_TRANSPORT_MISSING")
+        return transport.download_attachment(file_id, timeout=timeout)
+
     def read_text_attachment(
         self,
         attachment: dict[str, Any],

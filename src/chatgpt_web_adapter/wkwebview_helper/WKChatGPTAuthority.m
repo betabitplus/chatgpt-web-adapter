@@ -2846,6 +2846,8 @@ static int RunSessionMode(NSArray<NSString *> *args) {
     configuration.websiteDataStore = [WKWebsiteDataStore defaultDataStore];
     ConfigureForegroundPage(configuration);
     WKWebView *webView = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 1000, 760) configuration:configuration];
+    // Off screen the page is treated as occluded and stalls, as in the turn path.
+    KeepPageForeground(webView);
     NSRect rect = signIn ? NSMakeRect(120, 120, 1000, 760) : NSMakeRect(-20000, -20000, 1000, 760);
     NSWindowStyleMask style = signIn ? (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable)
                                      : NSWindowStyleMaskBorderless;
@@ -2862,7 +2864,6 @@ static int RunSessionMode(NSArray<NSString *> *args) {
         signInDelegate = [WKSignInDelegate new];
         webView.navigationDelegate = signInDelegate;
         webView.UIDelegate = signInDelegate;
-        KeepPageForeground(webView);
         [NSApp activateIgnoringOtherApps:YES];
         [window makeKeyAndOrderFront:nil];
     }
@@ -2885,7 +2886,11 @@ static int RunSessionMode(NSArray<NSString *> *args) {
             PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_AUTHORITY_LOGIN_REQUIRED"});
             return 60;
         }
-        PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_SESSION_UNAVAILABLE",@"detail":session ?: @{}});
+        PrintResult(@{@"ok":@NO,@"error":@"WKWEBVIEW_SESSION_UNAVAILABLE",@"detail":@{
+            @"answer":session ?: @"none",
+            @"page_loading":@(webView.isLoading),
+            @"page_url":webView.URL.absoluteString ?: @""
+        }});
         return 61;
     }
     NSString *userAgent = EvaluateSync(webView, @"navigator.userAgent", 5.0, nil);
